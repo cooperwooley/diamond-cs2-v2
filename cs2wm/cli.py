@@ -184,8 +184,14 @@ def _dispatch(args: argparse.Namespace) -> None:
         from cs2wm.play import loop
 
         loop.run(
-            _cfg(args), args.ckpt, args.upsampler_ckpt, args.no_upsampler, args.denoising_steps, args.context,
-            args.record, args.benchmark,
+            _cfg(args),
+            args.ckpt,
+            args.upsampler_ckpt,
+            args.no_upsampler,
+            args.denoising_steps,
+            args.context,
+            args.record,
+            args.benchmark,
         )
     elif cmd == "eval":
         _dispatch_eval(args)
@@ -205,9 +211,7 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
     elif sub == "h1":
         from cs2wm.eval import h1_controllability
 
-        h1_controllability.run_h1(
-            _parse_models(args.models), _cfg(args), Path("results/h1"), args.contexts, args.seed
-        )
+        h1_controllability.run_h1(_parse_models(args.models), _cfg(args), Path("results/h1"), args.contexts, args.seed)
     elif sub == "h2":
         from cs2wm.eval import h2_smoke
 
