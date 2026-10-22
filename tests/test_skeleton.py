@@ -70,4 +70,3 @@ def test_tickrate_multiple_of_fps(cfg) -> None:
 def test_launch_options_insecure(cfg) -> None:
     assert "-insecure" in cfg.generate.launch_options
     assert "-insecure" in OmegaConf.to_container(cfg.generate.launch_options)
-

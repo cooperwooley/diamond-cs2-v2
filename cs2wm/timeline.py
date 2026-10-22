@@ -45,16 +45,20 @@ class EpisodeSpec:
 
     def frame_tick(self, k: int) -> int:
         """Return ``T_k`` for frame ``k`` (``0 <= k <= n_frames``)."""
-        raise NotImplementedError("TODO(#10): EpisodeSpec.frame_tick")
+        if not 0 <= k <= self.n_frames:
+            raise IndexError(f"frame {k} outside [0, {self.n_frames}]")
+        return self.start_tick + k * self.ticks_per_frame
 
     def window(self, k: int) -> tuple[int, int]:
         """Return the open-closed tick window ``(T_k, T_{k+1}]`` covered by action ``k``."""
-        raise NotImplementedError("TODO(#10): EpisodeSpec.window")
+        if not 0 <= k < self.n_frames:
+            raise IndexError(f"action {k} outside [0, {self.n_frames})")
+        return self.frame_tick(k), self.frame_tick(k + 1)
 
     @property
     def end_tick(self) -> int:
         """Tick of frame ``n_frames``, the extra frame needed to label frame ``n_frames - 1``."""
-        raise NotImplementedError("TODO(#10): EpisodeSpec.end_tick")
+        return self.frame_tick(self.n_frames)
 
 
 def frame_to_tick(k: ArrayLike, start_tick: int, ticks_per_frame: int) -> np.ndarray:
@@ -68,7 +72,7 @@ def frame_to_tick(k: ArrayLike, start_tick: int, ticks_per_frame: int) -> np.nda
     Returns:
         Integer tick(s).
     """
-    raise NotImplementedError("TODO(#10): frame_to_tick")
+    return start_tick + np.asarray(k, dtype=np.int64) * ticks_per_frame
 
 
 def tick_to_frame(tick: ArrayLike, start_tick: int, ticks_per_frame: int) -> np.ndarray:
@@ -82,7 +86,8 @@ def tick_to_frame(tick: ArrayLike, start_tick: int, ticks_per_frame: int) -> np.
     Returns:
         Integer frame index (negative or ``>= n_frames`` when outside the episode).
     """
-    raise NotImplementedError("TODO(#10): tick_to_frame")
+    # Integer ceil: -((T0 - t) // tpf) == ceil((t - T0) / tpf); floats could misplace exact boundaries.
+    return -((start_tick - np.asarray(tick, dtype=np.int64)) // ticks_per_frame) - 1
 
 
 def make_episode_id(kind: str, demo_id: str, segment_idx: int, chunk_idx: int) -> str:
@@ -97,4 +102,4 @@ def make_episode_id(kind: str, demo_id: str, segment_idx: int, chunk_idx: int) -
     Returns:
         The episode id.
     """
-    raise NotImplementedError("TODO(#10): make_episode_id")
+    return f"{kind}-{demo_id}-s{segment_idx:03d}-c{chunk_idx:02d}"

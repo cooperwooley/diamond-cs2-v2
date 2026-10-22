@@ -59,8 +59,11 @@ actions:
     # ("slot 3+": knife or any utility incl. smoke; the 51-dim space has no slot-4 key).
     # Exact CS2 weapon strings are confirmed in #14.
     "1": [ak-47, m4a4, m4a1, famas, galil, aug, sg 553, awp, ssg 08, scar-20, g3sg1,
-          mac-10, mp9, mp7, mp5, ump-45, p90, pp-bizon, nova, xm1014, mag-7, sawed-off, m249, negev]
-    "2": [glock, usp, p2000, p250, five-seven, tec-9, cz75, desert eagle, deagle, dual berettas, r8]
+          mac-10, mp9, mp7, mp5, ump-45, p90, pp-bizon, nova, xm1014, mag-7, sawed-off, m249, negev,
+          # internal (no-hyphen) names, e.g. weapon_ak47
+          ak47, sg556, ssg08, scar20, mac10, ump45, bizon, mag7, sawedoff]
+    "2": [glock, usp, p2000, p250, five-seven, tec-9, cz75, desert eagle, deagle, dual berettas, r8,
+          fiveseven, tec9, elite, revolver, hkp2000]
     default: "3"
 
 qa:
@@ -68,6 +71,7 @@ qa:
   max_missing_tick_frac: 0.01
   max_mouse_saturation_frac: 0.02   # frames at the extreme x/y bins
   max_abs_dyaw_deg_per_frame: 60.0  # larger => spectator glitch / teleport
+  max_fill_ticks: 2                 # missing demo tick => use the nearest present tick within this distance
   max_speed_ups: 320.0
   teleport_factor: 1.5              # displacement > factor * max_speed / fps => fail
 
