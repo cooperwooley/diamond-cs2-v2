@@ -1,0 +1,17 @@
+# @package _global_
+# Hardware profile: rtx3060. TODO(#6)/(#8): values are final after the #8 benchmark.
+# Effective denoiser batch stays 128 (v1 parity): 8 x 16 = 128.
+denoiser:
+  training:
+    batch_size: 8
+    grad_acc_steps: 16
+
+upsampler:
+  training:
+    batch_size: 2
+    grad_acc_steps: 16
+
+training:
+  num_workers_data_loaders: 4
+  precision: fp32  # bf16 | fp16 | fp32
+  compile_wm: false

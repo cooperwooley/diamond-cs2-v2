@@ -1,0 +1,17 @@
+# @package _global_
+# Hardware profile: h100. TODO(#6)/(#8): values are final after the #8 benchmark.
+# Effective denoiser batch stays 128 (v1 parity): 128 x 1 = 128.
+denoiser:
+  training:
+    batch_size: 128
+    grad_acc_steps: 1
+
+upsampler:
+  training:
+    batch_size: 16
+    grad_acc_steps: 1
+
+training:
+  num_workers_data_loaders: 8
+  precision: bf16  # bf16 | fp16 | fp32
+  compile_wm: false

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cs2wm"
+version = "0.1.0"
+description = "Action-conditioned Counter-Strike 2 world model: paired frame/action data pipeline, training glue, eval and play."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+license = {text = "MIT"}
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+cs2wm = "cs2wm.cli:main"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["cs2wm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# src/ is v1/DIAMOND code; do not lint it.
+extend-exclude = ["src"]

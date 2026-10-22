@@ -1,0 +1,9 @@
+# conda env for WSL and the Mill; then `pip install -e .[dev]`.
+name: dcs2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - -r requirements.txt

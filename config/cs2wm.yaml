@@ -1,0 +1,120 @@
+# Single source of truth for the cs2wm data pipeline AND the play loop (#9).
+# Everything that labels and live input must agree on lives here: paths, timing, resolutions,
+# the 51-dim action layout, mouse bins, deadzones, QA thresholds. Load it with
+# cs2wm.config.load_config(); never hard-code these values elsewhere.
+# Hydra training configs (config/trainer.yaml etc.) are separate; only num_actions is shared
+# and a test asserts it matches.
+
+paths:
+  root: ${oc.env:DCS2_ROOT,./dcs2-data}      # working set (<= 10 GB) + demo archive
+  demos: ${paths.root}/demos                 # master copy; mirrored to the Mill by sync
+  plans: ${paths.root}/plans                 # render_plan.json per demo (#10)
+  frames: ${paths.root}/frames               # rendered 280x150 frames, deleted after pack
+  hdf5: ${paths.root}/hdf5                   # packed low-res episodes, deleted after sync
+  hdf5_fullres: ${paths.root}/hdf5_fullres   # ~10% full-res JPEG subset
+  qa: ${paths.root}/qa
+  events: ${paths.root}/events               # smoke/grenade event tables for H2
+  state: ${paths.root}/state                 # supervisor state
+  logs: ${paths.root}/logs
+  checkpoints: ${paths.root}/checkpoints
+  hlae_dir: ${oc.env:DCS2_HLAE_DIR,C:/hlae}
+  cs2_dir: ${oc.env:DCS2_CS2_DIR,"C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive"}
+
+timing:
+  tickrate: 64        # CS2 demos; demoparser2 also hard-codes 64
+  fps: 16             # frame k = demo time k/16 s; ticks_per_frame = tickrate / fps = 4
+
+resolution:            # [H, W]
+  capture: [720, 1280] # HLAE capture before downscale; final choice in #14
+  render: [150, 280]   # stored full-res frames (v1 full-res)
+  low_res: [30, 56]    # denoiser training frames
+
+episodes:
+  kinds: [dm, human, smoke]
+  max_frames: 1000     # one HDF5 file per <= 1000-frame episode (v1 schema)
+  min_frames: 64       # shorter remainders are dropped (4 s)
+
+actions:
+  # Layout (51 dims), identical to v1 / DIAMOND CS:GO / Pearce & Zhu:
+  #   keys[11] + clicks[2] + mouse_x one-hot[23] + mouse_y one-hot[15]
+  keys: [w, a, s, d, space, ctrl, shift, "1", "2", "3", r]
+  clicks: [lmb, rmb]
+  mouse:
+    # Pearce & Zhu bin centres are raw mouse counts per 16 Hz frame at CS:GO sens 2.5
+    # (dm_infer_actions.py: 0.00096 rad/count = 0.055 deg = 0.022 deg/count x 2.5).
+    # Labels and live input are both binned in DEGREES: centre_deg = units * deg_per_unit.
+    # Signs: +x = turn right (Source yaw decreases), +y = look down (Source pitch increases).
+    # Binning: nearest centre, clipped, ties -> lower index (same as P&Z / DIAMOND min()).
+    deg_per_unit: 0.055
+    x_units: [-1000, -500, -300, -200, -100, -60, -30, -20, -10, -4, -2, 0, 2, 4, 10, 20, 30, 60, 100, 200, 300, 500, 1000]
+    y_units: [-200, -100, -50, -20, -10, -4, -2, 0, 2, 4, 10, 20, 50, 100, 200]
+  movement:
+    wasd_deadzone_ups: 30.0   # horizontal speed (units/s) in the view frame; tuned in #18
+    jump_vz_min_ups: 100.0    # vertical speed that counts as a jump take-off
+    duck_eps: 0.02            # duck_amount tolerance for "rising" / "fully ducked"
+  fire:
+    hold_gap_s: 0.2           # consecutive shots of one weapon <= this apart => trigger held between
+  slots:
+    # active_weapon_name (lower-cased) substring -> slot key. Anything unmatched -> "3"
+    # ("slot 3+": knife or any utility incl. smoke; the 51-dim space has no slot-4 key).
+    # Exact CS2 weapon strings are confirmed in #14.
+    "1": [ak-47, m4a4, m4a1, famas, galil, aug, sg 553, awp, ssg 08, scar-20, g3sg1,
+          mac-10, mp9, mp7, mp5, ump-45, p90, pp-bizon, nova, xm1014, mag-7, sawed-off, m249, negev]
+    "2": [glock, usp, p2000, p250, five-seven, tec-9, cz75, desert eagle, deagle, dual berettas, r8]
+    default: "3"
+
+qa:
+  min_fire_recall: 0.98
+  max_missing_tick_frac: 0.01
+  max_mouse_saturation_frac: 0.02   # frames at the extreme x/y bins
+  max_abs_dyaw_deg_per_frame: 60.0  # larger => spectator glitch / teleport
+  max_speed_ups: 320.0
+  teleport_factor: 1.5              # displacement > factor * max_speed / fps => fail
+
+segment:
+  policy: longest_remaining         # bots; human sessions use fixed_player
+  settle_ticks: 32                  # dropped after spawn and before death (camera transitions); tuned in #14
+
+pack:
+  schema_version: 1
+  fullres_mod: 10                   # episode in full-res subset iff int(sha1(id)[:8], 16) % fullres_mod == 0
+  jpeg_quality: 95
+
+generate:
+  map: de_dust2
+  bots: 10
+  chunk_min: 10
+  hang_timeout_min: 5
+  expected_build: null              # CS2 buildid from appmanifest_730.acf; set after #14
+  launch_options: [-insecure, -novid, -console, -sw, -w, "1280", -h, "720"]   # -insecure is mandatory
+
+render:
+  tick_offset: 0                    # measured in #14
+  timeout_factor: 3.0               # x demo length
+  output_format: tga                # tga | ffmpeg; decided in #14
+
+sync:
+  host: mill                        # ~/.ssh/config alias from #3
+  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill
+  delete_local_hdf5: true
+
+supervisor:
+  max_working_gb: 8
+  heartbeat_min: 60
+  max_attempts: 3
+  ntfy_server: https://ntfy.sh
+  ntfy_topic: ${oc.env:DCS2_NTFY_TOPIC,null}   # secret; never committed
+
+play:
+  sensitivity: 2.5    # set to your CS2 sensitivity (#2); 2.5 reproduces P&Z units exactly
+  m_yaw: 0.022        # deg per mouse count at sensitivity 1
+  m_pitch: 0.022
+
+eval:
+  h1:
+    hfov_deg: 106.26  # 16:9 render at CS2's fixed 90 deg (4:3-based) FOV; refit on GT in #32
+    contexts: 50
+    rollout_frames: 32
+  h2:
+    smoke_radius_units: 144
+    mask_dilate_px: 2

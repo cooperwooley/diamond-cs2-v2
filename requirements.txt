@@ -1,0 +1,21 @@
+# OS-agnostic runtime requirements (WSL, Windows, the Mill). See environment.yml and pyproject.toml.
+# On Windows, install CUDA torch first from the cu126 index (see #2):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+demoparser2>=0.42
+h5py>=3.11
+hydra-core>=1.3
+omegaconf>=2.3
+numpy>=1.26
+pandas>=2.0
+pyarrow>=14
+opencv-python>=4.10
+pillow>=10.3
+torch>=2.4.1
+torchvision>=0.19
+torcheval>=0.0.7
+tqdm>=4.66
+pygame>=2.5.2
+requests>=2.31
+lpips>=0.1.4
+pytorch-fid>=0.3.0
+wandb>=0.17  # imported by v1's trainer

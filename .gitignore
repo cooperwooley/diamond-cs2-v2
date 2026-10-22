@@ -1,0 +1,59 @@
+# --- Never commit data, demos, frames, HDF5, checkpoints, or logs (see #1, "Conventions") ---
+/data/
+/dcs2-data/
+frames/
+recordings/
+*.dem
+*.dem.*
+*.hdf5
+*.h5
+*.tga
+*.npy
+*.npz
+*.parquet
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.mp4
+*.mkv
+*.avi
+*.log
+logs/
+slurm-*.out
+
+# Training / Hydra outputs
+outputs/
+multirun/
+runs/
+checkpoints/
+wandb/
+.hydra/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+
+# LaTeX build artifacts
+report/**/*.aux
+report/**/*.bbl
+report/**/*.blg
+report/**/*.fdb_latexmk
+report/**/*.fls
+report/**/*.out
+report/**/*.synctex.gz
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
