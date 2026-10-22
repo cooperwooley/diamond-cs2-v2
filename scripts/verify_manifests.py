@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Re-check every sha256 in each ``manifest.jsonl`` under an HDF5 root (#17); used by #19, #24, #25.
 
 Prints one line per demo and a final ``OK``/``FAILED`` summary; exits 1 on any mismatch or missing file.

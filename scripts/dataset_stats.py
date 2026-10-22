@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Dataset statistics (#17, #24, #25, #26).
 
 Two modes:

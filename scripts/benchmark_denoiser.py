@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Micro-benchmark of denoiser training throughput for one hardware profile (#6, used by #8).
 
 For each requested batch size it runs ``--steps`` optimizer steps on the data in ``--data`` and prints exactly one

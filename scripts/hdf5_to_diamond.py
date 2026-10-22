@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Convert synced low-res HDF5 episodes into DIAMOND ``.pt`` train/test datasets (#17, runs on the Mill).
 
 Output: ``<out>/low_res/{train,test}`` (DIAMOND ``Dataset`` episodes plus ``info.pt``) and ``<out>/split.json``
