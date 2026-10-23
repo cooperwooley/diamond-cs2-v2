@@ -71,7 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     lc = p.add_subparsers(dest="label_cmd", required=True, metavar="<action>")
     q = lc.add_parser("render", help="render the overlay clip and review sheet")
     q.add_argument("--episode", required=True, type=Path, help="packed episode HDF5")
-    q.add_argument("--full-res-frames", required=True, type=Path, help="directory of full-res rendered frames")
+    q.add_argument(
+        "--full-res-frames",
+        required=True,
+        type=Path,
+        help="directory of full-res frames (file i = episode frame i) or a full-res episode HDF5",
+    )
     q.add_argument("--start", type=int, default=0)
     q.add_argument("--frames", type=int, default=1920)
     q.add_argument("--out", required=True, type=Path, help="output clip.mp4")
