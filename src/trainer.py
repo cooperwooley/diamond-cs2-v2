@@ -93,7 +93,9 @@ class Trainer(StateDictMixin):
         assert self._is_static_dataset
 
         num_actions = cfg.env.num_actions
-        dataset_full_res = CS2Hdf5Dataset(Path(cfg.env.path_data_full_res)) if cfg.env.path_data_full_res is not None else None
+        # Only the upsampler trains on full-res frames; a denoiser-only agent ignores path_data_full_res.
+        use_full_res = cfg.agent.upsampler is not None and cfg.env.path_data_full_res is not None
+        dataset_full_res = CS2Hdf5Dataset(Path(cfg.env.path_data_full_res)) if use_full_res else None
 
         num_workers = cfg.training.num_workers_data_loaders
         use_manager = cfg.training.cache_in_ram and (num_workers > 0)

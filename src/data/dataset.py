@@ -196,7 +196,10 @@ class CS2Hdf5Dataset(StateDictMixin, TorchDataset):
         pass
 
     def _resolve(self, episode_id: Union[int, str]) -> str:
-        return self._keys[episode_id] if isinstance(episode_id, (int, np.integer)) else episode_id
+        if isinstance(episode_id, (int, np.integer)):
+            assert 0 <= episode_id < self.num_episodes, f"episode id {episode_id} out of range"
+            return self._keys[episode_id]
+        return episode_id
 
     def __getitem__(self, segment_id: SegmentId) -> Segment:
         key = self._resolve(segment_id.episode_id)
