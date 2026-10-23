@@ -148,8 +148,14 @@ def _dispatch(args: argparse.Namespace) -> None:
         from cs2wm.pipeline import sync
 
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-        if not sync.run(_cfg(args)).ok:
-            raise sync.SyncError("sync finished with errors, see the log above")
+        try:
+            ok = sync.run(_cfg(args)).ok
+        except sync.SyncError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if not ok:
+            print("error: sync finished with errors, see the log above", file=sys.stderr)
+            raise SystemExit(1)
     elif cmd == "supervise":
         from cs2wm.pipeline.supervisor import PipelineState, Supervisor
 
@@ -236,8 +242,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Argument list (defaults to ``sys.argv[1:]``).
 
     Returns:
-        Process exit code: 0 on success, 1 on a runtime error such as a failed sync, 2 when the command is not
-        implemented yet.
+        Process exit code: 0 on success, 2 when the command is not implemented yet.
     """
     args = build_parser().parse_args(argv)
     try:
@@ -245,9 +250,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except NotImplementedError as exc:
         print(f"not implemented yet: {exc}", file=sys.stderr)
         return 2
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
     return 0
 
 

@@ -15,6 +15,16 @@ from cs2wm.pipeline.pack import append_manifest, write_episode
 from cs2wm.pipeline.sync import DemoResult, SyncError, Transport
 
 H, W = 150, 280
+SSH_OPTS = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=30",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+]
 
 
 class LocalTransport(Transport):
@@ -46,6 +56,11 @@ class BrokenCheckTransport(LocalTransport):
         if "sha256sum" in remote_cmd:
             return ["bash", "-c", "echo connection lost >&2; exit 255"]
         return super().ssh_argv(remote_cmd)
+
+
+def real_run(argv, **kw):
+    """The real ``subprocess.run`` (callers pass ``check`` already), for spies that wrap the default runner."""
+    return subprocess.run(argv, **kw)  # noqa: PLW1510
 
 
 @pytest.fixture
@@ -153,9 +168,18 @@ def test_remote_root_user_is_expanded_by_the_remote_shell(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("bad", ["/x; rm -rf /", "/x/$(whoami)", "/x/`id`", "/x y", "/x/$HOME"])
-def test_remote_root_rejects_shell_metacharacters(bad) -> None:
+def test_remote_root_rejects_shell_metacharacters(bad, tmp_path) -> None:
+    cfg = load_config(overrides=[f"paths.root={tmp_path}", f"sync.remote_root={bad}"])
+    t = LocalTransport()
     with pytest.raises(SyncError, match="remote_root"):
-        sync._remote_root(LocalTransport(), bad)
+        sync._remote_root(t, cfg)
+    assert t.ssh_cmds == []  # rejected before anything reaches the remote shell
+
+
+def test_remote_root_command_has_no_embedded_quotes(cfg) -> None:
+    t = LocalTransport()
+    sync._connect(t, cfg)
+    assert [c for c in t.ssh_cmds if c.startswith("printf")] == [f"printf %s {cfg.sync.remote_root}"]
 
 
 # --- partial failure and delete safety --------------------------------------------------------------------------
@@ -359,7 +383,9 @@ def test_cli_returns_1_with_message_on_preflight_failure(cfg, monkeypatch, capsy
     monkeypatch.setattr(sync, "Transport", lambda host: NoKeyTransport())
     config = tmp_path / "c.yaml"
     config.write_text(Path(__file__).resolve().parent.parent.joinpath("config/cs2wm.yaml").read_text())
-    assert main(["--config", str(config), "sync"]) == 1
+    with pytest.raises(SystemExit) as e:
+        main(["--config", str(config), "sync"])
+    assert e.value.code == 1
     assert "#3" in capsys.readouterr().err
 
 
@@ -378,8 +404,7 @@ def test_linux_argv() -> None:
     t = Transport("mill", windows=False)
     assert t.ssh_argv("cd '/s' && sha256sum -c -") == [
         "ssh",
-        "-o",
-        "BatchMode=yes",
+        *SSH_OPTS,
         "mill",
         "cd '/s' && sha256sum -c -",
     ]
@@ -387,13 +412,14 @@ def test_linux_argv() -> None:
         "rsync",
         "-a",
         "--partial",
+        "--timeout=300",
         "--exclude=*.tmp",
         "-e",
-        "ssh -o BatchMode=yes",
+        "ssh " + " ".join(SSH_OPTS),
         "/data/hdf5/",
         "mill:/s/hdf5/",
     ]
-    assert "--files-from=-" in t.rsync_argv("/a/", "mill:/b/", files_from_stdin=True)
+    assert t.rsync_argv("/a/", "mill:/b/", files_from_stdin=True)[-4:-2] == ["--files-from=-", "--from0"]
     assert t.local_path(Path("/data/x")) == "/data/x"
 
 
@@ -405,14 +431,14 @@ def test_windows_argv_goes_through_wsl_with_wslpath() -> None:
         return subprocess.CompletedProcess(argv, 0, stdout="/mnt/c/dcs2/data/hdf5\n", stderr="")
 
     t = Transport("mill", windows=True, runner=fake)
-    assert t.ssh_argv("true") == ["wsl.exe", "-e", "ssh", "-o", "BatchMode=yes", "mill", "true"]
+    assert t.ssh_argv("true") == ["wsl.exe", "-e", "ssh", *SSH_OPTS, "mill", "true"]
     local = t.local_path(Path("C:/dcs2/data/hdf5"))
     assert local == "/mnt/c/dcs2/data/hdf5"
     assert calls[0][:5] == ["wsl.exe", "-e", "wslpath", "-a", "-u"]
     argv = t.rsync_argv(local + "/", t.remote_spec("/s/hdf5/"))
     assert argv[:5] == ["wsl.exe", "-e", "rsync", "-a", "--partial"]
     assert argv[-2:] == ["/mnt/c/dcs2/data/hdf5/", "mill:/s/hdf5/"]
-    assert argv[argv.index("ssh -o BatchMode=yes") - 1] == "-e"
+    assert argv[argv.index("ssh " + " ".join(SSH_OPTS)) - 1] == "-e"
 
 
 def test_wslpath_failure_is_reported() -> None:
@@ -428,3 +454,148 @@ def test_default_platform_detection(monkeypatch) -> None:
     assert Transport("mill").windows
     monkeypatch.setattr(os, "name", "posix")
     assert not Transport("mill").windows
+
+
+# --- stdin bytes, timeouts, per-demo state, names -----------------------------------------------------------------
+
+
+def test_stdin_is_sent_as_exact_bytes_without_carriage_returns(cfg) -> None:
+    """Text mode would turn \\n into \\r\\n on Windows, so the listings must reach the runner as bytes."""
+    make_demo(cfg, "d1", episodes=1)
+    sent: dict[str, bytes] = {}
+
+    def spy(argv, input=None, **kw):
+        if "--files-from=-" in argv:
+            sent["files"] = input
+        elif "sha256sum" in argv[-1]:
+            sent["check"] = input
+        return real_run(argv, input=input, **kw)
+
+    t = LocalTransport()
+    t._runner = spy
+    sync.push(cfg, "d1", t)
+    sync.verify_remote(cfg, "d1", t)
+
+    assert all(isinstance(v, bytes) and b"\r" not in v for v in sent.values())
+    # rsync --files-from=- --from0 (last call is qa/): NUL-terminated names relative to the tree, nothing else.
+    assert sent["files"] == b"d1.jsonl\0"
+    # sha256sum -c -: "<hex>  <rel>\n" per manifest entry, LF only.
+    lines = sent["check"].split(b"\n")
+    assert lines[-1] == b"" and len(lines) == 3
+    for line, rel in zip(lines, [b"hdf5/dm/d1/d1_e0.hdf5", b"hdf5_fullres/dm/d1/d1_e0.hdf5"]):
+        digest, name = line.split(b"  ")
+        assert len(digest) == 64 and name == rel
+
+
+def test_timeout_becomes_syncerror_and_nothing_is_deleted(cfg) -> None:
+    files = make_demo(cfg, "d1")
+
+    def hang_on_verify(argv, **kw):
+        if "sha256sum" in argv[-1]:
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        return real_run(argv, **kw)
+
+    t = LocalTransport()
+    t._runner = hang_on_verify
+    summary = sync.run(cfg, t)
+
+    r = summary.by_demo["d1"]
+    assert not summary.ok and not r.synced and r.deleted == 0
+    assert all(f.exists() for f in files)
+    assert any("timed out" in e and "nothing deleted" in e for e in r.errors)
+
+
+def test_rsync_timeout_is_a_push_error_not_a_crash(cfg) -> None:
+    files = make_demo(cfg, "d1")
+
+    def hang_on_rsync(argv, **kw):
+        if argv[0] == "rsync":
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        return real_run(argv, **kw)
+
+    t = LocalTransport()
+    t._runner = hang_on_rsync
+    summary = sync.run(cfg, t)
+    assert len(summary.push_errors) == 4 and "timed out" in summary.push_errors[0]
+    assert all(f.exists() for f in files)
+
+
+def test_timeouts_come_from_config(cfg) -> None:
+    seen: dict[str, float] = {}
+
+    def spy(argv, **kw):
+        seen[argv[0] if argv[0] == "rsync" else argv[-1].split()[0]] = kw["timeout"]
+        return real_run(argv, **kw)
+
+    make_demo(cfg, "d1", episodes=1)
+    t = LocalTransport()
+    t._runner = spy
+    sync.run(cfg, t)
+    assert seen["rsync"] == cfg.sync.rsync_timeout_s
+    assert seen["true"] == seen["mkdir"] == seen["printf"] == cfg.sync.ssh_timeout_s
+    assert seen["cd"] == cfg.sync.verify_timeout_s
+
+
+def test_qa_push_failure_does_not_unsync_verified_hdf5(cfg) -> None:
+    class QaFails(LocalTransport):
+        def rsync_argv(self, src, dest, files_from_stdin=False):
+            if dest.rstrip("/").endswith("/qa"):
+                return ["bash", "-c", "echo qa down >&2; exit 23"]
+            return super().rsync_argv(src, dest, files_from_stdin)
+
+    files = make_demo(cfg, "d1")
+    summary = sync.run(cfg, QaFails())
+
+    r = summary.by_demo["d1"]
+    assert not summary.ok and len(summary.push_errors) == 1 and "qa/" in summary.push_errors[0]
+    # The HDF5 is verified and freed; the demo is not "synced" until its QA reaches the Mill.
+    assert (r.verified, r.deleted) == (4, 4) and not any(f.exists() for f in files)
+    assert not r.pushed and not r.synced and r.errors == []
+
+    again = sync.run(cfg, LocalTransport())  # QA recovers on the next run
+    assert again.ok and again.by_demo["d1"].synced
+
+
+def test_hdf5_push_failure_is_covered_by_verification_not_by_pushed(cfg) -> None:
+    class Hdf5Fails(LocalTransport):
+        def rsync_argv(self, src, dest, files_from_stdin=False):
+            if dest.rstrip("/").endswith("/hdf5"):
+                return ["bash", "-c", "exit 23"]
+            return super().rsync_argv(src, dest, files_from_stdin)
+
+    files = make_demo(cfg, "d1", episodes=1)
+    r = sync.run(cfg, Hdf5Fails()).by_demo["d1"]
+    # The low-res file never arrived, so it is unverified and kept; the full-res one is freed.
+    assert r.pushed and not r.synced and r.verified == 1 and r.deleted == 1
+    assert files[0].exists() and not files[1].exists()
+
+
+def test_directories_with_unusable_names_are_skipped_and_reported(cfg) -> None:
+    files = make_demo(cfg, "d1", episodes=1)
+    bad = Path(cfg.paths.hdf5) / "dm" / "bad name"
+    bad.mkdir()
+    (bad / "manifest.jsonl").write_text('{"file": "x.hdf5", "sha256": "' + "0" * 64 + '"}\n')
+    victim = bad / "x.hdf5"
+    victim.write_bytes(b"x")
+
+    summary = sync.run(cfg, LocalTransport())
+
+    assert [d.demo_id for d in summary.demos] == ["d1"] and summary.by_demo["d1"].synced
+    assert not summary.ok and len(summary.skipped) == 1 and "bad name" in summary.skipped[0]
+    assert victim.exists() and not files[0].exists()
+
+
+@pytest.mark.parametrize("name", ["../x.hdf5", "a/b.hdf5", "x\n.hdf5", "/abs.hdf5", "fullres/../x.hdf5", "x.dem"])
+def test_unsafe_manifest_file_names_are_errors_and_never_touched(cfg, tmp_path, name) -> None:
+    files = make_demo(cfg, "d1", episodes=1)
+    manifest = Path(cfg.paths.hdf5) / "dm" / "d1" / "manifest.jsonl"
+    outside = tmp_path / "data" / "hdf5" / "dm" / "x.hdf5"
+    outside.write_bytes(b"precious")
+    append_manifest(manifest, {"file": name, "sha256": "0" * 64})
+
+    r = sync.run(cfg, LocalTransport()).by_demo["d1"]
+
+    assert r.expected == 2 and len(r.errors) == 1 and not r.synced
+    assert "bad file" in r.errors[0]
+    assert outside.read_bytes() == b"precious"
+    assert not any(f.exists() for f in files)  # the two honest entries still sync

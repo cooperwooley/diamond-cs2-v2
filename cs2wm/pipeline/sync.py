@@ -37,7 +37,18 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # ``sync.remote_root`` may only hold these characters plus ``$USER``/``${USER}``, so it is safe inside double quotes.
 _ROOT_RE = re.compile(r"[A-Za-z0-9_./-]+")
 _ROOT_VAR_RE = re.compile(r"\$\{USER\}|\$USER")
-_SSH_OPTS = ("-o", "BatchMode=yes")
+# BatchMode: never prompt. The rest make a dead connection fail in about a minute instead of hanging unattended.
+_SSH_OPTS = (
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=30",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+)
+_RSYNC_IO_TIMEOUT_S = 300
 
 
 class SyncError(RuntimeError):
@@ -52,14 +63,14 @@ class Transport:
     Args:
         host: ``~/.ssh/config`` alias of the Mill (``sync.host``).
         windows: Route commands through ``wsl.exe -e`` (default: ``os.name == "nt"``). The ssh key lives in WSL.
-        runner: ``subprocess.run`` stand-in.
+        runner: ``subprocess.run`` stand-in (receives bytes on stdin, may return bytes or str).
     """
 
     def __init__(
         self,
         host: str,
         windows: bool | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     ) -> None:
         self.host = host
         self.windows = os.name == "nt" if windows is None else windows
@@ -78,14 +89,22 @@ class Transport:
         Args:
             src: Local source, ending in ``/`` to copy the directory's contents.
             dest: Remote destination as returned by ``remote_spec``.
-            files_from_stdin: Copy only the files listed on stdin (relative to ``src``).
+            files_from_stdin: Copy only the files listed on stdin (relative to ``src``), NUL-separated.
 
         Returns:
             The argv list.
         """
-        argv = ["rsync", "-a", "--partial", "--exclude=*.tmp", "-e", shlex.join(["ssh", *_SSH_OPTS])]
+        argv = [
+            "rsync",
+            "-a",
+            "--partial",
+            f"--timeout={_RSYNC_IO_TIMEOUT_S}",
+            "--exclude=*.tmp",
+            "-e",
+            shlex.join(["ssh", *_SSH_OPTS]),
+        ]
         if files_from_stdin:
-            argv.append("--files-from=-")
+            argv += ["--files-from=-", "--from0"]
         return self._wrap([*argv, src, dest])
 
     def remote_spec(self, path: str) -> str:
@@ -96,28 +115,45 @@ class Transport:
         """Path as the rsync binary sees it: ``wslpath`` translation on Windows, ``as_posix`` elsewhere."""
         if not self.windows:
             return path.as_posix()
-        proc = self.run(["wsl.exe", "-e", "wslpath", "-a", "-u", str(path)])
+        proc = self.run(["wsl.exe", "-e", "wslpath", "-a", "-u", str(path)], timeout=60)
         if proc.returncode != 0 or not proc.stdout.strip():
             raise SyncError(f"wslpath failed for {path}: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
-    def run(self, argv: Sequence[str], stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, argv: Sequence[str], stdin: str | None = None, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """Run an argv list (never through a shell) and capture its output.
+
+        Stdin is sent as UTF-8 bytes, so text mode cannot turn ``\\n`` into ``\\r\\n`` on Windows.
 
         Args:
             argv: Command and arguments.
-            stdin: Text for the command's stdin.
+            stdin: Text for the command's stdin, sent byte for byte.
+            timeout: Seconds before the command is killed.
 
         Returns:
-            The finished process; the caller checks ``returncode``.
+            The finished process with decoded output; the caller checks ``returncode``.
 
         Raises:
-            SyncError: If the executable cannot be started.
+            SyncError: If the executable cannot be started or the timeout expires.
         """
         try:
-            return self._runner(list(argv), input=stdin, capture_output=True, text=True, check=False)
+            proc = self._runner(
+                list(argv),
+                input=None if stdin is None else stdin.encode("utf-8"),
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
         except OSError as e:
             raise SyncError(f"cannot run {argv[0]!r}: {e}") from e
+        except subprocess.TimeoutExpired as e:
+            raise SyncError(f"{argv[0]!r} timed out after {timeout}s: {shlex.join(map(str, argv))[:200]}") from e
+        out, err = (
+            b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "") for b in (proc.stdout, proc.stderr)
+        )
+        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 @dataclass
@@ -127,7 +163,8 @@ class DemoResult:
     Attributes:
         demo_id: Demo id.
         kind: Episode kind (``dm``, ``human``, ``smoke``).
-        pushed: True if every rsync of this run succeeded.
+        pushed: True if the rsyncs that carry this demo's ``demos/`` and ``qa/`` files succeeded (the HDF5 is covered
+            by checksum verification instead).
         expected: Manifest entries (distinct files).
         verified: Entries whose remote sha256 matches the manifest.
         deleted: Local HDF5 files deleted by this run.
@@ -150,10 +187,11 @@ class DemoResult:
 
 @dataclass
 class SyncSummary:
-    """Result of ``run``: one ``DemoResult`` per demo with a manifest, plus transfer errors."""
+    """Result of ``run``: one ``DemoResult`` per demo with a manifest, rsync errors, and skipped bad directories."""
 
     demos: list[DemoResult] = field(default_factory=list)
     push_errors: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
 
     @property
     def by_demo(self) -> dict[str, DemoResult]:
@@ -163,7 +201,7 @@ class SyncSummary:
     @property
     def ok(self) -> bool:
         """True if nothing failed anywhere."""
-        return not self.push_errors and all(not d.errors for d in self.demos)
+        return not self.push_errors and not self.skipped and all(not d.errors for d in self.demos)
 
 
 @dataclass(frozen=True)
@@ -173,11 +211,17 @@ class _Entry:
     sha256: str
 
 
-def _remote_root(transport: Transport, root: str) -> str:
-    """Expand ``$USER`` on the Mill: the config value goes through the remote shell in double quotes."""
+def _ssh_timeout(cfg: DictConfig) -> float:
+    return float(cfg.sync.ssh_timeout_s)
+
+
+def _remote_root(transport: Transport, cfg: DictConfig) -> str:
+    """Expand ``$USER`` on the Mill: the config value goes through the remote shell, unquoted but restricted."""
+    root = str(cfg.sync.remote_root)
     if not _ROOT_RE.fullmatch(_ROOT_VAR_RE.sub("", root)):
         raise SyncError(f"sync.remote_root {root!r} may only contain [A-Za-z0-9_./-] and $USER")
-    proc = transport.run(transport.ssh_argv(f'printf %s "{root}"'))
+    # No quotes: the root is restricted above, and embedded quotes do not survive wsl.exe's argument re-parsing.
+    proc = transport.run(transport.ssh_argv(f"printf %s {root}"), timeout=_ssh_timeout(cfg))
     lines = proc.stdout.strip().splitlines()
     # A login banner may precede the path, so take the last line.
     resolved = lines[-1].strip() if lines else ""
@@ -195,16 +239,16 @@ def _connect(transport: Transport, cfg: DictConfig) -> str:
     Raises:
         SyncError: If ssh cannot log in non-interactively or the remote directories cannot be made.
     """
-    proc = transport.run(transport.ssh_argv("true"))
+    proc = transport.run(transport.ssh_argv("true"), timeout=_ssh_timeout(cfg))
     if proc.returncode != 0:
         raise SyncError(
             f"cannot log in to {transport.host!r} without a password (ssh -o BatchMode=yes {transport.host} true "
             f"exited {proc.returncode}: {proc.stderr.strip() or 'no output'}). Key-based SSH is not set up: "
             "finish issue #3 (ssh-keygen, the 'Host mill' alias in ~/.ssh/config, ssh-copy-id) first."
         )
-    root = _remote_root(transport, str(cfg.sync.remote_root))
+    root = _remote_root(transport, cfg)
     dirs = " ".join(shlex.quote(f"{root}/{t}") for t in _TREES)
-    proc = transport.run(transport.ssh_argv(f"mkdir -p {dirs}"))
+    proc = transport.run(transport.ssh_argv(f"mkdir -p {dirs}"), timeout=_ssh_timeout(cfg))
     if proc.returncode != 0:
         raise SyncError(f"mkdir -p under {root} failed on {transport.host}: {proc.stderr.strip()}")
     return root
@@ -222,9 +266,13 @@ def _demo_files(cfg: DictConfig, tree: str, demo_id: str) -> list[str]:
     return sorted(p.relative_to(base).as_posix() for p in base.glob(pattern) if p.is_file())
 
 
-def _push_trees(transport: Transport, cfg: DictConfig, root: str, demo_id: str | None) -> list[str]:
-    """Rsync each tree; keep going after a failure so one bad directory does not block the rest."""
-    errors: list[str] = []
+def _push_trees(transport: Transport, cfg: DictConfig, root: str, demo_id: str | None) -> dict[str, str]:
+    """Rsync each tree; keep going after a failure so one bad directory does not block the rest.
+
+    Returns:
+        Error message by tree name, for the trees that failed.
+    """
+    errors: dict[str, str] = {}
     for tree in _TREES:
         base = Path(cfg.paths[tree])
         if not base.is_dir():
@@ -237,9 +285,15 @@ def _push_trees(transport: Transport, cfg: DictConfig, root: str, demo_id: str |
             transport.remote_spec(f"{root}/{tree}/"),
             files_from_stdin=files is not None,
         )
-        proc = transport.run(argv, stdin=None if files is None else "\n".join(files) + "\n")
+        # NUL-separated (--from0) so no newline or carriage return can end up in a name.
+        stdin = None if files is None else "".join(f + "\0" for f in files)
+        try:
+            proc = transport.run(argv, stdin=stdin, timeout=float(cfg.sync.rsync_timeout_s))
+        except SyncError as e:
+            errors[tree] = f"rsync of {tree}/ failed: {e}"
+            continue
         if proc.returncode != 0:
-            errors.append(f"rsync of {tree}/ failed (exit {proc.returncode}): {proc.stderr.strip()}")
+            errors[tree] = f"rsync of {tree}/ failed (exit {proc.returncode}): {proc.stderr.strip()}"
     return errors
 
 
@@ -260,7 +314,7 @@ def push(cfg: DictConfig, demo_id: str | None = None, transport: Transport | Non
     transport = transport or Transport(str(cfg.sync.host))
     errors = _push_trees(transport, cfg, _connect(transport, cfg), demo_id)
     if errors:
-        raise SyncError("; ".join(errors))
+        raise SyncError("; ".join(errors.values()))
 
 
 def _check_demo_id(demo_id: str) -> None:
@@ -298,7 +352,7 @@ def _read_manifest(cfg: DictConfig, kind: str, demo_id: str) -> tuple[list[_Entr
     return list(entries.values()), errors
 
 
-def _remote_check(transport: Transport, root: str, entries: Sequence[_Entry]) -> set[str]:
+def _remote_check(transport: Transport, cfg: DictConfig, root: str, entries: Sequence[_Entry]) -> set[str]:
     """One ``sha256sum -c`` on the Mill for ``entries``.
 
     Returns:
@@ -310,7 +364,11 @@ def _remote_check(transport: Transport, root: str, entries: Sequence[_Entry]) ->
     if not entries:
         return set()
     listing = "".join(f"{e.sha256}  {e.rel}\n" for e in entries)
-    proc = transport.run(transport.ssh_argv(f"cd {shlex.quote(root)} && LC_ALL=C sha256sum -c -"), stdin=listing)
+    proc = transport.run(
+        transport.ssh_argv(f"cd {shlex.quote(root)} && LC_ALL=C sha256sum -c -"),
+        stdin=listing,
+        timeout=float(cfg.sync.verify_timeout_s),
+    )
     # sha256sum exits 1 when some file failed, which is data, not an error; anything else is.
     if proc.returncode not in (0, 1):
         raise SyncError(f"remote sha256sum -c exited {proc.returncode}: {proc.stderr.strip()}")
@@ -318,11 +376,19 @@ def _remote_check(transport: Transport, root: str, entries: Sequence[_Entry]) ->
     return ok & {e.rel for e in entries}
 
 
-def _find_demos(cfg: DictConfig, demo_id: str | None) -> list[tuple[str, str]]:
-    """``(kind, demo_id)`` of every demo with a manifest."""
+def _find_demos(cfg: DictConfig, demo_id: str | None) -> tuple[list[tuple[str, str]], list[str]]:
+    """``(kind, demo_id)`` of every demo with a manifest, plus messages for directories with unusable names."""
     base = Path(cfg.paths.hdf5)
     pattern = f"*/{demo_id or '*'}/manifest.jsonl"
-    return sorted((p.parent.parent.name, p.parent.name) for p in base.glob(pattern))
+    found: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    for p in sorted(base.glob(pattern)):
+        kind, name = p.parent.parent.name, p.parent.name
+        if all(_NAME_RE.fullmatch(n) and ".." not in n for n in (kind, name)):
+            found.append((kind, name))
+        else:
+            skipped.append(f"skipped {p.parent}: kind and demo id must match [A-Za-z0-9][A-Za-z0-9._-]*")
+    return found, skipped
 
 
 def _verify_demo(
@@ -335,7 +401,7 @@ def _verify_demo(
         Mill with the same sha256; the count of remotely verified entries; the manifest size; and the problems.
     """
     entries, errors = _read_manifest(cfg, kind, demo_id)
-    ok = _remote_check(transport, root, entries)
+    ok = _remote_check(transport, cfg, root, entries)
     deletable: list[Path] = []
     for e in entries:
         if e.rel not in ok:
@@ -365,7 +431,7 @@ def verify_remote(cfg: DictConfig, demo_id: str, transport: Transport | None = N
         ValueError: If ``demo_id`` is not a plain id.
     """
     _check_demo_id(demo_id)
-    demos = _find_demos(cfg, demo_id)
+    demos, _ = _find_demos(cfg, demo_id)
     if not demos:
         raise SyncError(f"no manifest.jsonl for demo {demo_id!r} under {cfg.paths.hdf5}")
     transport = transport or Transport(str(cfg.sync.host))
@@ -415,12 +481,16 @@ def run(cfg: DictConfig, transport: Transport | None = None) -> SyncSummary:
     """
     transport = transport or Transport(str(cfg.sync.host))
     root = _connect(transport, cfg)
-    summary = SyncSummary(push_errors=_push_trees(transport, cfg, root, None))
-    for err in summary.push_errors:
+    failed = _push_trees(transport, cfg, root, None)
+    demos, skipped = _find_demos(cfg, None)
+    summary = SyncSummary(push_errors=list(failed.values()), skipped=skipped)
+    for err in [*summary.push_errors, *summary.skipped]:
         logger.error("sync: %s", err)
 
-    for kind, demo_id in _find_demos(cfg, None):
-        result = DemoResult(demo_id, kind, pushed=not summary.push_errors)
+    # HDF5 safety rests on checksum verification, so a failed hdf5 push only shows up as unverified files.
+    pushed = not ({"demos", "qa"} & failed.keys())
+    for kind, demo_id in demos:
+        result = DemoResult(demo_id, kind, pushed=pushed)
         summary.demos.append(result)
         try:
             deletable, result.verified, result.expected, result.errors = _verify_demo(
@@ -449,6 +519,6 @@ def run(cfg: DictConfig, transport: Transport | None = None) -> SyncSummary:
         len(summary.demos),
         sum(d.synced for d in summary.demos),
         sum(d.deleted for d in summary.demos),
-        len(summary.push_errors) + sum(len(d.errors) for d in summary.demos),
+        len(summary.push_errors) + len(summary.skipped) + sum(len(d.errors) for d in summary.demos),
     )
     return summary
