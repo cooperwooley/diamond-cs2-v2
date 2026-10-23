@@ -78,6 +78,9 @@ qa:
 segment:
   policy: longest_remaining         # bots; human sessions use fixed_player
   settle_ticks: 32                  # dropped after spawn and before death (camera transitions); tuned in #14
+                                    # also the gap between two segments (camera switch)
+  seed: 0                           # plan RNG seed (ties in the spectate policy); mixed with the demo id
+  event_player_props: [user_id]     # player props requested with spawn/death events; add entity_id once #14 confirms it
 
 pack:
   schema_version: 1
