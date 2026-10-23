@@ -10,6 +10,7 @@ paths:
   demos: ${paths.root}/demos                 # master copy; mirrored to the Mill by sync
   plans: ${paths.root}/plans                 # render_plan.json per demo (#10)
   frames: ${paths.root}/frames               # rendered 280x150 frames, deleted after pack
+  raw: ${paths.root}/raw                     # HLAE raw captures (1280x720), deleted per segment after downscaling
   hdf5: ${paths.root}/hdf5                   # packed low-res episodes, deleted after sync
   hdf5_fullres: ${paths.root}/hdf5_fullres   # ~10% full-res JPEG subset
   qa: ${paths.root}/qa
@@ -114,8 +115,25 @@ generate:
 
 render:
   tick_offset: 0                    # measured in #14
-  timeout_factor: 3.0               # x demo length
+  timeout_factor: 3.0               # x demo length (demo_end_tick / tickrate)
+  startup_s: 180                    # CS2 launch + demo load, added to the timeout.   CONFIRM(#14)
   output_format: tga                # tga | ffmpeg; decided in #14
+  ffmpeg_preset: afxFfmpegLosslessBest  # used when output_format = ffmpeg; must be lossless.   CONFIRM(#14)
+  retries: 1                        # a crash, timeout or frame-count mismatch is retried this often, then the demo fails
+  poll_s: 2                         # polling interval while waiting for HLAE / cs2.exe
+  quit_delay_ticks: 8               # `quit` is scheduled this many ticks after the last record end (capped at demo end)
+  stream_name: dcs2                 # `mirv_streams add normal <name>`; also the capture sub-folder.   CONFIRM(#14)
+  # In-eye spectator mode for `spec_mode <n>`.   CONFIRM(#14): 2 is the candidate, try 1 if not first person.
+  spec_mode: 2
+  # Which plan target field `spec_player` takes: entity_id | user_id | slot | name.   CONFIRM(#14)
+  # `slot` is a 1-based index that the plan does not carry, so it fails clearly until #14 defines how to map it.
+  spec_player_field: entity_id
+  hlae_exe: HLAE.exe                # relative to paths.hlae_dir
+  hook_dll: x64/AfxHookSource2.dll  # relative to paths.hlae_dir
+  # Command line handed to cs2.exe by the HLAE custom loader, before -w/-h (from resolution.capture) and +playdemo/+exec.
+  # -insecure is mandatory: the launcher and the config validator both refuse to run without it.
+  launch_options: [-steam, -insecure, -novid, -console, -sw]
+  png_compression: 1                # cv2 IMWRITE_PNG_COMPRESSION (0-9) for frames/; low = fast, see render.py
 
 sync:
   host: mill                        # ~/.ssh/config alias from #3

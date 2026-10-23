@@ -150,7 +150,16 @@ def _dispatch(args: argparse.Namespace) -> None:
     elif cmd == "render":
         from cs2wm.pipeline import render
 
-        render.run(Path(args.demo or ""), _cfg(args))
+        cfg = _cfg(args)
+        if args.all_pending:
+            # TODO(#20): resolve --all-pending through the supervisor's persistent pipeline state.
+            raise NotImplementedError("TODO(#20): render --all-pending")
+        if not args.demo:
+            raise SystemExit("render: give a demo id or a path to a .dem file")
+        result = render.run(_resolve_demo(args.demo, cfg), cfg)
+        if not result.ok:
+            raise SystemExit(f"render failed: {result.reason}")
+        print(result.out_dir)
     elif cmd == "extract":
         from cs2wm.pipeline import extract_actions
 

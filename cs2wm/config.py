@@ -172,11 +172,33 @@ def validate_config(cfg: DictConfig) -> None:
     if cfg.qa.max_fill_ticks < 0:
         problems.append(f"qa.max_fill_ticks must be >= 0, got {cfg.qa.max_fill_ticks}")
 
+    _validate_render(cfg, problems)
+
     if "default" not in cfg.actions.slots:
         problems.append("actions.slots.default is missing")
 
     if problems:
         raise ConfigError("invalid cs2wm config:\n  - " + "\n  - ".join(problems))
+
+
+def _validate_render(cfg: DictConfig, problems: list[str]) -> None:
+    """Append problems with the ``render`` section."""
+    r = cfg.render
+    if "-insecure" not in list(r.launch_options):
+        problems.append("render.launch_options must contain '-insecure' (HLAE and CS2 must never run without it)")
+    if r.output_format not in ("tga", "ffmpeg"):
+        problems.append(f"render.output_format must be 'tga' or 'ffmpeg', got {r.output_format!r}")
+    if r.spec_player_field not in ("entity_id", "user_id", "slot", "name"):
+        problems.append(
+            f"render.spec_player_field must be entity_id, user_id, slot or name, got {r.spec_player_field!r}"
+        )
+    for key in ("timeout_factor", "poll_s", "quit_delay_ticks"):
+        if r[key] <= 0:
+            problems.append(f"render.{key} must be > 0, got {r[key]}")
+    if r.startup_s < 0 or r.retries < 0:
+        problems.append(f"render.startup_s and render.retries must be >= 0, got {r.startup_s} and {r.retries}")
+    if not 0 <= r.png_compression <= 9:
+        problems.append(f"render.png_compression must be in [0, 9], got {r.png_compression}")
 
 
 def ticks_per_frame(cfg: DictConfig) -> int:
