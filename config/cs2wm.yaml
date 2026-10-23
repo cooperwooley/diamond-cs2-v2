@@ -99,8 +99,8 @@ render:
 
 sync:
   host: mill                        # ~/.ssh/config alias from #3
-  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill
-  delete_local_hdf5: true
+  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill (only [A-Za-z0-9_./-] and $USER allowed)
+  delete_local_hdf5: true           # free local hdf5/ + hdf5_fullres/ files whose remote sha256 verified; demos stay
 
 supervisor:
   max_working_gb: 8
