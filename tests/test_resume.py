@@ -4,6 +4,9 @@ import importlib.util
 import json
 import os
 import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -135,6 +138,11 @@ def test_preempt_and_resume_matches_uninterrupted_run(
         assert t.num_batch_train.denoiser == N_EPOCHS * STEPS_PER_EPOCH
         assert optimizer_steps(t) == N_EPOCHS * STEPS_PER_EPOCH
         assert t.lr_sched.denoiser.last_epoch == N_EPOCHS * STEPS_PER_EPOCH
+        # Adam moments must have been restored (or rebuilt), not reset: every parameter has them after training.
+        states = list(t.opt.denoiser.state.values())
+        assert states and all("exp_avg" in st and "exp_avg_sq" in st for st in states)
+        assert all(int(st["step"]) == N_EPOCHS * STEPS_PER_EPOCH for st in states)
+        assert any(st["exp_avg"].abs().sum() > 0 for st in states)
     assert (run / "checkpoints" / "DONE").is_file()
     assert [m["epoch"] for m in read_metrics(run / "metrics.jsonl")] == [1, 2]
 
@@ -297,3 +305,64 @@ def test_benchmark_script_is_executable(repo_root) -> None:
     path = repo_root / "scripts" / "benchmark_denoiser.py"
     assert path.read_text().startswith("#!/usr/bin/env python3")
     assert os.access(path, os.X_OK)
+
+
+def run_main(args: list[str], cwd: Path, env: dict, stop_when=None, timeout: float = 90):
+    """Run src/main.py (through @hydra.main) in a subprocess; optionally send SIGUSR1 once `stop_when()` is true."""
+    cmd = [sys.executable, str(Path(__file__).resolve().parent.parent / "src" / "main.py"), *args]
+    with (cwd / "stdout.log").open("a") as log:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            if stop_when is not None:
+                deadline = time.time() + timeout
+                while proc.poll() is None and not stop_when():
+                    assert time.time() < deadline, "condition never became true"
+                    time.sleep(0.05)
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGUSR1)
+            return proc.wait(timeout=timeout)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+def test_main_subprocess_preempt_resume_contract(data, tmp_path, repo_root, tiny_model_dotlist) -> None:
+    """The exit-code / file contract that scripts/mill/train.sbatch relies on, through the real entry point."""
+    run = tmp_path / "run"
+    args = [
+        f"hydra.run.dir={run}",
+        "common.resume=auto",
+        "common.devices=cpu",
+        f"env.path_data_low_res={data / 'low_res'}",
+        "env.path_data_full_res=null",
+        "agent=cs2_denoiser_only",
+        "training.num_workers_data_loaders=0",
+        "training.num_final_epochs=2",
+        "evaluation.every=1",
+        "denoiser.training.num_autoregressive_steps=1",
+        "denoiser.training.batch_size=2",
+        "denoiser.training.grad_acc_steps=1",
+        "denoiser.training.steps_first_epoch=40",
+        "denoiser.training.steps_per_epoch=40",
+        *[f"agent.{x}" for x in tiny_model_dotlist(("denoiser",))],
+    ]
+    env = {**os.environ, "WANDB_MODE": "disabled", "PYTHONPATH": str(repo_root / "src")}
+    metrics, ckpt = run / "metrics.jsonl", run / "checkpoints"
+    run.mkdir()  # the resubmitted-job case: the run dir already exists before the first start
+
+    # Run 1: signalled as soon as epoch 1 is logged, i.e. at the start of epoch 2.
+    code = run_main(args, tmp_path, env, stop_when=metrics.is_file)
+    assert code == 3, (tmp_path / "stdout.log").read_text()[-2000:]
+    assert (ckpt / "PREEMPTED").is_file() and (ckpt / "state.pt").is_file() and not (ckpt / "DONE").exists()
+    assert [m["epoch"] for m in read_metrics(metrics)] == [1]
+
+    # Run 2: resumes, finishes.
+    assert run_main(args, tmp_path, env) == 0, (tmp_path / "stdout.log").read_text()[-2000:]
+    assert (ckpt / "DONE").is_file() and not (ckpt / "PREEMPTED").exists()
+    assert [m["epoch"] for m in read_metrics(metrics)] == [1, 2]
+
+    # Run 3: DONE exists, exits 0 without training.
+    before = metrics.read_text()
+    assert run_main(args, tmp_path, env) == 0
+    assert metrics.read_text() == before and (ckpt / "DONE").is_file()

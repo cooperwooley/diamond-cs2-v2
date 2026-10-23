@@ -243,6 +243,8 @@ class Trainer(StateDictMixin):
             duration = p["elapsed"] + time.time() - self._epoch_start_time
             to_log.append({"duration": duration / 3600})
             if self._rank == 0:
+                # Appended before the epoch checkpoint on purpose: a hard kill in between duplicates this line after
+                # resume, which beats losing it. Consumers of metrics.jsonl must dedupe by "epoch", last line wins.
                 append_jsonl(
                     {
                         "epoch": self.epoch,
@@ -391,6 +393,7 @@ class Trainer(StateDictMixin):
         self._exit_preempted()
 
     def _exit_preempted(self) -> None:
+        # Preemption handling assumes a single process (one GPU); multi-GPU/DDP would need the flag all-reduced across ranks.
         if self._rank == 0:
             self._path_preempted.touch()
         sys.exit(3)
