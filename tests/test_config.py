@@ -55,6 +55,8 @@ def _bad(tmp_path: Path, overrides: list[str]) -> str:
         (["actions.mouse.x_units=[-10,0,10]"], "total 51"),
         (["actions.mouse.deg_per_unit=0"], "deg_per_unit"),
         (["generate.launch_options=[-novid]"], "-insecure"),
+        (["generate.chunking=udp"], "generate.chunking"),
+        (["generate.chunk_min=0"], "generate.chunk_min"),
         (["qa.min_fire_recall=1.5"], "qa.min_fire_recall"),
         (["qa.max_missing_tick_frac=-0.1"], "qa.max_missing_tick_frac"),
         (["qa.max_fill_ticks=-1"], "qa.max_fill_ticks"),

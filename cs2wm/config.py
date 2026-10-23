@@ -102,6 +102,12 @@ def validate_config(cfg: DictConfig) -> None:
     if "-insecure" not in list(cfg.generate.launch_options):
         problems.append("generate.launch_options must contain '-insecure' (CS2 must never run without it)")
 
+    if cfg.generate.chunking not in ("gotv", "netcon"):
+        problems.append(f"generate.chunking must be 'gotv' or 'netcon', got {cfg.generate.chunking!r}")
+    for key in ("chunk_min", "hang_timeout_min", "poll_s", "close_stable_s", "close_timeout_s", "max_failures"):
+        if cfg.generate[key] <= 0:
+            problems.append(f"generate.{key} must be > 0, got {cfg.generate[key]}")
+
     for key, value in cfg.qa.items():
         if (key.endswith("_frac") or key == "min_fire_recall") and not 0 <= value <= 1:
             problems.append(f"qa.{key} must be in [0, 1], got {value}")
