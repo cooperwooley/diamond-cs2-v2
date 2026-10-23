@@ -75,13 +75,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-res-frames",
         required=True,
         type=Path,
-        help="directory of full-res frames (file i = episode frame i) or a full-res episode HDF5",
+        help="directory of full-res frames (file i = episode frame i; a trailing extra frame is ignored) "
+        "or a full-res episode HDF5",
     )
     q.add_argument("--start", type=int, default=0)
-    q.add_argument("--frames", type=int, default=1920)
-    q.add_argument("--out", required=True, type=Path, help="output clip.mp4")
-    q = lc.add_parser("score", help="score a filled-in review sheet")
-    q.add_argument("sheet", type=Path, help="clip_labels.csv")
+    q.add_argument("--frames", type=int, default=None, help="clip length (default: to the end of the episode)")
+    q.add_argument(
+        "--out", required=True, type=Path, help="output clip.mp4 (the sheet is written as <stem>_labels.csv)"
+    )
+    q.epilog = "Judge each row by the change from this frame to the next (frame i shows the action taken after it)."
+    q = lc.add_parser("score", help="score filled-in review sheets (several are pooled)")
+    q.add_argument("sheet", nargs="+", type=Path, help="clip_labels.csv, one per reviewed episode")
     q.add_argument("--out", required=True, type=Path, help="e.g. results/label_accuracy.json")
 
     p = sub.add_parser("play", help="play the world model interactively (#28)")
@@ -181,7 +185,7 @@ def _dispatch(args: argparse.Namespace) -> None:
                 args.episode, args.full_res_frames, args.start, args.frames, args.out, _cfg(args)
             )
             label_accuracy.make_review_sheet(
-                args.episode, args.start, args.frames, args.out.with_name(args.out.stem + "_labels.csv")
+                args.episode, args.start, args.frames, args.out.with_name(args.out.stem + "_labels.csv"), cfg=_cfg(args)
             )
         else:
             label_accuracy.score_review_sheet(args.sheet, args.out)

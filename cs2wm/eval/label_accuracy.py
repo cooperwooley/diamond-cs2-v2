@@ -4,6 +4,12 @@
 frame index); ``make_review_sheet`` writes ``clip_labels.csv`` (one row per label transition plus 200 random frames
 for the mouse; columns ``frame, slot, label, ok, note``); ``score_review_sheet`` reports accuracy per slot group.
 
+A clip covers one episode (at most ``episodes.max_frames`` = 1000 frames, about a minute); a ~2-minute check
+renders two consecutive episodes, reviews both sheets and scores them together.
+
+Timing: the action shown on frame ``i`` is what the player does between frame ``i`` and frame ``i + 1``, so judge
+each row by the change from this frame to the next.
+
 Filling in the sheet: ``ok`` is empty on every row. Look at the frame and its neighbours and enter
 
 * ``1`` if the label matches what the player visibly did, ``0`` if not (every slot);
@@ -20,6 +26,9 @@ Slots and how they are judged (``slot`` column -> score group):
 * ``mouse_x``: one row per random frame feeds two groups. ``mouse-x sign`` counts the row correct when the
   direction is right (``ok`` is ``1`` or ``m``); ``mouse-x bin +-1`` counts it correct only when direction and
   magnitude are right (``ok == 1``). ``0`` fails both, so ``n`` is the same for both groups.
+
+Several sheets can be scored together; their rows are pooled. Groups with fewer than ``LOW_N`` judged rows are
+flagged ``low_n`` (they still count toward pass/fail).
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ import csv
 import json
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +51,7 @@ from cs2wm.pipeline.pack import read_episode
 
 UPSCALE = 3  # 280x150 -> 840x450, enough for the overlay text to be legible in VLC
 N_RANDOM_FRAMES = 200
+LOW_N = 10  # groups with fewer judged rows than this are flagged as statistically weak
 SHEET_COLUMNS = ("frame", "slot", "label", "ok", "note")
 IMAGE_SUFFIXES = (".png", ".tga", ".jpg", ".jpeg", ".bmp")
 
@@ -89,10 +100,15 @@ class Row:
     label: str
 
 
-def _window(n_total: int, start: int, n_frames: int) -> int:
-    """Validate the clip window and return its (possibly clamped) length."""
+def _window(n_total: int, start: int, n_frames: int | None) -> int:
+    """Validate the clip window and return its length (``None`` means up to the end of the episode).
+
+    A requested length past the end of the episode is clamped with a warning.
+    """
     if start < 0 or start >= n_total:
         raise ValueError(f"--start {start} is outside the episode ({n_total} frames)")
+    if n_frames is None:
+        return n_total - start
     if n_frames < 1:
         raise ValueError(f"n_frames must be >= 1, got {n_frames}")
     n = min(n_frames, n_total - start)
@@ -182,17 +198,18 @@ def random_mouse_rows(actions: np.ndarray, start: int, n_frames: int, spec: Acti
 
 
 def make_review_sheet(
-    episode: Path, start: int, n_frames: int, out_csv: Path, seed: int = 0, cfg: DictConfig | None = None
+    episode: Path, start: int, n_frames: int | None, out_csv: Path, seed: int = 0, cfg: DictConfig | None = None
 ) -> Path:
     """Write the review sheet: one row per label transition (key down/up, fire, reload, switch, jump) plus 200
     random frames for mouse direction and magnitude.
 
-    Rows are sorted by frame (then slot, label), so the same episode, window and seed give the same file.
+    Judge each row by the change from this frame to the next (the action on frame ``i`` is what the player does
+    between frame ``i`` and ``i + 1``). Rows are sorted by frame (then slot, label), so the same episode, window and seed give the same file.
 
     Args:
         episode: Packed episode HDF5 (labels).
         start: First frame.
-        n_frames: Number of frames (clamped to the end of the episode).
+        n_frames: Number of frames (clamped to the end of the episode); ``None`` for the rest of the episode.
         out_csv: Output ``clip_labels.csv`` with columns ``frame, slot, label, ok, note``; ``ok`` and ``note`` are
             empty.
         seed: Seed for the random frames.
@@ -232,7 +249,8 @@ def load_fullres_frames(source: Path, start: int, n_frames: int, expected: int) 
             frame ``i``), or a full-res episode HDF5 written by ``pack``.
         start: First frame.
         n_frames: Number of frames.
-        expected: The episode's frame count; the source must hold exactly this many frames.
+        expected: The episode's frame count. The source must hold this many frames, or one more: the renderer
+            adds a trailing frame ``T_n`` beyond the last labelled frame, which is dropped.
 
     Returns:
         BGR ``uint8[n_frames, H, W, 3]``.
@@ -249,8 +267,8 @@ def load_fullres_frames(source: Path, start: int, n_frames: int, expected: int) 
         nums = [_frame_number(p) for p in files]
         if len(set(nums)) != len(nums):
             raise ValueError(f"{source}: duplicate frame numbers in file names")
-        if len(files) != expected:
-            raise ValueError(f"{source}: {len(files)} frames but the episode has {expected}")
+        if len(files) not in (expected, expected + 1):
+            raise ValueError(f"{source}: {len(files)} frames but the episode has {expected} (or {expected + 1})")
         out = []
         for p in files[start : start + n_frames]:
             img = cv2.imread(str(p), cv2.IMREAD_COLOR)
@@ -263,8 +281,8 @@ def load_fullres_frames(source: Path, start: int, n_frames: int, expected: int) 
     frames, _, attrs = read_episode(source)
     if attrs["encoding"] != "jpeg":
         raise ValueError(f"{source}: expected a full-res (jpeg) episode, got encoding {attrs['encoding']!r}")
-    if len(frames) != expected:
-        raise ValueError(f"{source}: {len(frames)} frames but the episode has {expected}")
+    if len(frames) not in (expected, expected + 1):
+        raise ValueError(f"{source}: {len(frames)} frames but the episode has {expected} (or {expected + 1})")
     return frames[start : start + n_frames]
 
 
@@ -337,15 +355,21 @@ def draw_overlay(frame_bgr: np.ndarray, vec: np.ndarray, index: int, spec: Actio
     return img
 
 
-def render_overlay_clip(episode: Path, frames_dir: Path, start: int, n_frames: int, out: Path, cfg: DictConfig) -> Path:
+def render_overlay_clip(
+    episode: Path, frames_dir: Path, start: int, n_frames: int | None, out: Path, cfg: DictConfig
+) -> Path:
     """Render the half-speed label-overlay video.
+
+    The action shown on frame ``i`` is what the player does between frame ``i`` and ``i + 1``: judge each row by the
+    change from this frame to the next.
 
     Args:
         episode: Packed episode HDF5 (labels).
         frames_dir: Full-res rendered frames: a directory of image files (file ``i`` is episode frame ``i``, ordered
-            by the integer in the name) or a full-res episode HDF5 written by ``pack``.
+            by the integer in the name; one trailing extra frame is dropped) or a full-res episode HDF5 written by ``pack``.
         start: First frame.
-        n_frames: Number of frames (1920 = 2 minutes); clamped to the end of the episode.
+        n_frames: Number of frames, clamped to the end of the episode (with a warning); ``None`` renders the rest of
+            the episode. An episode is at most 1000 frames; review ~2 minutes as two consecutive episodes.
         out: Output ``clip.mp4`` (``mp4v``, ``timing.fps / 2`` fps).
         cfg: A validated cs2wm config.
 
@@ -391,17 +415,20 @@ def _judge(slot: str, ok: str, line: int) -> dict[str, bool]:
     return {slot: verdict == "right"}
 
 
-def score_review_sheet(sheet: Path, out_json: Path) -> dict[str, float]:
-    """Score a filled-in sheet per slot group.
+def score_review_sheet(sheet: Path | Sequence[Path], out_json: Path) -> dict[str, float]:
+    """Score filled-in sheets per slot group.
 
     Groups: WASD, jump, crouch, fire, reload, switch, mouse-x sign, mouse-x bin +-1, mouse-y (see the module
-    docstring for how rows are judged). Rows with an empty ``ok`` are skipped and counted. The result passes when
-    every group has at least one judged row and meets its minimum (0.90, or 0.98 for mouse-x sign).
+    docstring for how rows are judged). Rows with an empty ``ok`` are skipped and counted. Several sheets (e.g. two
+    consecutive episodes) are pooled into one table. The result passes when every group has at least one judged row
+    and meets its minimum (0.90, or 0.98 for mouse-x sign); a group with fewer than ``LOW_N`` judged rows is flagged
+    ``low_n`` but still counts.
 
     Args:
-        sheet: Review sheet with the ``ok`` column filled in.
-        out_json: Output, e.g. ``results/label_accuracy.json``. Holds ``groups`` (``n, correct, accuracy,
-            min_accuracy, pass`` each), ``blank_rows``, ``unscored`` groups and the overall ``pass``.
+        sheet: One review sheet, or several to pool, with the ``ok`` column filled in. Excel's BOM is accepted.
+        out_json: Output, e.g. ``results/label_accuracy.json``. Holds ``sheets`` (the pooled files), ``groups``
+            (``n, correct, accuracy, min_accuracy, low_n, pass`` each), ``blank_rows``, ``unscored`` groups and
+            the overall ``pass``.
 
     Returns:
         Accuracy per scored slot group (groups without judged rows are omitted).
@@ -409,23 +436,26 @@ def score_review_sheet(sheet: Path, out_json: Path) -> dict[str, float]:
     Raises:
         ValueError: If a column is missing, a slot is unknown or an ``ok`` value is invalid.
     """
+    sheets = [Path(sheet)] if isinstance(sheet, (str, Path)) else [Path(p) for p in sheet]
     counts = {g: [0, 0] for g in GROUPS}  # [n, correct]
     blank = 0
-    with Path(sheet).open(newline="") as f:
-        reader = csv.DictReader(f)
-        missing = {"frame", "slot", "label", "ok"} - set(reader.fieldnames or ())
-        if missing:
-            raise ValueError(f"{sheet}: missing columns {sorted(missing)}")
-        for line, row in enumerate(reader, start=2):
-            slot = (row["slot"] or "").strip()
-            if slot not in _SLOT_ORDER:
-                raise ValueError(f"row {line}: unknown slot {slot!r}")
-            if not (row["ok"] or "").strip():
-                blank += 1
-                continue
-            for group, correct in _judge(slot, row["ok"], line).items():
-                counts[group][0] += 1
-                counts[group][1] += int(correct)
+    for path in sheets:
+        # utf-8-sig: Excel's "CSV UTF-8" prepends a BOM that would otherwise glue itself to the first header.
+        with path.open(newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            missing = {"frame", "slot", "label", "ok"} - set(reader.fieldnames or ())
+            if missing:
+                raise ValueError(f"{path}: missing columns {sorted(missing)}")
+            for line, row in enumerate(reader, start=2):
+                slot = (row["slot"] or "").strip()
+                if slot not in _SLOT_ORDER:
+                    raise ValueError(f"{path} row {line}: unknown slot {slot!r}")
+                if not (row["ok"] or "").strip():
+                    blank += 1
+                    continue
+                for group, correct in _judge(slot, row["ok"], line).items():
+                    counts[group][0] += 1
+                    counts[group][1] += int(correct)
 
     groups: dict[str, dict] = {}
     for g in GROUPS:
@@ -437,10 +467,12 @@ def score_review_sheet(sheet: Path, out_json: Path) -> dict[str, float]:
             "correct": correct,
             "accuracy": accuracy,
             "min_accuracy": threshold,
+            "low_n": n < LOW_N,
             "pass": accuracy is not None and accuracy >= threshold,
         }
     unscored = [g for g in GROUPS if groups[g]["n"] == 0]
     result = {
+        "sheets": [str(p) for p in sheets],
         "groups": groups,
         "blank_rows": blank,
         "unscored": unscored,
@@ -462,11 +494,13 @@ def format_table(result: dict) -> str:
     Returns:
         A multi-line string.
     """
-    lines = [f"{'group':<14}{'n':>6}{'correct':>9}{'accuracy':>10}{'min':>7}  pass"]
+    lines = [f"{'group':<14}{'n':>6}{'correct':>9}{'accuracy':>10}{'min':>7}  pass  note"]
     for g, v in result["groups"].items():
         acc = f"{v['accuracy']:.3f}" if v["accuracy"] is not None else "n/a"
+        note = f"low n (<{LOW_N})" if v["low_n"] else ""
+        verdict = "yes" if v["pass"] else "NO"
         lines.append(
-            f"{g:<14}{v['n']:>6}{v['correct']:>9}{acc:>10}{v['min_accuracy']:>7.2f}  {'yes' if v['pass'] else 'NO'}"
+            f"{g:<14}{v['n']:>6}{v['correct']:>9}{acc:>10}{v['min_accuracy']:>7.2f}  {verdict:<4}  {note}".rstrip()
         )
     lines.append(f"blank rows ignored: {result['blank_rows']}")
     if result["unscored"]:

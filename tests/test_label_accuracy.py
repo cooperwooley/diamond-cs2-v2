@@ -141,7 +141,7 @@ def test_scoring_with_blanks(tmp_path, capsys):
     acc = la.score_review_sheet(write_sheet(tmp_path / "s.csv", rows), out)
     data = json.loads(out.read_text())
     g = data["groups"]
-    assert g["wasd"] == {"n": 10, "correct": 9, "accuracy": 0.9, "min_accuracy": 0.9, "pass": True}
+    assert g["wasd"] == {"n": 10, "correct": 9, "accuracy": 0.9, "min_accuracy": 0.9, "low_n": False, "pass": True}
     assert data["blank_rows"] == 3
     # 50 judged mouse-x rows: sign wrong only on "0" (49/50), bin right only on "1" (48/50).
     assert (g["mouse_x_sign"]["n"], g["mouse_x_sign"]["correct"]) == (50, 49)
@@ -237,3 +237,119 @@ def test_window_clamped_and_start_checked(tmp_path, cfg, episode, capsys):
     assert "clamped" in capsys.readouterr().err
     with pytest.raises(ValueError, match="outside the episode"):
         la.render_overlay_clip(low, full, N, 1, tmp_path / "clip.mp4", cfg)
+
+
+def write_png_dir(d: Path, frames: np.ndarray) -> Path:
+    d.mkdir()
+    for i, f in enumerate(frames):
+        cv2.imwrite(str(d / f"seg_{i}.png"), f)
+    return d
+
+
+def test_image_dir_with_trailing_extra_frame(tmp_path, cfg, episode):
+    low, _, frames = episode
+    extra = np.concatenate([frames, frames[:1]])  # n + 1 images: the renderer's trailing T_n frame
+    d = write_png_dir(tmp_path / "frames", extra)
+    out = la.render_overlay_clip(low, d, 0, None, tmp_path / "clip.mp4", cfg)
+    assert read_back(out)[0] == N
+    d2 = write_png_dir(tmp_path / "frames2", np.concatenate([frames, frames[:2]]))
+    with pytest.raises(ValueError, match=f"{N + 2} frames but the episode has {N}"):
+        la.render_overlay_clip(low, d2, 0, None, tmp_path / "clip.mp4", cfg)
+
+
+def test_default_length_does_not_warn(tmp_path, cfg, episode, capsys):
+    low, full, _ = episode
+    la.render_overlay_clip(low, full, 0, None, tmp_path / "clip.mp4", cfg)
+    assert capsys.readouterr().err == ""
+
+
+def test_scoring_accepts_excel_bom(tmp_path):
+    sheet = write_sheet(tmp_path / "s.csv", [("wasd", "1"), ("wasd", "0")])
+    sheet.write_bytes(b"\xef\xbb\xbf" + sheet.read_bytes())
+    acc = la.score_review_sheet(sheet, tmp_path / "o.json")
+    assert acc["wasd"] == 0.5
+
+
+def test_scoring_pools_sheets_and_flags_low_n(tmp_path, capsys):
+    a = write_sheet(tmp_path / "a.csv", [("wasd", "1")] * 6 + [("jump", "1")])
+    b = write_sheet(tmp_path / "b.csv", [("wasd", "1")] * 5 + [("wasd", "0")] * 1)
+    out = tmp_path / "o.json"
+    la.score_review_sheet([a, b], out)
+    data = json.loads(out.read_text())
+    assert data["sheets"] == [str(a), str(b)]
+    assert (data["groups"]["wasd"]["n"], data["groups"]["wasd"]["correct"]) == (12, 11)
+    assert data["groups"]["wasd"]["low_n"] is False
+    assert data["groups"]["jump"]["low_n"] is True
+    assert "low n" in capsys.readouterr().out
+
+
+def test_crouch_rows(spec):
+    rows = [encode(["ctrl"] if 2 <= t < 4 else [], False, False, 0.0, 0.0, spec) for t in range(6)]
+    got = [(r.frame, r.slot, r.label) for r in la.extract_transitions(np.stack(rows), 0, 6, spec)]
+    assert got == [(2, "crouch", "ctrl down"), (4, "crouch", "ctrl up")]
+
+
+def test_mouse_rows_signs(spec):
+    cases = [(5.0, 2.0, "right", "down"), (-5.0, -2.0, "left", "up"), (0.0, 0.0, "none", "none")]
+    actions = np.stack([encode([], False, False, x, y, spec) for x, y, _, _ in cases])
+    rows = la.random_mouse_rows(actions, 0, len(cases), spec, seed=0)
+    by_frame = {(r.frame, r.slot): r.label for r in rows}
+    for t, (_, _, dx, dy) in enumerate(cases):
+        assert by_frame[(t, "mouse_x")].endswith(f"({dx})")
+        assert by_frame[(t, "mouse_y")].endswith(f"({dy})")
+    assert "+" in by_frame[(0, "mouse_x")] and "-" in by_frame[(1, "mouse_x")]
+
+
+def test_overlay_alignment(tmp_path, cfg, spec):
+    """Video frame j shows frame index start + j and the keys of actions[start + j]."""
+    n = 8
+    key_cycle = ["w", "a", "s", "d", "space", "ctrl", "shift", "r"]
+    actions = np.stack([encode([key_cycle[t]], t % 2 == 0, False, 0.0, 0.0, spec) for t in range(n)])
+    gray = np.full((n, H, W, 3), 90, np.uint8)
+    res = write_episode(gray, actions, meta("align"), tmp_path / "low", cfg)
+    frames_dir = write_png_dir(tmp_path / "frames", gray)
+    start, count = 2, 5
+    out = la.render_overlay_clip(res.low_res_path, frames_dir, start, count, tmp_path / "clip.mp4", cfg)
+    cap = cv2.VideoCapture(str(out))
+    for j in range(count):
+        ok, img = cap.read()
+        assert ok
+        expected = [la.draw_overlay(gray[0], actions[t], t, spec).astype(np.float32) for t in range(n)]
+        errs = [np.abs(img.astype(np.float32) - e).mean() for e in expected]
+        assert int(np.argmin(errs)) == start + j
+    cap.release()
+
+
+def test_overlay_key_boxes_colour(spec):
+    vec = encode(["w", "r"], True, False, 0.0, 0.0, spec)
+    img = la.draw_overlay(np.full((H, W, 3), 90, np.uint8), vec, 0, spec)
+    y = img.shape[0] - 34 + 3  # inside the box row, above the label text
+    pressed = {tuple(img[y, x]) for x in range(10, 400) if tuple(img[y, x]) == la._ON}
+    assert pressed  # at least one green (pressed) box
+    assert la._OFF in {tuple(img[y, x]) for x in range(10, 400)}
+
+
+def test_cli_render_and_score(tmp_path, episode):
+    from cs2wm import cli
+
+    low, _, frames = episode
+    d = write_png_dir(tmp_path / "frames", np.concatenate([frames, frames[:1]]))
+    cfg_path = Path(__file__).resolve().parents[1] / "config" / "cs2wm.yaml"
+    clip = tmp_path / "out" / "clip.mp4"
+    argv = ["--config", str(cfg_path), "label-check", "render", "--episode", str(low), "--full-res-frames", str(d)]
+    assert cli.main([*argv, "--out", str(clip)]) == 0
+    sheet = tmp_path / "out" / "clip_labels.csv"
+    assert clip.exists() and sheet.exists()
+    assert read_back(clip)[0] == N
+    with sheet.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    with sheet.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=la.SHEET_COLUMNS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({**r, "ok": "1"})
+    res = tmp_path / "res" / "acc.json"
+    assert cli.main(["label-check", "score", str(sheet), str(sheet), "--out", str(res)]) == 0
+    data = json.loads(res.read_text())
+    assert data["sheets"] == [str(sheet), str(sheet)]
+    assert data["groups"]["wasd"]["n"] == 2 * 2
