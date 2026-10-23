@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("segment", help="plan lives, spectate schedule and episodes (#10)")
     _add_demo_args(p)
     p.add_argument("--policy", choices=["longest_remaining", "fixed_player"], default=None)
-    p.add_argument("--player", default=None, help="player name for --policy fixed_player")
+    p.add_argument("--player", default=None, help="player name (or numeric user_id) for --policy fixed_player")
 
     p = sub.add_parser("render", help="render a demo with HLAE (#15)")
     _add_demo_args(p)

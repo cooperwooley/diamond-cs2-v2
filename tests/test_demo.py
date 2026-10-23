@@ -219,3 +219,64 @@ def test_inspect_summarises_players_and_events(use_parser) -> None:
         (4, "Bot C", 7, 3),
     ]
     assert info["header"]["map_name"] == "de_dust2"
+
+
+def test_player_event_table_drops_null_user_id_rows(caplog) -> None:
+    raw = pd.DataFrame({"tick": [1, 2, 3], "user_user_id": [5.0, None, 6.0], "user_name": ["A", "ghost", "B"]})
+    with caplog.at_level("WARNING"):
+        out = demo.player_event_table(raw)
+    assert out["user_id"].tolist() == [5, 6] and out["tick"].tolist() == [1, 3]
+    assert "dropping 1" in caplog.text
+    assert demo.player_event_table(pd.DataFrame({"tick": [1], "userid": [None]})).empty
+
+
+class PanicException(BaseException):
+    """Stands in for pyo3's PanicException, which derives from BaseException."""
+
+
+@pytest.mark.parametrize("exc", [ValueError("truncated demo"), PanicException("panicked at parser")])
+def test_inspect_reports_parser_failures_instead_of_raising(use_parser, exc) -> None:
+    class Broken(FakeParser):
+        def parse_ticks(self, *a, **k):
+            raise exc
+
+    use_parser(Broken())
+    info = demo.inspect("x.dem")
+    assert info["ok"] is False and type(exc).__name__ in info["error"]
+    assert info["header"]["map_name"] == "de_dust2"  # what was read before the failure is kept
+    assert info["players"] == [] and not demo.is_parseable("x.dem")
+    json.dumps(info)
+
+
+def test_inspect_header_failure(use_parser) -> None:
+    class Broken(FakeParser):
+        def parse_header(self):
+            raise PanicException("no header")
+
+    use_parser(Broken())
+    assert demo.inspect("x.dem")["ok"] is False
+
+
+def test_inspect_empty_ticks_and_missing_columns(use_parser) -> None:
+    use_parser(FakeParser(ticks=pd.DataFrame(columns=["tick", "name", "steamid", "user_id"])))
+    info = demo.inspect("x.dem")
+    assert info["ok"] is False and "no ticks" in info["error"]
+    use_parser(FakeParser(ticks=pd.DataFrame({"tick": [1], "name": ["A"]})))
+    info = demo.inspect("x.dem")
+    assert info["ok"] is False and "user_id" in info["error"]
+
+
+def test_inspect_does_not_swallow_keyboard_interrupt(use_parser) -> None:
+    class Interrupted(FakeParser):
+        def parse_ticks(self, *a, **k):
+            raise KeyboardInterrupt
+
+    use_parser(Interrupted())
+    with pytest.raises(KeyboardInterrupt):
+        demo.inspect("x.dem")
+
+
+def test_is_parseable_true_for_good_demo(use_parser) -> None:
+    use_parser(FakeParser(ticks=tick_table()))
+    assert demo.is_parseable("x.dem")
+    assert demo.inspect("x.dem")["error"] is None

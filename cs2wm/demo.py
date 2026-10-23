@@ -11,6 +11,7 @@ script of #14, not yet seen on a real CS2 demo. The #14 session must confirm or 
 from __future__ import annotations
 
 import importlib.metadata
+import logging
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -18,9 +19,14 @@ from typing import Any
 
 import pandas as pd
 
+log = logging.getLogger(__name__)
+
 # CONFIRM(#14): per-tick table columns. ``user_id`` is a requested prop (step 3 of #14); ``name`` and ``steamid`` are
 # always returned by parse_ticks.
 TICK_USER_ID = "user_id"
+# CONFIRM(#14): the entity id of the player pawn/controller; requested in step 3 of #14. It is what ``spec_player`` is
+# expected to take (or the user_id; #14 step 4 decides).
+TICK_ENTITY_ID = "entity_id"
 # CONFIRM(#14): event-table columns. A player prop ``P`` requested for the ``user`` role of an event arrives as
 # ``user_P`` (``user_name`` and ``user_steamid`` always). Candidates are tried in order; the first present wins.
 EVENT_USER_ID_COLUMNS = ("user_user_id", "user_userid", "userid", "user_id")
@@ -132,7 +138,8 @@ def player_event_table(events: pd.DataFrame) -> pd.DataFrame:
         events: A table from ``load_events``.
 
     Returns:
-        One row per event with canonical columns (empty with those columns when ``events`` is empty). Missing
+        One row per event with canonical columns (empty with those columns when ``events`` is empty). Rows with a
+        null ``user_id`` (e.g. warmup events with no player) are dropped and counted in a warning. Missing
         ``name``/``steamid`` become ``""``/0. ``entity_id`` is present only if the demo provides it.
 
     Raises:
@@ -148,6 +155,10 @@ def player_event_table(events: pd.DataFrame) -> pd.DataFrame:
     uid = pick(EVENT_USER_ID_COLUMNS)
     if uid is None:
         raise KeyError(f"no user_id column in event table (columns: {list(events.columns)})")
+    null_uid = events[uid].isna()
+    if null_uid.any():
+        log.warning("dropping %d event row(s) with a null %s", int(null_uid.sum()), uid)
+        events = events[~null_uid]
     name, sid, eid = pick(EVENT_NAME_COLUMNS), pick(EVENT_STEAMID_COLUMNS), pick(EVENT_ENTITY_ID_COLUMNS)
     out = pd.DataFrame(
         {
@@ -243,29 +254,65 @@ def last_tick(demo_path: str | Path) -> int:
 def inspect(demo_path: str | Path) -> dict:
     """Summarise a demo for ``cs2wm inspect-demo``: header, players, tick range, event counts.
 
+    Never raises on a bad demo: any parser failure (including pyo3's ``PanicException``, a ``BaseException``) on a
+    truncated, empty or corrupt file yields ``ok=False`` and the message in ``error``; whatever was read before the
+    failure is still returned. ``KeyboardInterrupt`` and ``SystemExit`` propagate.
+
     Args:
         demo_path: Path to a ``.dem`` file.
 
     Returns:
-        JSON-serialisable summary; also used to decide whether a truncated chunk is kept.
+        JSON-serialisable summary with ``ok``, ``error``, ``demo``, ``parser_version``, ``header``, ``first_tick``,
+        ``last_tick``, ``players`` and ``events``; also used to decide whether a truncated chunk is kept.
     """
-    ticks = load_ticks(demo_path, ["steamid"])
-    players = [
-        {
-            "user_id": int(uid),
-            "name": str(g["name"].iloc[0]),
-            "steamid": int(g["steamid"].iloc[0]),
-            "n_ticks": len(g),
-        }
-        for uid, g in ticks.groupby(TICK_USER_ID, sort=True)
-    ]
-    events = load_events(demo_path, _INSPECT_EVENTS)
-    return {
+    out: dict = {
         "demo": str(demo_path),
-        "parser_version": parser_version(),
-        "header": header(demo_path),
-        "first_tick": int(ticks["tick"].min()) if len(ticks) else None,
-        "last_tick": int(ticks["tick"].max()) if len(ticks) else None,
-        "players": players,
-        "events": {name: len(events[name]) for name in _INSPECT_EVENTS},
+        "ok": False,
+        "error": None,
+        "parser_version": None,
+        "header": None,
+        "first_tick": None,
+        "last_tick": None,
+        "players": [],
+        "events": {},
     }
+    try:
+        out["parser_version"] = parser_version()
+        out["header"] = header(demo_path)
+        ticks = load_ticks(demo_path, ["steamid"])
+        if ticks.empty:
+            raise ValueError("demo has no ticks")
+        missing = [c for c in ("tick", "name", "steamid", TICK_USER_ID) if c not in ticks.columns]
+        if missing:
+            raise ValueError(f"tick table is missing columns {missing}")
+        out["first_tick"], out["last_tick"] = int(ticks["tick"].min()), int(ticks["tick"].max())
+        steam = pd.to_numeric(ticks["steamid"], errors="coerce").fillna(0)
+        out["players"] = [
+            {
+                "user_id": int(uid),
+                "name": str(g["name"].iloc[0]),
+                "steamid": int(steam.loc[g.index[0]]),
+                "n_ticks": len(g),
+            }
+            for uid, g in ticks.dropna(subset=[TICK_USER_ID]).groupby(TICK_USER_ID, sort=True)
+        ]
+        events = load_events(demo_path, _INSPECT_EVENTS)
+        out["events"] = {name: len(events[name]) for name in _INSPECT_EVENTS}
+        out["ok"] = True
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:  # noqa: BLE001 - pyo3 PanicException derives from BaseException
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def is_parseable(demo_path: str | Path) -> bool:
+    """Return whether the demo parses cleanly (header, ticks and the key events), for #13's keep-or-drop decision.
+
+    Args:
+        demo_path: Path to a ``.dem`` file.
+
+    Returns:
+        ``inspect(demo_path)["ok"]``.
+    """
+    return bool(inspect(demo_path)["ok"])

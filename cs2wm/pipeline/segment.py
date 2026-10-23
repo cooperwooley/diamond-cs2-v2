@@ -26,13 +26,17 @@ is ``demo tick + tick_offset`` and is the tick to pass to ``mirv_cmd addAtTick``
       "cs2_build": 1234567 | null,            # installed Steam build id at planning time (null if unknown)
       "parser_version": "0.42.0",
       "header": {"map_name": "de_dust2", ...},  # demo header, strings
+      "demo_end_tick": 90000,                 # last tick of the demo (render timeout, final quit)
       "tick_offset": 0,                       # render.tick_offset
       "settle_ticks": 32,
       "timing": {"tickrate": 64, "fps": 16, "ticks_per_frame": 4},
-      "meta": {"policy": "longest_remaining", "player": null, "seed": 0, "kind": "dm"},
+      "meta": {"policy": "longest_remaining", "player": null, "seed": 0, "kind": "dm",
+               "diagnostics": {"duplicate_spawns": 0, "deaths_without_spawn": 0}},
       "segments": [{
         "segment_idx": 0,
         "target": {"name": "Bot A", "user_id": 3, "steamid": 0, "entity_id": 7 | null},
+                                              # entity_id: the player's tick-table value at/after spawn (CONFIRM(#14));
+                                              # null if the demo gives none; the likely spec_player argument
         "life": {"spawn_tick": 1000, "death_tick": 9000},
         "record_start_tick": 1032,            # T0 of the first episode (frame 0)
         "record_end_tick": 5032,              # tick of the extra frame of the last episode
@@ -60,6 +64,7 @@ without parsing the demo again. Whether the frame at ``record_end_tick`` is capt
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -135,6 +140,7 @@ def find_lives(
     deaths: pd.DataFrame,
     demo_end_tick: int,
     disconnects: pd.DataFrame | None = None,
+    diagnostics: dict[str, int] | None = None,
 ) -> list[Life]:
     """Pair spawns and deaths into lives.
 
@@ -154,18 +160,21 @@ def find_lives(
         deaths: ``player_death`` events (the victim), same columns.
         demo_end_tick: Last tick of the demo.
         disconnects: Optional ``player_disconnect`` events, same columns.
+        diagnostics: Optional dict filled with ``duplicate_spawns`` and ``deaths_without_spawn`` counts (also logged),
+            so real demos show whether these cases occur.
 
     Returns:
         Lives sorted by spawn tick (then ``user_id``).
     """
-    events: list[tuple[int, int, dict[str, Any]]] = []  # (tick, order, row); order 0 closes, 1 opens
-    for order, table in ((1, spawns), (0, deaths), (0, disconnects)):
+    events: list[tuple[int, int, str, dict[str, Any]]] = []  # (tick, order, kind, row); order 0 closes, 1 opens
+    for order, kind, table in ((1, "spawn", spawns), (0, "death", deaths), (0, "disconnect", disconnects)):
         if table is None or table.empty:
             continue
         for row in table.to_dict("records"):
             if int(row["tick"]) <= demo_end_tick:
-                events.append((int(row["tick"]), order, row))
+                events.append((int(row["tick"]), order, kind, row))
     events.sort(key=lambda e: (e[0], e[1]))
+    dup_spawns = orphan_deaths = 0
 
     lives: list[Life] = []
     open_lives: dict[int, tuple[int, dict[str, Any]]] = {}  # user_id -> (spawn_tick, spawn row)
@@ -185,15 +194,54 @@ def find_lives(
                 )
             )
 
-    for tick, order, row in events:
+    for tick, order, kind, row in events:
         user_id = int(row["user_id"])
         if order == 1:
-            open_lives.setdefault(user_id, (tick, row))
+            if user_id in open_lives:
+                dup_spawns += 1
+            else:
+                open_lives[user_id] = (tick, row)
         elif user_id in open_lives:
             close(user_id, tick)
+        elif kind == "death":
+            orphan_deaths += 1
     for user_id in list(open_lives):
         close(user_id, demo_end_tick)
+    counts = {"duplicate_spawns": dup_spawns, "deaths_without_spawn": orphan_deaths}
+    if diagnostics is not None:
+        diagnostics.update(counts)
+    if dup_spawns or orphan_deaths:
+        log.info("find_lives: ignored %d duplicate spawn(s) and %d death(s) with no spawn", dup_spawns, orphan_deaths)
     return sorted(lives, key=lambda l: (l.spawn_tick, l.user_id, l.death_tick))
+
+
+def attach_entity_ids(lives: Sequence[Life], ticks: pd.DataFrame) -> list[Life]:
+    """Fill ``Life.entity_id`` from the tick table: each player's value at, or nearest after, its spawn tick.
+
+    A value found in ``ticks`` replaces one that came from the events; lives without a tick-table value keep theirs.
+    A warning is logged once if no life ends up with an entity id.
+
+    Args:
+        lives: Output of ``find_lives``.
+        ticks: Per-tick table with ``tick``, ``user_id`` and (optionally) ``entity_id`` columns.
+
+    Returns:
+        New lives with ``entity_id`` set where known.
+    """
+    out = list(lives)
+    if demo.TICK_ENTITY_ID in ticks.columns and not ticks.empty:
+        table = ticks.dropna(subset=[demo.TICK_USER_ID, demo.TICK_ENTITY_ID])
+        by_user = {int(uid): g.sort_values("tick") for uid, g in table.groupby(demo.TICK_USER_ID)}
+        for i, life in enumerate(out):
+            g = by_user.get(life.user_id)
+            if g is None:
+                continue
+            pos = int(np.searchsorted(g["tick"].to_numpy(), life.spawn_tick, side="left"))
+            if pos < len(g):
+                out[i] = dataclasses.replace(life, entity_id=int(g[demo.TICK_ENTITY_ID].iloc[pos]))
+    if out and all(life.entity_id is None for life in out):
+        log.warning("no entity_id for any player (tick table and events lack it); plan targets have entity_id null")
+    return out
 
 
 def plan_spectate(
@@ -201,13 +249,13 @@ def plan_spectate(
     policy: str,
     cfg: DictConfig,
     rng: np.random.Generator,
-    player: str | None = None,
+    player: str | int | None = None,
 ) -> list[ViewSegment]:
     """Choose whom to spectate when.
 
     Segments never overlap and switch only at the current target's death. Policies: ``longest_remaining`` (bots:
     the alive player with the most life left, ties broken round-robin for POV diversity) and ``fixed_player``
-    (human sessions, requires ``player``).
+    (human sessions, requires ``player``, a name or a numeric ``user_id``).
 
     A life is viewable from ``spawn + settle_ticks`` to ``death - settle_ticks``. After a segment the next one starts
     ``settle_ticks`` later (camera switch), so ``longest_remaining`` considers the lives alive at that tick. Ties in
@@ -218,24 +266,31 @@ def plan_spectate(
         policy: ``longest_remaining`` or ``fixed_player``.
         cfg: A validated cs2wm config (``segment.settle_ticks``).
         rng: Seeded generator, so plans are deterministic.
-        player: Player name for ``fixed_player``.
+        player: For ``fixed_player``: the player's name, or a numeric ``user_id`` if no player has that name.
 
     Returns:
         Non-overlapping view segments.
 
     Raises:
-        ValueError: On an unknown policy, ``fixed_player`` without ``player``, or a ``player`` with no lives.
+        ValueError: On an unknown policy, ``fixed_player`` without ``player``, a ``player`` with no lives, or a name
+            shared by several ``user_id`` values (pass the ``user_id`` instead).
     """
     if policy not in ("longest_remaining", "fixed_player"):
         raise ValueError(f"unknown segment policy {policy!r}")
     settle = int(cfg.segment.settle_ticks)
 
     if policy == "fixed_player":
-        if not player:
+        if player is None or player == "":
             raise ValueError("policy 'fixed_player' needs a player name")
+        player = str(player)
         mine = [life for life in lives if life.player_name == player]
+        if not mine and player.strip().isdigit():
+            mine = [life for life in lives if life.user_id == int(player)]
         if not mine:
             raise ValueError(f"no lives for player {player!r}")
+        user_ids = sorted({life.user_id for life in mine})
+        if len(user_ids) > 1:
+            raise ValueError(f"player name {player!r} is shared by user_ids {user_ids}; pass one user_id as --player")
         windows = [(l.spawn_tick + settle, l.death_tick - settle, l) for l in sorted(mine, key=lambda l: l.spawn_tick)]
         return [
             ViewSegment(life, start, end, idx)
@@ -329,6 +384,7 @@ def build_render_plan(
     header: Mapping[str, str],
     cs2_build: int | None = None,
     meta: Mapping[str, Any] | None = None,
+    demo_end_tick: int | None = None,
 ) -> dict[str, Any]:
     """Build the ``render_plan.json`` content (see the module docstring for the schema).
 
@@ -343,7 +399,8 @@ def build_render_plan(
         cfg: A validated cs2wm config.
         header: Demo header from ``cs2wm.demo.header``.
         cs2_build: Installed CS2 build id, if known.
-        meta: Extra provenance (policy, player, seed, kind, parser version).
+        meta: Extra provenance (policy, player, seed, kind, parser version, diagnostics).
+        demo_end_tick: Last tick of the demo.
 
     Returns:
         A JSON-serialisable dict.
@@ -415,6 +472,7 @@ def build_render_plan(
         "demo_id": demo_id,
         "demo_file": f"{demo_id}.dem",
         "cs2_build": cs2_build,
+        "demo_end_tick": demo_end_tick,
         "parser_version": meta.pop("parser_version", None),
         "header": dict(header),
         "tick_offset": offset,
@@ -441,6 +499,7 @@ def write_render_plan(
     header: Mapping[str, str],
     cs2_build: int | None = None,
     meta: Mapping[str, Any] | None = None,
+    demo_end_tick: int | None = None,
 ) -> None:
     """Write ``render_plan.json``: demo id, CS2 build, tick offset, segments with target identifiers, the
     ``mirv_cmd`` schedule ticks and planned frame counts.
@@ -456,8 +515,9 @@ def write_render_plan(
         header: Demo header from ``cs2wm.demo.header``.
         cs2_build: Installed CS2 build id, if known (added to the original signature).
         meta: Extra provenance, see ``build_render_plan`` (added to the original signature).
+        demo_end_tick: Last tick of the demo (added to the original signature).
     """
-    plan = build_render_plan(demo_id, segments, episodes, cfg, header, cs2_build, meta)
+    plan = build_render_plan(demo_id, segments, episodes, cfg, header, cs2_build, meta, demo_end_tick)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -536,10 +596,13 @@ def run(demo_path: Path, cfg: DictConfig, policy: str | None = None, player: str
         demo_path: Path to the ``.dem`` file.
         cfg: A validated cs2wm config.
         policy: Override for ``segment.policy``.
-        player: Player name for ``fixed_player``.
+        player: Player name (or numeric ``user_id``) for ``fixed_player``.
 
     Returns:
         Path of the written ``render_plan.json``.
+
+    Raises:
+        ValueError: If the demo has no ticks, or the policy cannot be applied (see ``plan_spectate``).
     """
     demo_path = Path(demo_path)
     demo_id = demo_path.stem
@@ -555,12 +618,24 @@ def run(demo_path: Path, cfg: DictConfig, policy: str | None = None, player: str
     except KeyError:
         log.warning("player_disconnect has no user_id column; disconnects are not used to close lives")
         disconnects = None
+    # One tick-table parse gives the demo end and the targets' entity ids (CONFIRM(#14): entity_id as a tick prop).
+    try:
+        ticks = demo.load_ticks(demo_path, [demo.TICK_ENTITY_ID])
+    except Exception:
+        log.warning("parse_ticks rejected %s; entity ids come from events only", demo.TICK_ENTITY_ID, exc_info=True)
+        ticks = demo.load_ticks(demo_path, [])
+    if ticks.empty:
+        raise ValueError(f"{demo_path} has no ticks")
+    demo_end = int(ticks["tick"].max())
+    diagnostics: dict[str, int] = {}
     lives = find_lives(
         demo.player_event_table(events["player_spawn"]),
         demo.player_event_table(events["player_death"]),
-        demo.last_tick(demo_path),
+        demo_end,
         disconnects,
+        diagnostics,
     )
+    lives = attach_entity_ids(lives, ticks)
     seed = _seed(cfg, demo_id)
     segments = plan_spectate(lives, policy, cfg, np.random.default_rng(seed), player)
     episodes = split_episodes(segments, demo_id, kind, cfg)
@@ -575,8 +650,11 @@ def run(demo_path: Path, cfg: DictConfig, policy: str | None = None, player: str
         "seed": int(cfg.segment.seed),
         "kind": kind,
         "parser_version": demo.parser_version(),
+        "diagnostics": diagnostics,
     }
     out = Path(cfg.paths.plans) / demo_id / "render_plan.json"
-    write_render_plan(out, demo_id, segments, episodes, cfg, hdr, build, meta)
+    write_render_plan(out, demo_id, segments, episodes, cfg, hdr, build, meta, demo_end)
+    if not episodes:
+        log.warning("%s: plan has zero episodes (%d lives, %d segments)", demo_id, len(lives), len(segments))
     log.info("%s: %d lives, %d segments, %d episodes -> %s", demo_id, len(lives), len(segments), len(episodes), out)
     return out

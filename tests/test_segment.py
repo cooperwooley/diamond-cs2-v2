@@ -168,8 +168,8 @@ def test_fixed_player_follows_only_that_player() -> None:
     lives = [
         life(1, 0, 500, "Me"),
         life(2, 0, 2000, "Bot"),
-        life(3, 700, 1500, "Me"),
-        life(4, 800, 800 + 2 * SETTLE, "Me"),
+        life(1, 700, 1500, "Me"),
+        life(1, 1600, 1600 + 2 * SETTLE, "Me"),
     ]
     segs = plan_spectate(lives, "fixed_player", CFG, rng(), player="Me")
     # The longer-living bot is ignored, and the too-short life of "Me" is skipped.
@@ -335,7 +335,15 @@ def fake_demo_parser() -> FakeParser:
             }
         )
 
-    ticks = pd.DataFrame({"tick": [0, 6000], "user_id": [1, 1], "name": ["A", "A"], "steamid": [0, 0]})
+    ticks = pd.DataFrame(
+        {
+            "tick": [0, 6000, 0, 6000],
+            "user_id": [1, 1, 2, 2],
+            "name": ["A", "A", "B", "B"],
+            "steamid": [0, 0, 0, 0],
+            "entity_id": [11, 11, 12, 12],
+        }
+    )
     return FakeParser(
         ticks=ticks,
         events={
@@ -391,3 +399,128 @@ def test_cli_segment_single_demo_and_all_pending(
     assert cli.main(["segment", "--all-pending"]) == 2  # needs the supervisor state (#20)
     with pytest.raises(SystemExit):
         cli.main(["segment", "missing"])
+
+
+# ---- review fixes ---------------------------------------------------------------------------------------------
+
+
+def test_find_lives_counts_duplicate_spawns_and_orphan_deaths() -> None:
+    diag: dict[str, int] = {}
+    # A disconnect with no life is normal and is not counted.
+    find_lives(
+        events((100, 1, "A"), (200, 1, "A")), events((50, 2, "B"), (300, 1, "A")), END, events((9, 7, "C")), diag
+    )
+    assert diag == {"duplicate_spawns": 1, "deaths_without_spawn": 1}
+
+
+def test_round_restart_respawn_without_death_keeps_one_life() -> None:
+    # Pins the current behaviour: the second spawn (e.g. mp_restartgame) is a duplicate, so the life continues.
+    (l,) = find_lives(events((100, 1, "A"), (5000, 1, "A")), events((9000, 1, "A")), END)
+    assert (l.spawn_tick, l.death_tick) == (100, 9000)
+
+
+def test_fixed_player_rejects_a_name_shared_by_two_user_ids() -> None:
+    lives = [life(1, 0, 500, "Bot"), life(2, 100, 600, "Bot")]
+    with pytest.raises(ValueError, match="user_ids"):
+        plan_spectate(lives, "fixed_player", CFG, rng(), player="Bot")
+    (seg,) = plan_spectate(lives, "fixed_player", CFG, rng(), player="2")  # a user_id picks one of them
+    assert seg.target.user_id == 2
+
+
+def test_fixed_player_name_wins_over_numeric_user_id() -> None:
+    lives = [life(1, 0, 500, "2"), life(2, 0, 500, "Other")]
+    (seg,) = plan_spectate(lives, "fixed_player", CFG, rng(), player="2")
+    assert seg.target.user_id == 1
+
+
+def test_attach_entity_ids_uses_value_at_or_after_spawn() -> None:
+    ticks = pd.DataFrame(
+        {
+            "tick": [90, 100, 110, 300, 310],
+            "user_id": [1, 1, 1, 1, 1],
+            "entity_id": [5, 6, 6, 8, 8],  # the pawn changes between lives
+        }
+    )
+    lives = [life(1, 100, 200), life(1, 305, 400), life(2, 0, 50)]
+    out = segment.attach_entity_ids(lives, ticks)
+    assert [l.entity_id for l in out] == [6, 8, None]
+
+
+def test_attach_entity_ids_falls_back_to_events_and_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    from_events = Life("A", 1, 0, 0, 100, 42)
+    assert segment.attach_entity_ids([from_events], pd.DataFrame({"tick": [1], "user_id": [1]}))[0].entity_id == 42
+    assert "no entity_id" not in caplog.text
+    with caplog.at_level("WARNING"):
+        out = segment.attach_entity_ids([life(1, 0, 100), life(2, 0, 100)], pd.DataFrame())
+    assert [l.entity_id for l in out] == [None, None]
+    assert caplog.text.count("no entity_id") == 1
+
+
+def test_run_fills_entity_id_demo_end_and_diagnostics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = load_config(overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}"])
+    monkeypatch.setattr(demo, "_make_parser", lambda path: fake_demo_parser())
+    plan = segment.read_render_plan(segment.run(tmp_path / "d1.dem", cfg))
+    assert plan["demo_end_tick"] == 6000
+    assert plan["segments"][0]["target"]["entity_id"] == 12
+    assert plan["meta"]["diagnostics"] == {"duplicate_spawns": 0, "deaths_without_spawn": 0}
+
+
+def test_run_without_entity_id_prop_support_still_plans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoEntity(FakeParser):
+        def parse_ticks(self, wanted_props, **kw):
+            if "entity_id" in wanted_props:
+                raise ValueError("unknown prop entity_id")
+            return super().parse_ticks(wanted_props, **kw)
+
+    base = fake_demo_parser()
+    parser = NoEntity(ticks=base._ticks, events=base._events)
+    cfg = load_config(overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}"])
+    monkeypatch.setattr(demo, "_make_parser", lambda path: parser)
+    plan = segment.read_render_plan(segment.run(tmp_path / "d1.dem", cfg))
+    assert plan["segments"][0]["target"]["entity_id"] is None
+
+
+def test_run_warns_on_zero_episodes_and_rejects_empty_demo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = load_config(overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}"])
+    parser = fake_demo_parser()
+    parser._events = {k: v.iloc[0:0] for k, v in parser._events.items()}
+    monkeypatch.setattr(demo, "_make_parser", lambda path: parser)
+    with caplog.at_level("WARNING"):
+        segment.run(tmp_path / "d1.dem", cfg)
+    assert "zero episodes" in caplog.text
+    parser._ticks = parser._ticks.iloc[0:0]
+    with pytest.raises(ValueError, match="no ticks"):
+        segment.run(tmp_path / "d1.dem", cfg)
+
+
+def test_plan_episodes_match_the_timeline_and_the_extractor() -> None:
+    from cs2wm.pipeline.extract_actions import extract_episode
+    from cs2wm.timeline import frame_to_tick, tick_to_frame
+    from tests.test_extract_actions import CFG as EXTRACT_CFG
+    from tests.test_extract_actions import make_ticks
+
+    lives = [life(1, 0, 30 * TPF * 100)]
+    segs = plan_spectate(lives, "longest_remaining", CFG, rng())
+    eps = split_episodes(segs, "demoX", "dm", CFG)
+    plan = segment.build_render_plan("demoX", segs, eps, CFG, {}, demo_end_tick=lives[0].death_tick)
+    rebuilt = segment.episodes_from_plan(plan)
+    assert rebuilt == eps and len(eps) >= 2
+
+    for ep, rec in zip(rebuilt, (e for s in plan["segments"] for e in s["episodes"])):
+        ks = np.arange(ep.n_frames + 1)
+        assert frame_to_tick(ks, ep.start_tick, ep.ticks_per_frame).tolist() == [ep.frame_tick(int(k)) for k in ks]
+        assert ep.end_tick == rec["end_tick"] == frame_to_tick(ep.n_frames, ep.start_tick, TPF)
+        for k in (0, ep.n_frames - 1):
+            lo, hi = ep.window(k)
+            assert (lo, hi) == (ep.start_tick + k * TPF, ep.start_tick + (k + 1) * TPF) and tick_to_frame(
+                hi, ep.start_tick, TPF
+            ) == k  # (T_k, T_k+1]
+            assert tick_to_frame(lo + 1, ep.start_tick, TPF) == k
+    # Consecutive episodes of a segment share the boundary frame.
+    assert eps[0].end_tick == eps[1].start_tick
+    # The extractor accepts a planned episode and yields one label per labeled frame.
+    short = next(e for e in eps if e.n_frames < CFG.episodes.max_frames)
+    actions, _ = extract_episode(make_ticks(short), {}, short, EXTRACT_CFG)
+    assert actions.shape == (short.n_frames, 51)
