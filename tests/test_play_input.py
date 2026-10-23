@@ -13,6 +13,7 @@ from cs2wm.play.input import CMD_QUIT, CMD_RESET, CMD_TOGGLE_OVERLAY, InputBindi
 KEYDOWN, KEYUP, MBDOWN, MBUP, MOTION, QUIT = 1, 2, 3, 4, 5, 6
 CODES = {"w": 10, "a": 11, "s": 12, "d": 13, "space": 14, "ctrl": 15, "shift": 16, "1": 17, "2": 18, "3": 19, "r": 20}
 K_4, K_RCTRL, K_BACKSPACE, K_F1, K_ESC = 21, 22, 23, 24, 25
+FOCUSLOST = 7
 BINDINGS = InputBindings(
     keydown=KEYDOWN,
     keyup=KEYUP,
@@ -24,6 +25,7 @@ BINDINGS = InputBindings(
     key_reset=K_BACKSPACE,
     key_overlay=K_F1,
     key_quit=K_ESC,
+    windowfocuslost=FOCUSLOST,
 )
 
 
@@ -119,10 +121,10 @@ def test_newer_slot_replaces_older_slot() -> None:
 @pytest.mark.parametrize("pair", [("w", "s"), ("a", "d")])
 def test_opposing_movement_cancels(pair) -> None:
     m = make_mapper()
-    feed(m, down(CODES[pair[0]]), down(CODES[pair[1]]), down(CODES["r"]))
-    assert keys_of(m) == ("r",)
+    feed(m, down(CODES[pair[0]]), down(CODES[pair[1]]), down(CODES["shift"]))
+    assert keys_of(m) == ("shift",)
     feed(m, up(CODES[pair[1]]))
-    assert keys_of(m) == (pair[0], "r")
+    assert keys_of(m) == (pair[0], "shift")
 
 
 def test_clicks() -> None:
@@ -130,9 +132,10 @@ def test_clicks() -> None:
     feed(m, click(1), click(3), click(2))  # middle button ignored
     d = decode(m.frame_action(), m.spec)
     assert d.lmb and d.rmb
-    feed(m, click(1, pressed=False))
     d = decode(m.frame_action(), m.spec)
-    assert not d.lmb and d.rmb
+    assert d.lmb and not d.rmb  # LMB is held (labels hold-fill fire); RMB is a one-frame pulse
+    feed(m, click(1, pressed=False))
+    assert not decode(m.frame_action(), m.spec).lmb
 
 
 def test_mouse_motion_accumulates_over_the_frame_then_resets(spec) -> None:
@@ -221,3 +224,73 @@ def test_reset_forgets_held_input() -> None:
     m.reset()
     action = m.frame_action()
     assert action[:13].sum() == 0
+
+
+def tap(name: str) -> tuple[SimpleNamespace, SimpleNamespace]:
+    if name in ("lmb", "rmb"):
+        button = 1 if name == "lmb" else 3
+        return click(button), click(button, pressed=False)
+    return down(CODES[name]), up(CODES[name])
+
+
+@pytest.mark.parametrize("name", ["lmb", "rmb", "space", "r", "w", "ctrl", "shift"])
+def test_tap_shorter_than_a_frame_is_not_lost(spec, name) -> None:
+    m = make_mapper()
+    feed(m, *tap(name))
+    d = decode(m.frame_action(), spec)
+    assert (name in d.keys) or (name == "lmb" and d.lmb) or (name == "rmb" and d.rmb)
+    after = decode(m.frame_action(), spec)  # released: gone from the next frame
+    assert after.keys == () and not after.lmb and not after.rmb
+
+
+def test_tap_that_cancels_an_opposite_still_cancels() -> None:
+    m = make_mapper()
+    feed(m, down(CODES["s"]), *tap("w"))
+    assert keys_of(m) == ()
+    assert keys_of(m) == ("s",)
+
+
+@pytest.mark.parametrize("name", ["space", "r", "rmb"])
+def test_pulse_keys_fire_once_while_held(spec, name) -> None:
+    m = make_mapper()
+    feed(m, tap(name)[0])
+    on = []
+    for _ in range(5):
+        d = decode(m.frame_action(), spec)
+        on.append(name in d.keys or (name == "rmb" and d.rmb))
+    assert on == [True, False, False, False, False]
+    feed(m, tap(name)[1], *tap(name))  # release, press again: a new pulse
+    d = decode(m.frame_action(), spec)
+    assert name in d.keys or d.rmb
+
+
+def test_os_key_repeat_does_not_retrigger_a_pulse(spec) -> None:
+    m = make_mapper()
+    feed(m, down(CODES["space"]))
+    m.frame_action()
+    feed(m, down(CODES["space"]), down(CODES["space"]))
+    assert keys_of(m) == ()
+
+
+@pytest.mark.parametrize("name", ["lmb", "w", "ctrl", "shift"])
+def test_state_keys_stay_on_while_held(spec, name) -> None:
+    m = make_mapper()
+    feed(m, tap(name)[0])
+    for _ in range(4):
+        d = decode(m.frame_action(), spec)
+        assert (name in d.keys) or (name == "lmb" and d.lmb)
+
+
+def test_focus_loss_drops_held_input() -> None:
+    m = make_mapper()
+    feed(m, down(CODES["w"]), click(1), motion(9, 9))
+    assert m.handle_event(SimpleNamespace(type=FOCUSLOST)) is None
+    assert m.frame_action()[:13].sum() == 0
+
+
+def test_drop_mouse_keeps_keys(spec) -> None:
+    m = make_mapper()
+    feed(m, down(CODES["w"]), motion(500, 500))
+    m.drop_mouse()
+    d = decode(m.frame_action(), spec)
+    assert d.keys == ("w",) and d.mouse_x_deg == 0.0

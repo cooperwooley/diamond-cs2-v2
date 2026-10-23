@@ -183,6 +183,11 @@ class WorldModel:
     def reset(self, frames: torch.Tensor, actions: np.ndarray | torch.Tensor) -> None:
         """Set the context and the displayed frame.
 
+        The upsampler also needs a previous full-res frame, which the context does not have (packed episodes hold only
+        low-res frames). The first one is a bicubic upscale of the last context frame; it is replaced by the
+        upsampler's own output after one step, so the error does not accumulate. A full-res twin of the episode
+        could provide a better first frame, but is not used.
+
         Args:
             frames: ``float[n_cond, 3, h, w]`` RGB in [-1, 1]; the last ``n_cond`` are kept.
             actions: ``[n_cond, 51]`` actions aligned with ``frames``. The last one is overwritten by the first

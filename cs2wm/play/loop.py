@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     from agent import Agent
 
 WARMUP_STEPS = 3
+# A frame longer than this (CUDA/compile stall, window drag) drops its accumulated mouse motion instead of applying
+# it as one giant turn.
+STALL_S = 1.0
 _OVERLAY_ROWS = (("w", "a", "s", "d"), ("space", "ctrl", "shift"), ("1", "2", "3", "r"), ("lmb", "rmb"))
 _KEY_LABELS = {"space": "SPC", "ctrl": "CTRL", "shift": "SHIFT"}
 
@@ -129,6 +132,7 @@ class PlaySession:
         agent: A ready agent, used instead of loading the checkpoints (tests).
         event_source: Returns the frame's pygame events; defaults to ``pygame.event.get`` (tests).
         max_frames: Stop after this many frames (tests); None plays until Esc or the window is closed.
+        clock: Monotonic seconds, ``time.perf_counter`` unless a test supplies a fake.
     """
 
     def __init__(
@@ -145,6 +149,7 @@ class PlaySession:
         agent: Agent | None = None,
         event_source: Callable[[], Iterable[Any]] | None = None,
         max_frames: int | None = None,
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.cfg = cfg
         self.ckpt = ckpt
@@ -158,6 +163,7 @@ class PlaySession:
         self.agent = agent
         self.event_source = event_source
         self.max_frames = max_frames
+        self.clock = clock
         self.fps = 0.0
 
     def _build_world_model(self) -> WorldModel:
@@ -186,36 +192,51 @@ class PlaySession:
         h, w = (int(v) for v in cfg.resolution.render)
         size = (w * int(cfg.play.window_scale), h * int(cfg.play.window_scale))
 
-        pg.init()
-        screen = pg.display.set_mode(size)
-        pg.display.set_caption("cs2wm play  |  Esc quit  Backspace reset  F1 overlay")
-        pg.mouse.set_visible(False)
-        pg.event.set_grab(True)
-        if hasattr(pg.mouse, "set_relative_mode"):
-            pg.mouse.set_relative_mode(True)
-        get_events = self.event_source or pg.event.get
-
         writer = None
-        if self.record is not None:
-            self.record.parent.mkdir(parents=True, exist_ok=True)
-            # Written at the dataset frame rate, so the video plays in world time even if the model runs slower.
-            writer = cv2.VideoWriter(str(self.record), cv2.VideoWriter_fourcc(*"mp4v"), float(cfg.timing.fps), size)
-            if not writer.isOpened():
-                raise RuntimeError(f"cannot open {self.record} for writing")
-
-        clock = pg.time.Clock()
-        stamps: deque[float] = deque(maxlen=16)
-        show_overlay, frames, running = True, 0, True
+        pg.init()
         try:
+            screen = pg.display.set_mode(size)
+            pg.display.set_caption("cs2wm play  |  Esc quit  Backspace reset  F1 overlay")
+            pg.mouse.set_visible(False)
+            pg.event.set_grab(True)
+            if hasattr(pg.mouse, "set_relative_mode"):
+                pg.mouse.set_relative_mode(True)
+            get_events = self.event_source or pg.event.get
+
+            video_fps = float(cfg.timing.fps)
+            if self.record is not None:
+                self.record.parent.mkdir(parents=True, exist_ok=True)
+                writer = cv2.VideoWriter(str(self.record), cv2.VideoWriter_fourcc(*"mp4v"), video_fps, size)
+                if not writer.isOpened():
+                    raise RuntimeError(f"cannot open {self.record} for writing")
+
+            # Throwaway step: the first one pays for CUDA/cuDNN warm-up, and the motion during it must not become a
+            # giant turn in the first real frame.
+            world.step(blank_context(1, cfg.resolution.low_res, spec)[1][0])
+            world.restart()
+            pg.event.clear()
+            mapper.reset()
+
+            clock = pg.time.Clock()
+            stamps: deque[float] = deque(maxlen=16)
+            show_overlay, frames, running = True, 0, True
+            t_prev = prev_start = self.clock()
+            carry = 0.0
             while running and (self.max_frames is None or frames < self.max_frames):
+                start = self.clock()
                 for event in get_events():
                     cmd = mapper.handle_event(event)
                     if cmd == CMD_QUIT:
                         running = False
                     elif cmd == CMD_RESET:
                         world.restart()
+                        mapper.reset()
                     elif cmd == CMD_TOGGLE_OVERLAY:
                         show_overlay = not show_overlay
+                if start - prev_start > STALL_S:
+                    print(f"Frame took {start - prev_start:.1f} s; dropped the mouse motion accumulated meanwhile")
+                    mapper.drop_mouse()
+                prev_start = start
                 action = mapper.frame_action()
                 frame = tensor_to_rgb_uint8(world.step(action))
                 surf = pg.transform.scale(pg.surfarray.make_surface(frame.swapaxes(0, 1)), size)
@@ -223,18 +244,29 @@ class PlaySession:
                 if show_overlay:
                     draw_overlay(screen, action, spec, self.fps)
                 pg.display.flip()
+                now = self.clock()
                 if writer is not None:
+                    # The video runs at the dataset frame rate. A loop slower than that writes the frame several
+                    # times, so playback takes as long as the session did; `carry` keeps the rounding error.
+                    owed = (now - t_prev) * video_fps + carry
+                    k = max(1, round(owed))
+                    carry = owed - k
                     rgb = pg.surfarray.array3d(screen).swapaxes(0, 1)
-                    writer.write(cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR))
+                    bgr = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
+                    for _ in range(k):
+                        writer.write(bgr)
+                t_prev = now
                 frames += 1
                 # Cap at the dataset frame rate: one mouse-count accumulation window must be 1/16 s, as in the labels.
-                clock.tick(float(cfg.timing.fps))
-                stamps.append(time.perf_counter())
-                if len(stamps) > 1:
+                clock.tick(video_fps)
+                stamps.append(now)
+                if len(stamps) > 1 and stamps[-1] > stamps[0]:
                     self.fps = (len(stamps) - 1) / (stamps[-1] - stamps[0])
         finally:
             if writer is not None:
                 writer.release()
+            if hasattr(pg.mouse, "set_relative_mode"):
+                pg.mouse.set_relative_mode(False)
             pg.event.set_grab(False)
             pg.mouse.set_visible(True)
             pg.quit()
@@ -290,11 +322,12 @@ def benchmark(
                     world = WorldModel(agent, steps, use_upsampler=use_up, bf16=precision == "bf16")
                     world.reset(*blank_context(world.n_cond, cfg.resolution.low_res, spec))
                     for _ in range(WARMUP_STEPS):
-                        world.step(idle)
+                        tensor_to_rgb_uint8(world.step(idle))
                     _sync(device)
                     t0 = time.perf_counter()
                     for _ in range(n_frames):
-                        world.step(idle)
+                        # The conversion copies the frame to the CPU, as play does for display.
+                        tensor_to_rgb_uint8(world.step(idle))
                     _sync(device)
                     dt = time.perf_counter() - t0
                     results[name] = {"status": "ok", "fps": n_frames / dt, "ms_per_frame": 1000 * dt / n_frames}
@@ -312,6 +345,7 @@ def benchmark(
         "device": device.type,
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "torch": torch.__version__,
+        "note": "per-frame time = model step + GPU-to-CPU frame conversion; excludes display, overlay and recording",
         "n_frames": n_frames,
         "warmup_steps": WARMUP_STEPS,
         "ckpt": str(ckpt),
