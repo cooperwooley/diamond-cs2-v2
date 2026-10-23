@@ -419,3 +419,135 @@ def test_verify_manifests_fullres_records(verify, tmp_path, capsys) -> None:
     assert verify.main([str(root), "--fullres-root", str(fullres)]) == 0
     (d / "e.hdf5").write_bytes(b"abd")
     assert verify.main([str(root), "--fullres-root", str(fullres)]) == 1
+
+
+# Cross-demo shuffle
+
+
+@pytest.mark.parametrize("sizes", [[2, 2, 2], [3, 3], [1, 2, 3, 4], [2, 2, 2, 2, 2, 2, 1], [1, 1]])
+@pytest.mark.parametrize("seed", range(5))
+def test_assign_action_sources_avoids_own_demo(conv, sizes, seed) -> None:
+    demos = [f"d{d}" for d, size in enumerate(sizes) for _ in range(size)]
+    n = len(demos)
+    source, method = conv.assign_action_sources(demos, seed)
+    assert (source, method) == conv.assign_action_sources(demos, seed)
+    assert sorted(source) == list(range(n))
+    assert all(source[i] != i for i in range(n))
+    if 2 * max(sizes) <= n:
+        assert method == "cross_demo_shift"
+        assert all(demos[source[i]] != demos[i] for i in range(n))
+    else:
+        assert method == "derangement_fallback"
+
+
+def test_assign_action_sources_fallback_warns(conv, capsys) -> None:
+    demos = ["a"] * 4 + ["b"]
+    source, method = conv.assign_action_sources(demos, 0)
+    assert method == "derangement_fallback" and all(source[i] != i for i in range(5))
+    assert "WARNING" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="at least 2"):
+        conv.assign_action_sources(["a"], 0)
+
+
+def multi_tree(root: Path, per_demo: dict[str, int]) -> Path:
+    i = 0
+    for demo, count in per_demo.items():
+        for e in range(count):
+            add_episode(root, "dm", demo, f"{demo}_e{e}", 3 + i % 3, action(3 + i % 3, keys={i % 11: [0]}), i)
+            i += 1
+    return root
+
+
+def test_shuffle_records_method_and_zero_same_demo_swaps(conv, tmp_path) -> None:
+    root = multi_tree(tmp_path / "hdf5", {f"dm{d}": 2 for d in range(4)})
+    convert(conv, root, tmp_path / "ds", "--shuffle-actions", "--test-frac", "0.25")
+    meta = json.loads((tmp_path / "ds" / "dataset_meta.json").read_text())
+    assert meta["shuffle"] == {"method": "cross_demo_shift", "same_demo_swaps": 0}
+    by_id = {r["episode_id"]: r for r in meta["episodes"]}
+    for r in meta["episodes"]:
+        if r["split"] == "train":
+            assert by_id[r["actions_from"]]["demo_id"] != r["demo_id"]
+
+
+def test_shuffle_fallback_records_same_demo_swaps(conv, tmp_path, capsys) -> None:
+    root = multi_tree(tmp_path / "hdf5", {"dm0": 4, "dm1": 1, "dm2": 1, "dm3": 1})
+    # dm0 (4 of 7 episodes) must land in train for the fallback to be needed; pick a seed that does that.
+    for seed in range(20):
+        out = tmp_path / f"ds{seed}"
+        convert(conv, root, out, "--shuffle-actions", "--test-frac", "0.25", "--seed", str(seed))
+        if split_of(out)["dm0"] == "train":
+            break
+    else:
+        pytest.fail("no seed puts dm0 in train")
+    meta = json.loads((out / "dataset_meta.json").read_text())
+    assert meta["shuffle"]["method"] == "derangement_fallback"
+    assert "WARNING" in capsys.readouterr().out
+    rows = {r["episode_id"]: r for r in meta["episodes"]}
+    expected = sum(
+        rows[r["actions_from"]]["demo_id"] == r["demo_id"] for r in meta["episodes"] if r["split"] == "train"
+    )
+    assert meta["shuffle"]["same_demo_swaps"] == expected
+    assert all(r["actions_from"] != r["episode_id"] for r in meta["episodes"] if r["split"] == "train")
+
+
+def test_plain_conversion_has_no_shuffle_info(conv, tree, tmp_path) -> None:
+    convert(conv, tree, tmp_path / "ds")
+    assert json.loads((tmp_path / "ds" / "dataset_meta.json").read_text())["shuffle"] is None
+
+
+# Stats: long episodes and no obs reads
+
+
+def test_length_hist_keeps_episodes_longer_than_max(stats_mod) -> None:
+    acc = stats_mod._Acc(SPEC)
+    acc.add(action(5))
+    acc.add(action(1200))
+    hist = acc.summary(16, 1000)["length_hist"]
+    assert sum(hist["counts"]) == 2 and hist["counts"][-1] == 1 and hist["counts"][0] == 1
+
+
+def test_dataset_stats_mmaps_episodes(stats_mod, stats_ds, monkeypatch) -> None:
+    calls = []
+    real = torch.load
+    monkeypatch.setattr(torch, "load", lambda *a, **k: calls.append(k.get("mmap")) or real(*a, **k))
+    stats_mod.compute_stats(stats_ds)
+    assert calls and all(calls)
+
+
+# Trainer-style batching
+
+
+def test_batch_sampler_and_collate_build_trainer_batches(conv, tree, tmp_path, monkeypatch) -> None:
+    convert(conv, tree, tmp_path / "ds")
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from data import BatchSampler, Dataset, collate_segments_to_batch
+
+    ds = Dataset(tmp_path / "ds" / "low_res" / "train", None, "train_dataset")
+    ds.load_from_default_path()
+    batch_size, seq_length = 4, 5
+    # torch >= 2.2 dropped Sampler's data_source argument, which v1's BatchSampler still passes to super().__init__.
+    monkeypatch.setattr(torch.utils.data.Sampler, "__init__", lambda self, *a, **k: None)
+    sampler = BatchSampler(ds, 0, 1, batch_size, seq_length, None)
+    it = iter(sampler)
+    for _ in range(3):
+        batch = collate_segments_to_batch([ds[sid] for sid in next(it)])
+        assert batch.obs.shape == (batch_size, seq_length, 3, 30, 56) and batch.obs.dtype == torch.float32
+        assert batch.act.shape == (batch_size, seq_length, ACTION_DIM) and batch.act.dtype == torch.float32
+        assert batch.rew.shape == batch.end.shape == batch.trunc.shape == (batch_size, seq_length)
+        assert batch.end.dtype == batch.trunc.dtype == torch.uint8
+        assert batch.mask_padding.shape == (batch_size, seq_length) and batch.mask_padding.dtype == torch.bool
+        assert batch.obs.min() >= -1 and batch.obs.max() <= 1
+        assert len(batch.info) == batch_size and len(batch.segment_ids) == batch_size
+
+
+def test_verify_manifests_empty_and_undecodable_manifests(verify, tmp_path, capsys) -> None:
+    root = tmp_path / "hdf5"
+    (root / "dm" / "dm0").mkdir(parents=True)
+    (root / "dm" / "dm0" / "manifest.jsonl").write_text("\n\n")
+    assert verify.main([str(root)]) == 1
+    out = capsys.readouterr().out
+    assert "empty manifest" in out and out.strip().splitlines()[-1].startswith("FAILED")
+    (root / "dm" / "dm0" / "manifest.jsonl").write_bytes(b"\xff\xfe\x00{")
+    assert verify.main([str(root)]) == 1
+    out = capsys.readouterr().out
+    assert "unreadable manifest" in out and out.strip().splitlines()[-1].startswith("FAILED")

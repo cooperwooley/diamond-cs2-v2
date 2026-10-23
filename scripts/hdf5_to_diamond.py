@@ -10,7 +10,11 @@ least 30% of them, and at least 3, go to test. With fewer than 3 smoke demos all
 says train has none), because an H2 evaluation without smoke test data is worse than a train set without smoke.
 
 ``--shuffle-actions`` gives each train episode the action sequence of a different train episode (a seeded
-derangement, tiled or cropped to the episode's length); test keeps the true actions.
+derangement, tiled or cropped to the episode's length); test keeps the true actions. Where possible the source is
+from a different demo too (see ``assign_action_sources``), so the control cannot reuse the same match.
+
+The split depends on the full set of demos present. Build the main and the shuffled dataset together, from the same
+HDF5 snapshot and with the same ``--seed``; adding demos later re-draws the split.
 
 Frames are saved as uint8 directly (not through ``Episode.save``, whose float round trip truncates 63 of the 256
 values), so the stored pixels equal the HDF5 pixels exactly.
@@ -194,6 +198,44 @@ def derangement(n: int, seed: int) -> list[int]:
     return p
 
 
+def assign_action_sources(demo_ids: Sequence[str], seed: int) -> tuple[list[int], str]:
+    """Pick, for each train episode, the train episode whose actions it receives.
+
+    Preferred: shuffle the demo order with the seed, lay the episodes out grouped by demo, and map position ``i`` to
+    ``(i + k) mod n`` with ``k`` the largest demo group size. For ``2k <= n`` no episode then receives actions from
+    its own demo (and, as ``k >= 1``, none keeps its own). Otherwise fall back to ``derangement`` (which can pair
+    episodes of one demo) and print a warning.
+
+    Args:
+        demo_ids: Demo of each train episode.
+        seed: Seed.
+
+    Returns:
+        ``(source, method)``: ``source[i]`` is the episode index whose actions episode ``i`` gets, and ``method``
+        is ``"cross_demo_shift"`` or ``"derangement_fallback"``.
+
+    Raises:
+        ValueError: If there are fewer than 2 episodes.
+    """
+    n = len(demo_ids)
+    if n < 2:
+        raise ValueError(f"a derangement needs at least 2 items, got {n}")
+    groups: dict[str, list[int]] = {}
+    for i, demo in enumerate(demo_ids):
+        groups.setdefault(demo, []).append(i)
+    k = max(len(g) for g in groups.values())
+    if 2 * k > n:
+        print(f"WARNING: largest demo has {k} of {n} train episodes; shuffled actions may come from the same demo")
+        return derangement(n, seed), "derangement_fallback"
+    order = sorted(groups)
+    random.Random(f"{seed}:demo-order").shuffle(order)
+    layout = [i for demo in order for i in groups[demo]]
+    source = [0] * n
+    for pos, i in enumerate(layout):
+        source[i] = layout[(pos + k) % n]
+    return source, "cross_demo_shift"
+
+
 def tile_to_length(actions: np.ndarray, n: int) -> np.ndarray:
     """Repeat (tile) or cut (crop) an action sequence to ``n`` rows.
 
@@ -229,10 +271,9 @@ def _save_episode(dataset: Dataset, ref: EpisodeRef, frames_bgr: np.ndarray, act
         "demo_id": ref.demo_id,
         "kind": ref.kind,
     }
-    # The dataset is built with save_on_disk=False: add_episode only updates the counters here (it ignores the pixel
+    # The dataset is built with save_on_disk=False: add_episode only reads the length, rew and end here (never the pixel
     # values), and the lossless file is written below in the layout Episode.load expects.
-    obs_float = obs.float().div(255).mul(2).sub(1)
-    episode_id = dataset.add_episode(Episode(obs_float, act, rew, end, trunc, info))
+    episode_id = dataset.add_episode(Episode(obs, act, rew, end, trunc, info))
     path = dataset._get_episode_path(episode_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -282,12 +323,16 @@ def convert(
         if not eps:
             raise SystemExit(f"the {s} split is empty ({len(episodes)} episodes, {len(split)} demos); add demos")
     sources: dict[str, EpisodeRef] = {}
+    shuffle_info: dict[str, Any] | None = None
     if shuffle_actions:
         n_train = len(by_split["train"])
         if n_train < 2:
             raise SystemExit(f"--shuffle-actions needs at least 2 train episodes to swap, got {n_train}")
-        perm = derangement(n_train, seed)
-        sources = {e.episode_id: by_split["train"][perm[i]] for i, e in enumerate(by_split["train"])}
+        train = by_split["train"]
+        source, method = assign_action_sources([e.demo_id for e in train], seed)
+        sources = {e.episode_id: train[source[i]] for i, e in enumerate(train)}
+        same_demo = sum(e.demo_id == sources[e.episode_id].demo_id for e in train)
+        shuffle_info = {"method": method, "same_demo_swaps": same_demo}
 
     table: list[dict[str, Any]] = []
     for s in SPLITS:
@@ -317,6 +362,7 @@ def convert(
         "test_frac": test_frac,
         "seed": seed,
         "shuffle_actions": shuffle_actions,
+        "shuffle": shuffle_info,
         "source_manifests": _manifest_checksums(hdf5_root),
         "episodes": table,
     }

@@ -62,7 +62,8 @@ class _Acc:
 
     def summary(self, fps: int, max_frames: int) -> dict[str, Any]:
         spec, frames = self.spec, max(self.frames, 1)
-        counts, edges = np.histogram(self.lengths, bins=_LENGTH_BINS, range=(0, max_frames))
+        # Clip so an episode longer than max_frames lands in the (closed) top bin instead of being dropped.
+        counts, edges = np.histogram(np.minimum(self.lengths, max_frames), bins=_LENGTH_BINS, range=(0, max_frames))
         slots = (*spec.keys, *spec.clicks)
         return {
             "episodes": self.episodes,
@@ -106,8 +107,9 @@ def compute_stats(dataset_dir: Path) -> dict[str, Any]:
         for path in sorted((root / split).rglob("*.pt")):
             if path.name == "info.pt":
                 continue
-            ep = torch.load(path, map_location="cpu", weights_only=True)
-            act = ep["act"].numpy()
+            # mmap: only the small act/info entries are read, the obs pages are never touched.
+            ep = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+            act = ep["act"].clone().numpy()
             kind = ep["info"]["kind"]
             for acc in (total, accs[split]):
                 acc.add(act)

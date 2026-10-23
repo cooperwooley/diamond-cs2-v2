@@ -2,7 +2,8 @@
 """Re-check every sha256 in each ``manifest.jsonl`` under an HDF5 root (#17); used by #19, #24, #25.
 
 Each record's ``file`` is relative to its manifest's directory. Prints one line per manifest and a final
-``OK``/``FAILED`` summary; exits 1 on any mismatch, missing file, unreadable record, or if no manifest is found.
+``OK``/``FAILED`` summary; exits 1 on any mismatch, missing file, unreadable record or manifest, empty manifest
+(nothing was packed), or if no manifest is found.
 ``fullres/<name>`` records (the full-res twin of a low-res file) are checked against ``--fullres-root`` and counted
 as skipped without it. ``.hdf5`` files that no record lists are reported as a warning only.
 """
@@ -40,7 +41,13 @@ def check_manifest(manifest: Path, root: Path, fullres_root: Path | None) -> tup
     checked, skipped = 0, 0
     problems: list[str] = []
     listed: set[Path] = set()
-    for lineno, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+    try:
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+    except (UnicodeDecodeError, OSError) as e:
+        return 0, 0, [f"{manifest}: unreadable manifest ({e})"], []
+    if not any(line.strip() for line in lines):
+        return 0, 0, [f"{manifest}: empty manifest (no records)"], []
+    for lineno, line in enumerate(lines, 1):
         if not line.strip():
             continue
         try:
