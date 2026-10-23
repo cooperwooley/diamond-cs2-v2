@@ -2,6 +2,7 @@
 
 import socket
 import socketserver
+import struct
 import threading
 import time
 
@@ -44,6 +45,25 @@ class _Handler(socketserver.StreamRequestHandler):
                 self.request.recv(1)
             except OSError:
                 pass
+
+
+class _ResetHandler(socketserver.StreamRequestHandler):
+    def handle(self) -> None:
+        self.rfile.readline()
+        self.request.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        self.request.close()  # linger 0: close sends RST, not FIN
+
+
+def test_reset_after_send_raises() -> None:
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _ResetHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = NetconClient(port=srv.server_address[1], idle_s=1, timeout_s=3)
+        with pytest.raises(ConnectionError, match="lost"):
+            client.send("stop")
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def _free_port() -> int:

@@ -67,9 +67,10 @@ class GenerateError(RuntimeError):
 
 
 def _require_insecure(cmd: Sequence[str]) -> None:
-    """Raise ``ValueError`` unless ``-insecure`` is in ``cmd``."""
-    if "-insecure" not in cmd:
-        raise ValueError("refusing to start CS2 without -insecure (HLAE and CS2 only ever run offline)")
+    """Raise ``ValueError`` unless ``-insecure`` is in ``cmd``, or if it asks CS2 to connect to a server or go secure."""
+    problem = cs2wm_config.launch_option_problem(list(cmd))
+    if problem:
+        raise ValueError(f"refusing to start CS2: {problem} (HLAE and CS2 only ever run offline)")
 
 
 def build_launch_command(cfg: DictConfig, profile: str, netconport: int | None = None) -> list[str]:
@@ -84,7 +85,7 @@ def build_launch_command(cfg: DictConfig, profile: str, netconport: int | None =
         The argv list: ``cs2.exe``, the launch options, ``-netconport <port>`` if given and ``+exec generate_<profile>``.
 
     Raises:
-        ValueError: If ``-insecure`` is not among the launch options, or the profile is unknown.
+        ValueError: If ``-insecure`` is not among the launch options, ``-secure``/``+connect`` is, or the profile is unknown.
     """
     options = [str(o) for o in cfg.generate.launch_options]
     _require_insecure(options)
@@ -216,6 +217,11 @@ class Watchdog:
         self._last_progress = now
         self._last_size: int | None = None
 
+    @property
+    def last_progress(self) -> float:
+        """Clock reading of the last growth (or the last rearm)."""
+        return self._last_progress
+
     def rearm(self, now: float) -> None:
         """Restart the grace period (after a launch or at a chunk boundary)."""
         self._last_progress = now
@@ -322,6 +328,13 @@ class CS2Process:
         if self._watchdog is not None:
             self._watchdog.rearm(self._clock())
 
+    @property
+    def last_progress(self) -> float:
+        """Clock reading of the last demo growth seen by the watchdog."""
+        if self._watchdog is None:
+            raise RuntimeError("CS2Process is not started")
+        return self._watchdog.last_progress
+
     def poll(self) -> str:
         """Advance the watchdog state machine.
 
@@ -334,12 +347,19 @@ class CS2Process:
         return self._watchdog.observe(self._clock(), alive, self._size_probe(self.demo_dir))
 
     def kill(self) -> None:
-        """Kill the process tree (``taskkill /T /F`` on Windows). Safe to call twice."""
+        """Kill the process tree (``taskkill /T /F`` on Windows). Safe to call twice.
+
+        On Windows ``taskkill`` also runs when the main process already exited, because a crash handler or child of
+        ``cs2.exe`` may still be alive (CONFIRM(#14)).
+        """
         proc = self._proc
-        if proc is None or proc.poll() is not None:
+        if proc is None:
             return
         if _is_windows():
-            self._run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False, timeout=30)
+            try:
+                self._run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False, timeout=30)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.warning("taskkill failed: %s", exc)
         if proc.poll() is None:
             proc.kill()
         try:
@@ -402,24 +422,13 @@ class Hooks:
     parse_error: Callable[[Path], str | None] = lambda path: _parse_error(path)
     notify: Callable[..., None] = ntfy.notify
     git_sha: Callable[[], str] = _git_sha
+    copy: Callable[[Path, Path], Any] = shutil.copyfile
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
     tmp = path.with_name(path.name + ".part")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
-
-
-def _move_atomic(src: Path, dest: Path) -> None:
-    """Copy ``src`` next to ``dest``, rename into place, then delete ``src`` (works across drives)."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".part")
-    shutil.copyfile(src, tmp)
-    os.replace(tmp, dest)
-    try:
-        src.unlink()
-    except OSError as exc:  # CS2 may still hold the handle; the copy is complete, a leftover is harmless
-        log.warning("could not delete %s after copying: %s", src, exc)
 
 
 class Generator:
@@ -432,6 +441,9 @@ class Generator:
         chunk_min: Chunk length override (``generate.chunk_min``).
         hooks: Clock, process factory, filesystem probe, ... (fakes in tests).
         cfg_dir: Source cfg directory override.
+
+    Raises:
+        ValueError: If ``hours`` or the chunk length is not positive.
     """
 
     def __init__(
@@ -447,20 +459,30 @@ class Generator:
         self.g = cfg.generate
         self.profile = profile
         self.chunk_min = float(chunk_min if chunk_min is not None else self.g.chunk_min)
+        if not hours > 0:
+            raise ValueError(f"--hours must be > 0, got {hours}")
+        if not self.chunk_min > 0:
+            raise ValueError(f"--chunk-min must be > 0, got {self.chunk_min}")
         self.target_s = hours * 3600.0
         self.h = hooks or Hooks()
         self.cfg_dir = cfg_dir
         self.cs2_dir = Path(cfg.paths.cs2_dir)
         self.csgo_dir = self.cs2_dir / "game" / "csgo"
         self.out_dir = Path(cfg.paths.demos) / profile
+        self.rejected_dir = Path(cfg.paths.demos) / REJECTED_DIR
         self.kept: list[Path] = []
-        self.generated_s = 0.0  # demo time of kept chunks
+        self.generated_s = 0.0  # demo time of kept chunks (plus intact chunks that could not be published yet)
         self.cfg_sha = ""
         self.git_sha = ""
         self.started = self.h.wall()
         self._index = 0  # chunk counter, continues across CS2 restarts
-        self._progress = 0  # chunks closed (kept or rejected) in the current session
-        self._ignore: set[Path] = set()  # gotv: demos already handled or present before this run
+        self._progress = 0  # chunks kept or closed normally in the current session; rejected ones do not count
+        self._ignore: set[Path] = set()  # gotv: demos that were present before the run or are published/rejected
+        self._stranded: set[Path] = set()  # gotv: demos whose publishing failed; retried in the next session
+        self._pending_unlink: list[Path] = []  # copied sources CS2 still holds open; deleted again at the end
+        self._notified: set[Path] = set()
+        kinds = "|".join(re.escape(str(k)) for k in cfg.episodes.kinds)
+        self._ours = re.compile(rf"^(?:{kinds})_\d{{8}}-\d{{6}}_\d{{3}}\.dem$")
 
     # -- patch guard ------------------------------------------------------------------------------------------------
 
@@ -495,7 +517,8 @@ class Generator:
         """Wait until ``path`` exists and its size has been stable for ``close_stable_s``.
 
         Returns:
-            True if it closed with data in it, False on timeout or if it is missing/empty.
+            True if it closed with data in it. False on timeout (e.g. it is still growing) or if it is missing or
+            empty; the file is then left where it is and picked up again in a later cycle.
         """
         start = self.h.clock()
         last: int | None = None
@@ -508,10 +531,12 @@ class Generator:
             elif size and now - stable_since >= self.g.close_stable_s:
                 return True
             if now - start >= self.g.close_timeout_s:
-                return bool(size)
+                return False
             self.h.sleep(min(1.0, self.g.close_stable_s))
 
-    def _sidecar(self, demo_id: str, started: datetime, duration_s: float, truncated: bool, nbytes: int) -> dict:
+    def _sidecar(
+        self, demo_id: str, started: datetime, duration_s: float, truncated: bool, nbytes: int, extra: dict
+    ) -> dict:
         return {
             "demo_id": demo_id,
             "kind": self.profile,
@@ -525,40 +550,141 @@ class Generator:
             "cs2_build": self._build(),
             "cfg_sha256": self.cfg_sha,
             "cs2wm_git_sha": self.git_sha,
+            **extra,
         }
 
-    def _publish(self, src: Path, demo_id: str, started: datetime, duration_s: float, truncated: bool) -> None:
-        """Keep a closed chunk, or reject a truncated one that does not parse."""
-        self._progress += 1
+    def _copy(self, src: Path, dest: Path) -> bool:
+        """Copy ``src`` to ``dest``, retrying with backoff for up to ``close_timeout_s``.
+
+        CS2 can hold a demo open for a while after its size stopped changing; on Windows copying then raises
+        ``PermissionError``.
+        """
+        start, delay = self.h.clock(), 0.5
+        while True:
+            try:
+                self.h.copy(src, dest)
+                return True
+            except OSError as exc:
+                if self.h.clock() - start >= self.g.close_timeout_s:
+                    log.error("giving up copying %s: %s", src, exc)
+                    dest.unlink(missing_ok=True)
+                    return False
+                log.debug("copy of %s failed (%s), retry in %.1f s", src, exc, delay)
+                self.h.sleep(delay)
+                delay = min(delay * 2, 10.0)
+
+    def _remove_source(self, src: Path) -> None:
+        try:
+            src.unlink()
+        except OSError as exc:
+            log.warning("could not delete %s after copying (retried at the end of the run): %s", src, exc)
+            self._pending_unlink.append(src)
+
+    def _unpublished(self, src: Path, what: str) -> bool:
+        """Log and notify (once per file) that ``src`` could not be moved; the source stays where it is."""
+        msg = f"{what} failed for {src.name}; the file is kept in {src.parent} and retried later"
+        log.error(msg)
+        if src not in self._notified:
+            self._notified.add(src)
+            self.h.notify(msg, title="dcs2: generate publish failed", priority="high", tags=["warning"])
+        return False
+
+    def _unique_id(self, demo_id: str) -> str:
+        """Return ``demo_id``, or ``demo_id`` plus a suffix if a demo with that id already exists."""
+        candidate, n = demo_id, 1
+        while any(
+            (d / f"{candidate}{ext}").exists() for d in (self.out_dir, self.rejected_dir) for ext in (".dem", ".json")
+        ):
+            candidate, n = f"{demo_id}x{n}", n + 1
+        return candidate
+
+    def _publish(
+        self,
+        src: Path,
+        demo_id: str,
+        started: datetime,
+        duration_s: float,
+        truncated: bool,
+        extra: dict | None = None,
+    ) -> bool:
+        """Keep a closed chunk, or reject a truncated one that does not parse.
+
+        A failure to copy (file locks) is logged and notified but never raised; ``src`` stays in place.
+
+        Returns:
+            True if the chunk was kept or rejected (``src`` is dealt with), False if publishing failed.
+        """
         if truncated:
             error = self.h.parse_error(src)
             if error is not None:
-                self._reject(src, demo_id, f"truncated chunk does not parse: {error}")
-                return
+                return self._reject(src, demo_id, f"truncated chunk does not parse: {error}")
+        self._progress += 1
+        demo_id = self._unique_id(demo_id)
         dest = self.out_dir / f"{demo_id}.dem"
+        part = dest.with_name(dest.name + ".part")
+        sidecar = self.out_dir / f"{demo_id}.json"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         nbytes = self.h.file_size(src) or 0
-        _write_json_atomic(
-            self.out_dir / f"{demo_id}.json", self._sidecar(demo_id, started, duration_s, truncated, nbytes)
-        )
-        _move_atomic(src, dest)  # last, so a .dem is never visible without its sidecar
+        if not self._copy(src, part):
+            if not truncated:  # an intact chunk waits in the csgo dir and still counts against the time budget
+                self.generated_s += duration_s
+            return self._unpublished(src, "copying")
+        try:
+            # sidecar first, then the .dem: a .dem is never visible without its sidecar
+            _write_json_atomic(sidecar, self._sidecar(demo_id, started, duration_s, truncated, nbytes, extra or {}))
+            os.replace(part, dest)
+        except OSError as exc:
+            sidecar.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
+            log.error("renaming %s into place failed: %s", demo_id, exc)
+            return self._unpublished(src, "renaming")
+        self._remove_source(src)
         self.kept.append(dest)
         self.generated_s += duration_s
         log.info("kept %s (%.0f s, %d bytes%s)", dest, duration_s, nbytes, ", truncated" if truncated else "")
+        return True
 
-    def _reject(self, src: Path, demo_id: str, reason: str) -> None:
-        rejected = Path(self.cfg.paths.demos) / REJECTED_DIR
-        rejected.mkdir(parents=True, exist_ok=True)
-        (rejected / f"{demo_id}.reason.txt").write_text(reason + "\n", encoding="utf-8")
-        _move_atomic(src, rejected / f"{demo_id}.dem")
+    def _reject(self, src: Path, demo_id: str, reason: str) -> bool:
+        demo_id = self._unique_id(demo_id)
+        self.rejected_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.rejected_dir / f"{demo_id}.dem"
+        part = dest.with_name(dest.name + ".part")
+        if not self._copy(src, part):
+            return self._unpublished(src, "copying a rejected chunk")
+        os.replace(part, dest)
+        (self.rejected_dir / f"{demo_id}.reason.txt").write_text(reason + "\n", encoding="utf-8")
+        self._remove_source(src)
         log.warning("rejected %s: %s", demo_id, reason)
+        return True
 
     def _salvage(self, src: Path, demo_id: str, started: datetime, duration_s: float) -> None:
         """Handle the chunk that was being recorded when CS2 died or hung."""
         if self._wait_closed(src):
             self._publish(src, demo_id, started, duration_s, truncated=True)
         else:
-            log.warning("%s: no demo data to salvage", demo_id)
+            log.warning("%s: no demo data to salvage (missing, empty or still growing)", demo_id)
+
+    def _adopt_leftovers(self) -> None:
+        """Publish demos this tool recorded earlier but could not move (``<kind>_<stamp>_<nnn>.dem`` in the csgo dir).
+
+        Called while no CS2 of ours is running. Each one is parse-checked like a truncated chunk (kept or rejected)
+        and carries ``"adopted": true`` with ``duration_s`` 0, since its length is unknown; it does not count toward
+        ``--hours``. GOTV's own ``auto*.dem`` names are never adopted: demos of other runs there stay untouched.
+        """
+        for path in sorted(self.csgo_dir.glob("*.dem")):
+            if not self._ours.match(path.name):
+                continue
+            mtime = datetime.fromtimestamp(path.stat().st_mtime) if path.exists() else self.h.wall()
+            log.info("adopting leftover demo %s", path)
+            self._publish(path, path.stem, mtime, 0.0, truncated=True, extra={"adopted": True})
+
+    def _flush_unlinks(self) -> None:
+        pending, self._pending_unlink = self._pending_unlink, []
+        for path in pending:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.error("%s is a published demo still left in the csgo dir (delete it by hand): %s", path, exc)
 
     # -- sessions ---------------------------------------------------------------------------------------------------
 
@@ -578,6 +704,7 @@ class Generator:
         """Record chunks with ``record``/``stop`` over netcon until the target or a failure."""
         client = self.h.netcon(port=int(self.g.netconport), clock=self.h.clock, sleep=self.h.sleep)
         active: tuple[str, datetime, float] | None = None
+        end: float | None = None  # when recording really ended: before the close wait, and before a hang's idle tail
         try:
             client.wait_ready(float(self.g.netcon_connect_timeout_s))
             if self._watch(proc, float(self.g.map_load_wait_s)) != "running":
@@ -591,26 +718,32 @@ class Generator:
                 # CONFIRM(#14): `record` writes <csgo>/<name>.dem; a name with '-' needs no quotes; `stop` closes it.
                 client.send(f"record {demo_id}")
                 proc.rearm()
-                active = (demo_id, started, t0)
+                active, end = (demo_id, started, t0), None
                 verdict = self._watch(proc, length_s)
+                # CONFIRM(#14): wall time is a proxy for demo time (the listen server runs at 1x); segment uses the
+                # real tick counts downstream, so a small drift here only shifts how many chunks --hours produces.
+                end = proc.last_progress if verdict == "hung" else self.h.clock()
                 if verdict != "running":
                     raise ConnectionError(f"CS2 {verdict} while recording {demo_id}")
                 client.send("stop")
                 active = None
                 src = self.csgo_dir / f"{demo_id}.dem"
                 if self._wait_closed(src):
-                    self._publish(src, demo_id, started, self.h.clock() - t0, truncated=False)
+                    self._publish(src, demo_id, started, end - t0, truncated=False)
                 else:
-                    log.warning("%s: demo missing or empty after stop", demo_id)
+                    log.warning("%s: demo missing, empty or still growing after stop; kept for a later cycle", demo_id)
         except ConnectionError as exc:
             log.warning("netcon session ended: %s", exc)
-            proc.kill()
             if active is not None:
+                end = self.h.clock() if end is None else end
+            proc.kill()
+            if active is not None and end is not None:
                 demo_id, started, t0 = active
-                self._salvage(self.csgo_dir / f"{demo_id}.dem", demo_id, started, self.h.clock() - t0)
+                self._salvage(self.csgo_dir / f"{demo_id}.dem", demo_id, started, max(end - t0, 0.0))
 
     def _new_demos(self) -> list[Path]:
-        return sorted(p for p in self.csgo_dir.glob("*.dem") if p not in self._ignore)
+        skip = self._ignore | self._stranded
+        return sorted(p for p in self.csgo_dir.glob("*.dem") if p not in skip and not self._ours.match(p.name))
 
     def _session_gotv(self, proc: CS2Process) -> None:
         """Pick up GOTV autorecord demos as they close, until the target or a failure."""
@@ -629,7 +762,7 @@ class Generator:
             for p in files[:-1]:
                 if now - seen[p][2] >= self.g.close_stable_s:
                     self._finish_gotv(p, seen.pop(p), truncated=False)
-            active = seen[files[-1]] if files else None
+            active = seen[files[-1]] if files and files[-1] in seen else None
             over = active is not None and self.generated_s + (active[2] - active[1]) >= self.target_s
             if verdict != "running" or over:
                 proc.kill()
@@ -641,18 +774,21 @@ class Generator:
                 return
 
     def _finish_gotv(self, path: Path, rec: list[float], truncated: bool) -> None:
-        self._ignore.add(path)
         demo_id = make_demo_id(self.profile, self.started, self._index)
-        self._index += 1
         # CONFIRM(#14): the start time is approximated by when the demo file was first seen.
         started = self.h.wall() - timedelta(seconds=self.h.clock() - rec[1])
-        self._publish(path, demo_id, started, max(rec[2] - rec[1], 0.0), truncated)
+        if self._publish(path, demo_id, started, max(rec[2] - rec[1], 0.0), truncated):
+            self._index += 1
+            self._ignore.add(path)  # only handled demos are ignored; a failed one is retried in the next session
+        else:
+            self._stranded.add(path)
         if not truncated:
             self._guard()  # the next map cycle has already started; stop it by leaving the session
 
     def _session(self) -> None:
         netcon = self.g.chunking == "netcon"
         cmd = build_launch_command(self.cfg, self.profile, int(self.g.netconport) if netcon else None)
+        self._stranded.clear()
         with CS2Process(
             cmd,
             self.csgo_dir,
@@ -669,6 +805,15 @@ class Generator:
 
     # -- entry point ------------------------------------------------------------------------------------------------
 
+    def _fresh_start(self) -> None:
+        """Move ``self.started`` forward until no demo of an earlier run in this second has the same id prefix."""
+        while any(
+            list(d.glob(f"{self.profile}_{self.started:%Y%m%d-%H%M%S}_*"))
+            for d in (self.out_dir, self.rejected_dir, self.csgo_dir)
+            if d.is_dir()
+        ):
+            self.started += timedelta(seconds=1)
+
     def run(self) -> list[Path]:
         """Generate until ``hours`` of demo time are kept.
 
@@ -676,28 +821,42 @@ class Generator:
             Paths of the kept demos.
 
         Raises:
-            PatchGuardError: If CS2 was patched.
-            GenerateError: If CS2 failed ``generate.max_failures`` sessions in a row without a single closed chunk.
+            PatchGuardError: If CS2 was patched. Demos not yet published are left in the csgo dir and logged.
+            GenerateError: If CS2 failed ``generate.max_failures`` sessions in a row without a kept chunk.
         """
         rendered = render_cfg(self.profile, self.cfg, self.cfg_dir)
         _, self.cfg_sha = install_cfg(rendered, self.profile, self.cs2_dir)
         self.git_sha = self.h.git_sha()
-        self._ignore = set(self.csgo_dir.glob("*.dem"))  # leftovers of earlier runs are not ours
+        self._fresh_start()
+        self._ignore = set(self.csgo_dir.glob("*.dem"))  # demos of other tools and runs are not ours
         failures = 0
-        while self.generated_s < self.target_s:
-            self._guard()
-            self._progress = 0
-            self._session()
-            if self.generated_s >= self.target_s:
-                break
-            failures = 0 if self._progress else failures + 1
-            log.warning(
-                "CS2 session ended after %d chunk(s); restarting (%d failure(s) in a row)", self._progress, failures
-            )
-            if failures >= self.g.max_failures:
-                msg = f"CS2 failed {failures} sessions in a row without recording a chunk; giving up."
-                self.h.notify(msg, title="dcs2: generate failed", priority="high", tags=["rotating_light"])
-                raise GenerateError(msg)
+        try:
+            while self.generated_s < self.target_s:
+                self._guard()
+                self._adopt_leftovers()
+                self._progress = 0
+                self._session()
+                if self.generated_s >= self.target_s:
+                    break
+                failures = 0 if self._progress else failures + 1
+                log.warning(
+                    "CS2 session ended after %d usable chunk(s); restarting (%d failure(s) in a row)",
+                    self._progress,
+                    failures,
+                )
+                if failures >= self.g.max_failures:
+                    msg = f"CS2 failed {failures} sessions in a row without a usable chunk; giving up."
+                    self.h.notify(msg, title="dcs2: generate failed", priority="high", tags=["rotating_light"])
+                    raise GenerateError(msg)
+        except PatchGuardError:
+            left = [p.name for p in self._new_demos()]
+            if left:
+                log.error("stopped by the patch guard with unpublished demos in %s: %s", self.csgo_dir, left)
+            raise
+        finally:
+            self._flush_unlinks()
+        self._adopt_leftovers()
+        self._flush_unlinks()
         return self.kept
 
 

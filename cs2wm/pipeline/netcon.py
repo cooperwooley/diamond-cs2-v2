@@ -75,7 +75,7 @@ class NetconClient:
             Console output received until the connection was idle for ``idle_s`` (or closed, or ``timeout_s`` passed).
 
         Raises:
-            ConnectionError: If the console port is unreachable.
+            ConnectionError: If the console port is unreachable or the connection is reset after the command was sent.
         """
         sock = self._connect(self.connect_retries if retries is None else retries)
         chunks: list[bytes] = []
@@ -91,8 +91,8 @@ class NetconClient:
                     data = sock.recv(65536)
                 except TimeoutError:  # idle: the reply is complete
                     break
-                except OSError:  # reset by CS2 while it quits
-                    break
+                except OSError as exc:  # reset by CS2: the command may not have run, so do not report success
+                    raise ConnectionError(f"netcon connection lost after sending {cmd!r}: {exc}") from exc
                 if not data:
                     break
                 chunks.append(data)

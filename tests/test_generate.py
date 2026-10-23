@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import logging
+import shutil
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -127,8 +129,8 @@ def test_process_windows_uses_taskkill_tree(tmp_path: Path, monkeypatch: pytest.
     with proc:
         assert FakePopen.instances[0].kwargs["creationflags"] == 512
     assert ran == [["taskkill", "/T", "/F", "/PID", str(FakePopen.instances[0].pid)]]
-    proc.kill()  # already dead: no second taskkill
-    assert len(ran) == 1
+    proc.kill()  # the main process is dead, but its child tree may not be: taskkill runs again
+    assert len(ran) == 2
 
 
 # --- cfg -----------------------------------------------------------------------------------------------------------
@@ -237,6 +239,8 @@ class FakeWorld:
         self.hung = False
         self.launch_t = 0.0
         self.inspect_fails = False
+        self.crash_after_launch: float | None = None  # every launched process dies this long after its launch
+        self.copy_failures = 0  # copies raising PermissionError before one succeeds (-1: always)
         self.notified: list[dict] = []
         csgo.mkdir(parents=True, exist_ok=True)
 
@@ -252,6 +256,12 @@ class FakeWorld:
         while self.t < end:
             step = min(1.0, end - self.t)
             self.t += step
+            if (
+                self.crash_after_launch is not None
+                and self.alive()
+                and self.t - self.launch_t >= self.crash_after_launch
+            ):
+                self.proc.returncode = 1
             if self.crash_at and self.t >= self.crash_at[0] and self.alive():
                 self.crash_at.pop(0)
                 self.proc.returncode = 1
@@ -300,6 +310,12 @@ class FakeWorld:
                     world.recording = None
                 return ""
 
+        def copy(src: Path, dest: Path) -> None:
+            if world.copy_failures != 0:
+                world.copy_failures = max(world.copy_failures - 1, -1) if world.copy_failures > 0 else -1
+                raise PermissionError("file is locked by another process")
+            shutil.copyfile(src, dest)
+
         def parse_error(path: Path) -> str | None:
             return "unexpected EOF" if world.inspect_fails else None
 
@@ -312,6 +328,7 @@ class FakeWorld:
             netcon=Netcon,
             build_id=lambda _: world.build,
             parse_error=parse_error,
+            copy=copy,
             notify=lambda msg, **kw: world.notified.append({"message": msg, **kw}),
             git_sha=lambda: "deadbeef",
         )
@@ -390,7 +407,11 @@ def test_hang_kills_and_relaunches(tmp_path: Path) -> None:
     kept = gen.run()
     assert len(world.launches) == 2
     assert world.launches[0].killed
-    assert any(json.loads(p.with_suffix(".json").read_text())["truncated"] for p in kept)
+    sides = [json.loads(p.with_suffix(".json").read_text()) for p in kept]
+    hung = [s for s in sides if s["truncated"]]
+    assert len(hung) == 1
+    assert hung[0]["duration_s"] < 25  # recording time up to the last growth, without the 60 s hang timeout
+    assert all(s["duration_s"] == pytest.approx(120, abs=1) for s in sides[:2])
 
 
 def test_gives_up_when_cs2_never_stays_up(tmp_path: Path) -> None:
@@ -476,3 +497,143 @@ def test_parse_error_seam(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert generate._parse_error(f) is None
     monkeypatch.setattr(generate.demo, "inspect", lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
     assert "boom" in generate._parse_error(f)
+
+
+def test_crash_loop_with_only_rejected_chunks_gives_up(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path)
+    world.crash_after_launch = 40  # 30 s after every `record`
+    world.inspect_fails = True
+    with pytest.raises(GenerateError):
+        gen.run()
+    assert len(world.launches) == cfg.generate.max_failures
+    assert world.notified and world.notified[-1]["priority"] == "high"
+    rejected = Path(cfg.paths.demos) / "_rejected"
+    assert len(list(rejected.glob("*.dem"))) == cfg.generate.max_failures
+    assert gen.kept == []
+
+
+def test_transient_copy_lock_is_retried(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path)
+    world.copy_failures = 3
+    kept = gen.run()
+    out = Path(cfg.paths.demos) / "dm"
+    assert len(kept) == 3
+    assert len(list(out.glob("*.json"))) == 3 and list(out.glob("*.part")) == []
+    assert world.notified == []
+
+
+def test_permanent_copy_lock_does_not_crash_and_keeps_sources(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path)
+    world.copy_failures = -1
+    assert gen.run() == []  # no exception
+    out = Path(cfg.paths.demos) / "dm"
+    assert list(out.glob("*.json")) == [] and list(out.glob("*.part")) == []  # no orphan sidecar
+    assert len(list(world.csgo.glob("dm_*.dem"))) == 3  # sources are kept for a later run
+    assert len(world.notified) == 3  # once per file
+
+
+def test_leftover_chunks_are_adopted_by_the_next_run(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path)
+    world.copy_failures = -1
+    gen.run()
+    leftovers = sorted(world.csgo.glob("dm_*.dem"))
+    world.copy_failures = 0
+    _, _, gen2 = _run(tmp_path)
+    gen2.h = world.hooks()
+    gen2.run()
+    assert all(not p.exists() for p in leftovers)
+    out = Path(cfg.paths.demos) / "dm"
+    adopted = [json.loads(p.read_text()) for p in out.glob("*.json") if json.loads(p.read_text()).get("adopted")]
+    assert len(adopted) == 3 and all(a["duration_s"] == 0 for a in adopted)
+
+
+def test_wait_closed_is_false_while_the_file_still_grows(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path)
+    path = world.csgo / "x.dem"
+    path.write_bytes(b"x")
+    sizes = iter(range(1, 10_000))
+    gen.h.file_size = lambda _: next(sizes)
+    assert gen._wait_closed(path) is False
+    gen.h.file_size = lambda _: 5
+    assert gen._wait_closed(path) is True
+
+
+def test_unique_id_never_clobbers(tmp_path: Path) -> None:
+    cfg, _world, gen = _run(tmp_path)
+    out = Path(cfg.paths.demos) / "dm"
+    out.mkdir(parents=True)
+    (out / "dm_a_000.dem").write_bytes(b"old")
+    assert gen._unique_id("dm_a_000") == "dm_a_000x1"
+    (out / "dm_a_000x1.json").write_text("{}")
+    assert gen._unique_id("dm_a_000") == "dm_a_000x2"
+    assert gen._unique_id("dm_b_000") == "dm_b_000"
+
+
+def test_second_run_in_the_same_second_gets_new_ids(tmp_path: Path) -> None:
+    _, _world, gen = _run(tmp_path)
+    first = gen.run()
+    _, _world2, gen2 = _run(tmp_path)
+    second = gen2.run()
+    assert not {p.name for p in first} & {p.name for p in second}
+    assert all(p.read_bytes() for p in first)
+
+
+def test_failed_unlink_is_retried_at_the_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, world, gen = _run(tmp_path)
+    src = world.csgo / "locked.dem"
+    src.write_bytes(b"x")
+    real = Path.unlink
+
+    def locked(self: Path, missing_ok: bool = False) -> None:
+        if self == src:
+            raise PermissionError("locked")
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    gen._remove_source(src)
+    assert gen._pending_unlink == [src] and src.exists()
+    monkeypatch.setattr(Path, "unlink", real)
+    gen._flush_unlinks()
+    assert not src.exists()
+
+
+def test_patch_guard_in_gotv_logs_unpublished_demos(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    _, world, gen = _run(
+        tmp_path, 0.2, "generate.chunking=gotv", "generate.poll_s=1", f"generate.expected_build={BUILD}"
+    )
+    real = world.sleep
+
+    def sleep(s: float) -> None:
+        real(s)
+        if world.t > 150:
+            world.build = BUILD + 1
+
+    gen.h.sleep = sleep
+    with caplog.at_level(logging.ERROR), pytest.raises(PatchGuardError):
+        gen.run()
+    assert "unpublished demos" in caplog.text
+    assert list(world.csgo.glob("auto*.dem"))
+
+
+@pytest.mark.parametrize("hours,chunk", [(0, 2), (-1, 2), (0.1, 0), (0.1, -3)])
+def test_run_rejects_non_positive_durations(tmp_path: Path, hours: float, chunk: float) -> None:
+    cfg = _cfg(tmp_path)
+    with pytest.raises(ValueError):
+        generate.run(cfg, "dm", hours, chunk)
+
+
+@pytest.mark.parametrize(
+    "opts", [["-secure"], ["+connect", "1.2.3.4"], ["-connect", "x"], ["connect"], ["+CONNECT_lobby"]]
+)
+def test_connect_and_secure_options_are_refused(tmp_path: Path, opts: list[str]) -> None:
+    raw = OmegaConf.create(OmegaConf.to_container(_cfg(tmp_path)))
+    raw.generate.launch_options = ["-insecure", *opts]
+    with pytest.raises(ValueError, match="not allowed"):
+        build_launch_command(raw, "dm")
+    with pytest.raises(ValueError, match="not allowed"):
+        CS2Process(["cs2.exe", "-insecure", *opts], tmp_path, 5, popen=FakePopen)
+    proc = CS2Process(["cs2.exe", "-insecure"], tmp_path, 5, popen=FakePopen)
+    proc.cmd += opts
+    with pytest.raises(ValueError, match="not allowed"), proc:
+        pass
+    assert FakePopen.instances == []
