@@ -3,5 +3,5 @@ train:
   size: [150, 280]
 num_actions: 51
 path_data_low_res: null # SET THIS: path to low_res processed data
-path_data_full_res: null # SET THIS: path to full_res HDF5 data
+path_data_full_res: null # path to full_res HDF5 data; null for denoiser-only training (agent=cs2_denoiser_only)
 keymap: cs2

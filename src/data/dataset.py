@@ -4,8 +4,10 @@ from collections import Counter
 import multiprocessing as mp
 from pathlib import Path
 import shutil
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Union
 
+import cv2
 import h5py
 import numpy as np
 import torch
@@ -16,6 +18,12 @@ from .episode import Episode
 from .segment import Segment, SegmentId
 from .utils import make_segment
 from utils import StateDictMixin
+
+_V1_LENGTH_ONE_EPISODE = 1000
+
+
+def _natural_key(name: str) -> List[Any]:
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
 
 
 class Dataset(StateDictMixin, TorchDataset):
@@ -158,17 +166,28 @@ class Dataset(StateDictMixin, TorchDataset):
 
 
 class CS2Hdf5Dataset(StateDictMixin, TorchDataset):
-    """Dataset loader for CS2 HDF5 files (same format as DIAMOND CS:GO)."""
+    """Dataset loader for CS2 HDF5 files.
+
+    Reads v1's fixed 1000-frame files (raw uint8 frames, no attrs) and v2's variable-length files written by
+    cs2wm.pipeline.pack (``n_frames`` attr, ``encoding`` attr: "raw" or "jpeg").
+    """
 
     def __init__(self, directory: Path) -> None:
         super().__init__()
-        filenames = sorted(Path(directory).rglob("*.hdf5"), key=lambda x: int(x.stem.split("_")[-1]))
+        filenames = sorted(Path(directory).rglob("*.hdf5"), key=lambda x: (_natural_key(x.stem), x.parent.name))
         self._filenames = {f"{x.parent.name}/{x.name}": x for x in filenames}
-        # TODO(#5): variable length (read the n_frames attr per file) and JPEG-encoded full-res frames (encoding="jpeg").
-        self._length_one_episode = 1000
+        self._keys = list(self._filenames)
+        self._index = {k: i for i, k in enumerate(self._keys)}
+        # v2 files carry n_frames and encoding attrs; v1 files have neither (1000 raw frames).
+        lengths, jpeg = [], {}
+        for key, path in self._filenames.items():
+            with h5py.File(path, "r") as f:
+                lengths.append(int(f.attrs.get("n_frames", _V1_LENGTH_ONE_EPISODE)))
+                jpeg[key] = f.attrs.get("encoding", "raw") == "jpeg"
+        self._is_jpeg = jpeg
         self.num_episodes = len(self._filenames)
-        self.num_steps = self._length_one_episode * self.num_episodes
-        self.lengths = np.array([self._length_one_episode] * self.num_episodes, dtype=np.int64)
+        self.lengths = np.array(lengths, dtype=np.int64)
+        self.num_steps = int(self.lengths.sum())
 
     def __len__(self) -> int:
         return self.num_steps
@@ -176,17 +195,22 @@ class CS2Hdf5Dataset(StateDictMixin, TorchDataset):
     def save_to_default_path(self) -> None:
         pass
 
+    def _resolve(self, episode_id: Union[int, str]) -> str:
+        return self._keys[episode_id] if isinstance(episode_id, (int, np.integer)) else episode_id
+
     def __getitem__(self, segment_id: SegmentId) -> Segment:
-        assert segment_id.start < self._length_one_episode and segment_id.stop > 0 and segment_id.start < segment_id.stop
-        pad_len_right = max(0, segment_id.stop - self._length_one_episode)
+        key = self._resolve(segment_id.episode_id)
+        length = int(self.lengths[self._index[key]])
+        assert segment_id.start < length and segment_id.stop > 0 and segment_id.start < segment_id.stop
+        pad_len_right = max(0, segment_id.stop - length)
         pad_len_left = max(0, -segment_id.start)
 
         start = max(0, segment_id.start)
-        stop = min(self._length_one_episode, segment_id.stop)
+        stop = min(length, segment_id.stop)
         mask_padding = torch.cat((torch.zeros(pad_len_left), torch.ones(stop - start), torch.zeros(pad_len_right))).bool()
 
-        with h5py.File(self._filenames[segment_id.episode_id], "r") as f:
-            obs = torch.stack([torch.tensor(f[f"frame_{i}_x"][:]).flip(2).permute(2, 0, 1).div(255).mul(2).sub(1) for i in range(start, stop)])
+        with h5py.File(self._filenames[key], "r") as f:
+            obs = torch.stack([self._read_frame(f, i, self._is_jpeg[key]) for i in range(start, stop)])
             act = torch.tensor(np.array([f[f"frame_{i}_y"][:] for i in range(start, stop)]))
 
         def pad(x):
@@ -200,6 +224,15 @@ class CS2Hdf5Dataset(StateDictMixin, TorchDataset):
         trunc = torch.zeros(obs.size(0), dtype=torch.uint8)
         return Segment(obs, act, rew, end, trunc, mask_padding, info={}, id=SegmentId(segment_id.episode_id, start, stop))
 
-    def load_episode(self, episode_id: int) -> Episode:  # used by DatasetTraverser
-        s = self[SegmentId(episode_id, 0, self._length_one_episode)]
+    @staticmethod
+    def _read_frame(f: h5py.File, i: int, jpeg: bool) -> torch.Tensor:
+        raw = f[f"frame_{i}_x"][:]
+        if jpeg:  # BGR uint8 [H, W, 3], like the raw encoding
+            raw = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+            assert raw is not None, f"frame_{i}_x is not a valid JPEG"
+        return torch.tensor(raw).flip(2).permute(2, 0, 1).div(255).mul(2).sub(1)
+
+    def load_episode(self, episode_id: Union[int, str]) -> Episode:  # used by DatasetTraverser
+        key = self._resolve(episode_id)
+        s = self[SegmentId(key, 0, int(self.lengths[self._index[key]]))]
         return Episode(s.obs, s.act, s.rew, s.end, s.trunc, s.info)
