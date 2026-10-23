@@ -517,7 +517,7 @@ def test_dataset_stats_mmaps_episodes(stats_mod, stats_ds, monkeypatch) -> None:
 # Trainer-style batching
 
 
-def test_batch_sampler_and_collate_build_trainer_batches(conv, tree, tmp_path, monkeypatch) -> None:
+def test_batch_sampler_and_collate_build_trainer_batches(conv, tree, tmp_path) -> None:
     convert(conv, tree, tmp_path / "ds")
     sys.path.insert(0, str(REPO_ROOT / "src"))
     from data import BatchSampler, Dataset, collate_segments_to_batch
@@ -525,8 +525,6 @@ def test_batch_sampler_and_collate_build_trainer_batches(conv, tree, tmp_path, m
     ds = Dataset(tmp_path / "ds" / "low_res" / "train", None, "train_dataset")
     ds.load_from_default_path()
     batch_size, seq_length = 4, 5
-    # torch >= 2.2 dropped Sampler's data_source argument, which v1's BatchSampler still passes to super().__init__.
-    monkeypatch.setattr(torch.utils.data.Sampler, "__init__", lambda self, *a, **k: None)
     sampler = BatchSampler(ds, 0, 1, batch_size, seq_length, None)
     it = iter(sampler)
     for _ in range(3):
