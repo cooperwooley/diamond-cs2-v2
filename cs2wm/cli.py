@@ -92,10 +92,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("eval", help="evaluations (#27, #32, #33, #34)")
     ev = p.add_subparsers(dest="eval_cmd", required=True, metavar="<experiment>")
-    q = ev.add_parser("upsampler", help="v1 upsampler compatibility check (#27)")
+    q = ev.add_parser(
+        "upsampler",
+        help="v1 upsampler compatibility check (#27); exit code 0 = PASS, 1 = FAIL, 3 = INCOMPLETE (no --v1-fullres; 2 means not implemented)",
+    )
     q.add_argument("--ckpt", required=True, type=Path)
     q.add_argument("--fullres", required=True, type=Path, help="v2 hdf5_fullres directory")
-    q.add_argument("--n", type=int, default=256)
+    q.add_argument("--n", type=int, default=256, help="frames per dataset")
+    q.add_argument("--v1-fullres", type=Path, default=None, help="v1 test full-res HDF5 directory (the reference)")
+    q.add_argument("--out", type=Path, default=Path("results"))
+    q.add_argument("--seed", type=int, default=0)
+    q.add_argument("--device", default=None, help="torch device (default: cuda if available)")
+    q.add_argument("--batch-size", type=int, default=16)
+    q.add_argument("--denoising-steps", type=int, choices=[1, 3], default=1)
     q = ev.add_parser("h1", help="controllability (#32)")
     q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=... shuffled=...")
     q.add_argument("--contexts", type=int, default=50)
@@ -211,7 +220,20 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
     if sub == "upsampler":
         from cs2wm.eval import upsampler_check
 
-        upsampler_check.run_upsampler_check(args.ckpt, args.fullres, args.n)
+        report = upsampler_check.run_upsampler_check(
+            args.ckpt,
+            args.fullres,
+            args.n,
+            args.out,
+            v1_fullres_dir=args.v1_fullres,
+            seed=args.seed,
+            device=args.device,
+            batch_size=args.batch_size,
+            denoising_steps=args.denoising_steps,
+        )
+        passed = report["verdict"]["passed"]
+        if passed is not True:
+            sys.exit(3 if passed is None else 1)  # 0 = PASS, 1 = FAIL, 3 = INCOMPLETE
     elif sub == "h1":
         from cs2wm.eval import h1_controllability
 

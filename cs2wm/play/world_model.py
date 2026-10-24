@@ -60,6 +60,54 @@ def load_sampler_cfg(denoising_steps: int, s_cond: float | None = None) -> Any:
     return DiffusionSamplerConfig(**raw)
 
 
+def bicubic_up(x: torch.Tensor, factor: int) -> torch.Tensor:
+    """Bicubic upscale exactly as ``Denoiser.forward`` builds the upsampler's low-res conditioning.
+
+    Args:
+        x: ``float[b, 3, h, w]``.
+        factor: Integer upsampling factor.
+
+    Returns:
+        ``float[b, 3, h * factor, w * factor]``. Not clamped: ringing can leave the input range, as in training.
+    """
+    return F.interpolate(x, scale_factor=factor, mode="bicubic")
+
+
+def make_upsampler_sampler(upsampler: Any, denoising_steps: int = 1) -> Any:
+    """Build the sampler play uses for the upsampler (preset ``denoising_steps``, ``s_cond=0``).
+
+    Args:
+        upsampler: ``agent.upsampler``.
+        denoising_steps: 1 or 3.
+
+    Returns:
+        A ``DiffusionSampler``.
+    """
+    from models.diffusion import DiffusionSampler
+
+    return DiffusionSampler(upsampler, load_sampler_cfg(denoising_steps, s_cond=0.0))
+
+
+def upsample_step(sampler: Any, prev_full: torch.Tensor, low: torch.Tensor, factor: int) -> torch.Tensor:
+    """Sample the next full-res frames from the previous full-res frames and the new low-res frames.
+
+    The conditioning is ``[previous full-res, bicubic(new low-res)]`` (the ``cat`` order of ``Denoiser.forward``).
+    Play and the upsampler compatibility check (#27) both go through this, so they condition identically.
+
+    Args:
+        sampler: Upsampler ``DiffusionSampler`` from ``make_upsampler_sampler``.
+        prev_full: ``float[b, 3, H, W]`` in [-1, 1].
+        low: ``float[b, 3, h, w]`` in [-1, 1].
+        factor: The upsampler's ``upsampling_factor``.
+
+    Returns:
+        ``float[b, 3, H, W]``; unclamped sampler output (about [-1, 1]).
+    """
+    cond = torch.stack((prev_full, bicubic_up(low, factor)), dim=1)
+    full, _ = sampler.sample(cond, None)
+    return full.float()
+
+
 def frames_to_tensor(frames_bgr: np.ndarray) -> torch.Tensor:
     """Convert packed BGR uint8 frames to RGB floats in [-1, 1].
 
@@ -160,7 +208,7 @@ class WorldModel:
         self.factor = upsampling_factor
         if use_upsampler:
             self.factor = int(agent.upsampler.cfg.upsampling_factor)
-            self.up_sampler = DiffusionSampler(agent.upsampler, load_sampler_cfg(denoising_steps, s_cond=0.0))
+            self.up_sampler = make_upsampler_sampler(agent.upsampler, denoising_steps)
         self._ctx_obs: torch.Tensor | None = None
         self._ctx_act: torch.Tensor | None = None
         self._init: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -176,9 +224,7 @@ class WorldModel:
         return torch.autocast("cuda", dtype=torch.bfloat16) if self.bf16 else nullcontext()
 
     def _bicubic(self, x: torch.Tensor) -> torch.Tensor:
-        # Same call as Denoiser.forward builds the upsampler's low-res conditioning with; the result can leave
-        # [-1, 1] (ringing), as it does in training.
-        return F.interpolate(x, scale_factor=self.factor, mode="bicubic")
+        return bicubic_up(x, self.factor)
 
     def reset(self, frames: torch.Tensor, actions: np.ndarray | torch.Tensor) -> None:
         """Set the context and the displayed frame.
@@ -233,10 +279,7 @@ class WorldModel:
             low, _ = self.sampler.sample(self._ctx_obs[None], self._ctx_act[None])
             low = low[0].float()
             if self.up_sampler is not None:
-                # Upsampler input: previous full-res frame, then the bicubic of the new low-res frame.
-                cond = torch.stack((self.full_res, self._bicubic(low[None])[0]))
-                full, _ = self.up_sampler.sample(cond[None], None)
-                full = full[0].float()
+                full = upsample_step(self.up_sampler, self.full_res[None], low[None], self.factor)[0]
         if self.up_sampler is None:
             full = self._bicubic(low[None])[0].clamp(-1, 1)
         self._ctx_obs = torch.cat((self._ctx_obs[1:], low[None]))
