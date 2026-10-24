@@ -26,6 +26,14 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# pack stages, swaps and deletes whole demo dirs under these suffixes; files inside them are never part of the dataset
+_TRANSIENT_DIR_SUFFIXES = (".staging", ".old", ".deleting")
+
+
+def _in_transient_dir(path: Path, root: Path) -> bool:
+    return any(part.endswith(_TRANSIENT_DIR_SUFFIXES) for part in path.relative_to(root).parts[:-1])
+
+
 def check_manifest(manifest: Path, root: Path, fullres_root: Path | None) -> tuple[int, int, list[str], list[str]]:
     """Check one manifest.
 
@@ -89,7 +97,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(args.root)
     fullres_root = Path(args.fullres_root) if args.fullres_root else None
-    manifests = sorted(root.rglob("manifest.jsonl"))
+    manifests = [m for m in sorted(root.rglob("manifest.jsonl")) if not _in_transient_dir(m, root)]
     if not manifests:
         print(f"FAILED: no manifest.jsonl under {root}")
         return 1

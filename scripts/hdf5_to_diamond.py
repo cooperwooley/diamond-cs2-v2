@@ -108,6 +108,8 @@ def discover(hdf5_root: Path, kinds: Sequence[str]) -> list[EpisodeRef]:
     episodes: dict[str, EpisodeRef] = {}
     demo_kind: dict[str, str] = {}
     for path in sorted(Path(hdf5_root).rglob("*.hdf5")):
+        if _in_transient_dir(path, Path(hdf5_root)):
+            continue
         with h5py.File(path, "r") as f:
             missing = [k for k in ("episode_id", "demo_id", "kind", "n_frames") if k not in f.attrs]
             if missing:
@@ -282,8 +284,18 @@ def _save_episode(dataset: Dataset, ref: EpisodeRef, frames_bgr: np.ndarray, act
     return episode_id
 
 
+# pack stages, swaps and deletes whole demo dirs under these suffixes; files inside them are never part of the dataset
+_TRANSIENT_DIR_SUFFIXES = (".staging", ".old", ".deleting")
+
+
+def _in_transient_dir(path: Path, root: Path) -> bool:
+    return any(part.endswith(_TRANSIENT_DIR_SUFFIXES) for part in path.relative_to(root).parts[:-1])
+
+
 def _manifest_checksums(hdf5_root: Path) -> dict[str, str]:
-    return {str(p.relative_to(hdf5_root)): sha256_file(p) for p in sorted(Path(hdf5_root).rglob("manifest.jsonl"))}
+    root = Path(hdf5_root)
+    manifests = (p for p in sorted(root.rglob("manifest.jsonl")) if not _in_transient_dir(p, root))
+    return {str(p.relative_to(root)): sha256_file(p) for p in manifests}
 
 
 def convert(

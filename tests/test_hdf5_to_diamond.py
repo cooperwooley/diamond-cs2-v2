@@ -549,3 +549,20 @@ def test_verify_manifests_empty_and_undecodable_manifests(verify, tmp_path, caps
     assert verify.main([str(root)]) == 1
     out = capsys.readouterr().out
     assert "unreadable manifest" in out and out.strip().splitlines()[-1].startswith("FAILED")
+
+
+def test_transient_pack_dirs_are_ignored(conv, verify, tree, tmp_path, capsys) -> None:
+    """A half-done pack run can leave <demo>.staging/.old/.deleting copies; they must not enter the dataset or checks."""
+    import shutil
+
+    root = tmp_path / "hdf5"
+    shutil.copytree(tree, root)
+    for suffix in ("staging", "old", "deleting"):
+        shutil.copytree(root / "dm" / "dm0", root / "dm" / f"dm0.{suffix}")  # same episode ids, a stale manifest
+    assert convert(conv, root, tmp_path / "out") == 0  # no "duplicate episode_id" error
+    assert sum(1 for d in split_of(tmp_path / "out") if d == "dm0") == 1
+    meta = json.loads((tmp_path / "out" / "dataset_meta.json").read_text())
+    assert not [m for m in json.dumps(meta).split('"') if ".staging" in m or ".old/" in m or ".deleting" in m]
+    capsys.readouterr()
+    assert verify.main([str(root)]) == 0
+    assert ".staging" not in capsys.readouterr().out
