@@ -11,7 +11,8 @@ Frames are float tensors in [-1, 1], RGB, ``[3, H, W]``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import itertools
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -88,23 +89,84 @@ def make_upsampler_sampler(upsampler: Any, denoising_steps: int = 1) -> Any:
     return DiffusionSampler(upsampler, load_sampler_cfg(denoising_steps, s_cond=0.0))
 
 
-def upsample_step(sampler: Any, prev_full: torch.Tensor, low: torch.Tensor, factor: int) -> torch.Tensor:
+# Draws standard normal noise of shape ``[b, *shape]``; see ``sample_from_noise``.
+RandnFn = Callable[..., torch.Tensor]
+
+
+def sample_from_noise(
+    sampler: Any, prev_obs: torch.Tensor, prev_act: torch.Tensor | None, randn: RandnFn
+) -> torch.Tensor:
+    """``DiffusionSampler.sample`` with the noise supplied by the caller.
+
+    The stock sampler draws all of its noise from the global torch RNG, so a sample depends on its position in the
+    batch. This copy of its loop takes the noise from ``randn`` instead, which lets an evaluation give every sample
+    its own reproducible noise and batch them freely. The maths is the sampler's (Euler or Heun, optional churn and
+    conditioning noise); the draw order is: initial noise, then per step the churn noise (if any) and the
+    conditioning noise (if ``s_cond > 0``).
+
+    Args:
+        sampler: A ``DiffusionSampler``.
+        prev_obs: ``float[b, t, c, h, w]`` conditioning frames.
+        prev_act: ``float[b, t, 51]`` conditioning actions, or None (the upsampler).
+        randn: Called as ``randn(*shape)`` and returns ``float[b, *shape]`` standard normal noise on the right device.
+
+    Returns:
+        ``float[b, c, h, w]`` sample, like ``DiffusionSampler.sample(...)[0]``.
+    """
+    cfg, sigmas, denoiser = sampler.cfg, sampler.sigmas, sampler.denoiser
+    b, t, c, h, w = prev_obs.shape
+    prev_obs = prev_obs.reshape(b, t * c, h, w)
+    s_in = torch.ones(b, device=prev_obs.device)
+    gamma_ = min(cfg.s_churn / (len(sigmas) - 1), 2**0.5 - 1)
+    x = randn(c, h, w)
+    for sigma, next_sigma in itertools.pairwise(sigmas):
+        gamma = gamma_ if cfg.s_tmin <= sigma <= cfg.s_tmax else 0
+        sigma_hat = sigma * (gamma + 1)
+        if gamma > 0:
+            x = x + randn(c, h, w) * cfg.s_noise * (sigma_hat**2 - sigma**2) ** 0.5
+        if cfg.s_cond > 0:
+            sigma_cond = torch.full((b,), fill_value=cfg.s_cond, device=prev_obs.device)
+            # Denoiser.apply_noise with sigma_offset_noise=0.
+            prev_obs = prev_obs + randn(t * c, h, w) * sigma_cond.view(b, 1, 1, 1)
+        else:
+            sigma_cond = None
+        denoised = denoiser.denoise(x, sigma, sigma_cond, prev_obs, prev_act)
+        d = (x - denoised) / sigma_hat
+        dt = next_sigma - sigma_hat
+        if cfg.order == 1 or next_sigma == 0:
+            x = x + d * dt
+        else:
+            x_2 = x + d * dt
+            denoised_2 = denoiser.denoise(x_2, next_sigma * s_in, sigma_cond, prev_obs, prev_act)
+            d_2 = (x_2 - denoised_2) / next_sigma
+            x = x + (d + d_2) / 2 * dt
+    return x
+
+
+def upsample_step(
+    sampler: Any, prev_full: torch.Tensor, low: torch.Tensor, factor: int, randn: RandnFn | None = None
+) -> torch.Tensor:
     """Sample the next full-res frames from the previous full-res frames and the new low-res frames.
 
     The conditioning is ``[previous full-res, bicubic(new low-res)]`` (the ``cat`` order of ``Denoiser.forward``).
-    Play and the upsampler compatibility check (#27) both go through this, so they condition identically.
+    Play, the upsampler compatibility check (#27) and the H1 eval (#32) all go through this, so they condition
+    identically.
 
     Args:
         sampler: Upsampler ``DiffusionSampler`` from ``make_upsampler_sampler``.
         prev_full: ``float[b, 3, H, W]`` in [-1, 1].
         low: ``float[b, 3, h, w]`` in [-1, 1].
         factor: The upsampler's ``upsampling_factor``.
+        randn: Per-sample noise source for ``sample_from_noise``; None uses the global torch RNG.
 
     Returns:
         ``float[b, 3, H, W]``; unclamped sampler output (about [-1, 1]).
     """
     cond = torch.stack((prev_full, bicubic_up(low, factor)), dim=1)
-    full, _ = sampler.sample(cond, None)
+    if randn is None:
+        full, _ = sampler.sample(cond, None)
+    else:
+        full = sample_from_noise(sampler, cond, None, randn)
     return full.float()
 
 
@@ -258,6 +320,45 @@ class WorldModel:
             raise RuntimeError("restart() before reset()")
         self.reset(*self._init)
 
+    def _advance(
+        self,
+        ctx_obs: torch.Tensor,
+        ctx_act: torch.Tensor,
+        full_res: torch.Tensor,
+        action: torch.Tensor,
+        randn_low: RandnFn | None = None,
+        randn_up: RandnFn | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One step for a batch of ``b`` independent streams (``step`` is the ``b = 1`` case).
+
+        Args:
+            ctx_obs: ``float[b, n_cond, 3, h, w]``.
+            ctx_act: ``float[b, n_cond, 51]``; the last slot is replaced by ``action``.
+            full_res: ``float[b, 3, H, W]`` the previous displayed frames.
+            action: ``float[b, 51]``.
+            randn_low: Noise source for the denoiser sampler, or None for the global RNG.
+            randn_up: Noise source for the upsampler sampler, or None for the global RNG.
+
+        Returns:
+            ``(ctx_obs, ctx_act, low, full)``: the rolled contexts and the new ``float[b, 3, h, w]`` and
+            ``float[b, 3, H, W]`` frames.
+        """
+        ctx_act = torch.cat((ctx_act[:, :-1], action[:, None]), dim=1)
+        with self._autocast():
+            if randn_low is None:
+                low, _ = self.sampler.sample(ctx_obs, ctx_act)
+            else:
+                low = sample_from_noise(self.sampler, ctx_obs, ctx_act, randn_low)
+            low = low.float()
+            if self.up_sampler is not None:
+                full = upsample_step(self.up_sampler, full_res, low, self.factor, randn_up)
+        if self.up_sampler is None:
+            full = self._bicubic(low).clamp(-1, 1)
+        ctx_obs = torch.cat((ctx_obs[:, 1:], low[:, None]), dim=1)
+        # The slot for the next frame's action; replaced by the next step's action before it is read.
+        ctx_act = torch.cat((ctx_act[:, 1:], ctx_act[:, -1:]), dim=1)
+        return ctx_obs, ctx_act, low, full
+
     @torch.no_grad()
     def step(self, action: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Advance one frame.
@@ -274,16 +375,57 @@ class WorldModel:
         if self._ctx_obs is None or self._ctx_act is None:
             raise RuntimeError("step() before reset()")
         act = torch.as_tensor(np.asarray(action), dtype=torch.float32, device=self.device)
-        self._ctx_act = torch.cat((self._ctx_act[:-1], act[None]))
-        with self._autocast():
-            low, _ = self.sampler.sample(self._ctx_obs[None], self._ctx_act[None])
-            low = low[0].float()
-            if self.up_sampler is not None:
-                full = upsample_step(self.up_sampler, self.full_res[None], low[None], self.factor)[0]
-        if self.up_sampler is None:
-            full = self._bicubic(low[None])[0].clamp(-1, 1)
-        self._ctx_obs = torch.cat((self._ctx_obs[1:], low[None]))
-        # The slot for the next frame's action; replaced by the next step's action before it is read.
-        self._ctx_act = torch.cat((self._ctx_act[1:], self._ctx_act[-1:]))
-        self.low_res, self.full_res = low, full
-        return full
+        obs, act_ctx, low, full = self._advance(
+            self._ctx_obs[None], self._ctx_act[None], self.full_res[None], act[None]
+        )
+        self._ctx_obs, self._ctx_act = obs[0], act_ctx[0]
+        self.low_res, self.full_res = low[0], full[0]
+        return self.full_res
+
+    @torch.no_grad()
+    def rollout(
+        self,
+        frames: torch.Tensor,
+        ctx_actions: torch.Tensor,
+        actions: torch.Tensor,
+        generators: Sequence[torch.Generator],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Roll ``b`` independent contexts forward in one batch, each with its own reproducible noise.
+
+        Per stream this is ``reset`` followed by ``step`` for every row of ``actions`` (same context handling, same
+        ``[prev full-res, bicubic(new low-res)]`` upsampler conditioning), but the streams share the forward passes.
+        It leaves the single-stream state of the model untouched. Sample ``i`` draws all its noise from
+        ``generators[i]`` (on the CPU, then moved to the device), in a fixed order, so its frames do not depend on
+        the other streams in the batch or on the model: the same generator seed gives the same noise for any model.
+
+        Args:
+            frames: ``float[b, >=n_cond, 3, h, w]`` context frames in [-1, 1]; the last ``n_cond`` are kept.
+            ctx_actions: ``float[b, >=n_cond, 51]`` context actions (the last is overwritten by the first action).
+            actions: ``float[b, T, 51]`` the action held at each rollout step.
+            generators: ``b`` CPU generators, one per stream.
+
+        Returns:
+            ``(low, full)``: ``float[b, T, 3, h, w]`` and ``float[b, T, 3, H, W]`` (the displayed frames; bicubic
+            if the model has no upsampler), on the CPU.
+
+        Raises:
+            ValueError: On inconsistent batch sizes or too short a context.
+        """
+        b = len(frames)
+        if not (len(ctx_actions) == len(actions) == len(generators) == b):
+            raise ValueError("frames, ctx_actions, actions and generators must have the same batch size")
+        if frames.shape[1] < self.n_cond or ctx_actions.shape[1] < self.n_cond:
+            raise ValueError(f"need {self.n_cond} context frames and actions")
+        obs = frames[:, -self.n_cond :].to(self.device, torch.float32)
+        act = ctx_actions[:, -self.n_cond :].to(self.device, torch.float32)
+        full = self._bicubic(obs[:, -1]).clamp(-1, 1)
+
+        def randn(*shape: int) -> torch.Tensor:
+            return torch.stack([torch.randn(shape, generator=g) for g in generators]).to(self.device)
+
+        lows, fulls = [], []
+        for t in range(actions.shape[1]):
+            obs, act, low, full = self._advance(obs, act, full, actions[:, t].to(self.device), randn, randn)
+            lows.append(low.cpu())
+            fulls.append(full.cpu())
+        return torch.stack(lows, dim=1), torch.stack(fulls, dim=1)
