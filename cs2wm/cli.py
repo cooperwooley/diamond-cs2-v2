@@ -320,6 +320,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         from cs2wm.report import latex
 
         latex.run(args.results, args.out)
+
     return 0
 
 
