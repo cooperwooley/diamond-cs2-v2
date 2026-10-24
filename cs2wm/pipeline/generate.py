@@ -46,6 +46,7 @@ from omegaconf import DictConfig
 from cs2wm import config as cs2wm_config
 from cs2wm import demo
 from cs2wm.pipeline import ntfy
+from cs2wm.pipeline import proc as proc_utils
 from cs2wm.pipeline.netcon import NetconClient
 
 log = logging.getLogger(__name__)
@@ -68,9 +69,7 @@ class GenerateError(RuntimeError):
 
 def _require_insecure(cmd: Sequence[str]) -> None:
     """Raise ``ValueError`` unless ``-insecure`` is in ``cmd``, or if it asks CS2 to connect to a server or go secure."""
-    problem = cs2wm_config.launch_option_problem(list(cmd))
-    if problem:
-        raise ValueError(f"refusing to start CS2: {problem} (HLAE and CS2 only ever run offline)")
+    proc_utils.require_offline(cmd)
 
 
 def build_launch_command(cfg: DictConfig, profile: str, netconport: int | None = None) -> list[str]:

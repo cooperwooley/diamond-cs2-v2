@@ -1,6 +1,6 @@
 """Process helpers shared by the stages that launch CS2 (generate #13, render #15).
 
-HLAE and CS2 only ever run offline: every launch goes through ``require_insecure``.
+HLAE and CS2 only ever run offline: every launch goes through ``require_offline``.
 """
 
 from __future__ import annotations
@@ -10,28 +10,36 @@ import subprocess
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from cs2wm import config as cs2wm_config
+
 log = logging.getLogger(__name__)
 
 
-def require_insecure(cmd: Sequence[str]) -> None:
-    """Raise ``ValueError`` unless ``-insecure`` is in ``cmd``.
+def require_offline(cmd: Sequence[str]) -> None:
+    """Raise ``ValueError`` unless ``cmd`` launches CS2 offline: ``-insecure`` present, nothing that connects.
 
-    The flag counts when it is an argv element of its own or a word of the value after ``-cmdLine`` (the HLAE custom
-    loader passes the CS2 command line as a single argument).
+    This is the single launch-safety check (generate and render call it right before ``Popen``). The value after
+    ``-cmdLine`` (the HLAE custom loader passes the CS2 command line as one argument) is split into tokens with
+    ``config.split_command_line``, so ``+connect`` inside it is seen, and a quoted path that merely contains
+    ``-insecure`` does not count as the flag. The rules are ``config.launch_option_problem``.
 
     Args:
         cmd: The argv list about to be started.
 
     Raises:
-        ValueError: If ``-insecure`` is missing.
+        ValueError: If ``-insecure`` is missing, or ``-secure``/``connect`` options are present.
     """
     tokens: list[str] = []
     for i, part in enumerate(cmd):
         tokens.append(part)
         if i > 0 and cmd[i - 1].lower() == "-cmdline":
-            tokens.extend(part.split())
-    if "-insecure" not in tokens:
-        raise ValueError("refusing to start CS2 without -insecure (HLAE and CS2 only ever run offline)")
+            try:
+                tokens.extend(cs2wm_config.split_command_line(part))
+            except ValueError as exc:
+                raise ValueError(f"refusing to start CS2: unparsable -cmdLine ({exc})") from exc
+    problem = cs2wm_config.launch_option_problem(tokens)
+    if problem:
+        raise ValueError(f"refusing to start CS2: {problem} (HLAE and CS2 only ever run offline)")
 
 
 def spawn_kwargs(windows: bool) -> dict[str, Any]:

@@ -111,6 +111,22 @@ def test_sha256_ignores_paths_and_supervisor(cfg) -> None:
     assert config_sha256(other) == config_sha256(cfg)
 
 
+def test_sha256_tracks_only_pixel_affecting_render_keys(cfg) -> None:
+    local = [
+        "render.poll_s=9", "render.startup_s=1", "render.launch_options=[-insecure]", "render.hlae_exe=X.exe",
+        "render.hook_dll=y.dll", "render.stream_name=other", "render.retries=3", "render.png_compression=9",
+        "render.quit_delay_ticks=99", "render.timeout_factor=9", "generate.chunk_min=7",
+    ]  # fmt: skip
+    assert config_sha256(load_config(overrides=local)) == config_sha256(cfg)
+    for override in ("render.tick_offset=2", "render.spec_mode=1", "render.spec_player_field=user_id",
+                     "render.output_format=ffmpeg"):  # fmt: skip
+        assert config_sha256(load_config(overrides=[override])) != config_sha256(cfg)
+    ff = load_config(overrides=["render.output_format=ffmpeg"])
+    assert config_sha256(load_config(overrides=["render.output_format=ffmpeg", "render.ffmpeg_preset=other"])) != (
+        config_sha256(ff)
+    )
+
+
 def test_num_actions_matches_env_config(cfg, repo_root) -> None:
     env = OmegaConf.load(repo_root / "config" / "env" / "cs2.yaml")
     assert env.num_actions == ActionSpec.from_config(cfg).dim

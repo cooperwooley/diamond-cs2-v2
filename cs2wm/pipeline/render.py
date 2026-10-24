@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,7 +54,6 @@ _TAKE_RE = re.compile(r"^take\d+$")
 _VIDEO_SUFFIXES = (".mp4", ".mkv", ".avi", ".mov")
 _IMAGE_SUFFIXES = (".tga", ".png", ".bmp")
 _WINDOWS_PATH_RE = re.compile(r"^([A-Za-z]:|\\\\)")
-_DEMO_ID_RE = re.compile(r"^[\w.\-]+$")
 
 
 class RenderError(RuntimeError):
@@ -148,9 +148,10 @@ def raw_dir(cfg: DictConfig, demo_id: str) -> Path:
     return Path(cfg.paths.raw) / demo_id
 
 
-def _check_demo_id(demo_id: str) -> None:
-    if not _DEMO_ID_RE.match(demo_id):
-        raise RenderError(f"demo id {demo_id!r} may only hold letters, digits, '_', '.' and '-'")
+def _check_safe_name(what: str, value: str) -> None:
+    """Raise ``RenderError`` unless ``value`` is safe in file names and console commands."""
+    if not cs2wm_config.SAFE_NAME_RE.match(value):
+        raise RenderError(f"{what} {value!r} may only hold letters, digits, '_', '.' and '-'")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -185,11 +186,12 @@ def build_render_cfg(plan: Mapping, cfg: DictConfig) -> str:
         The cfg file content.
 
     Raises:
-        RenderError: If the plan has nothing to render, the demo id is unusable, or a target lacks the field that
+        RenderError: If the plan has nothing to render, the demo id or stream name is unusable, or a target lacks the field that
             ``render.spec_player_field`` selects.
     """
     demo_id = plan["demo_id"]
-    _check_demo_id(demo_id)
+    _check_safe_name("demo id", demo_id)
+    _check_safe_name("render.stream_name", str(cfg.render.stream_name))
     schedule = plan["mirv_cmd_schedule"]
     if not schedule:
         raise RenderError(f"{demo_id}: the plan has no segments to render")
@@ -269,7 +271,7 @@ def build_hlae_command(cfg: DictConfig, demo_path: Path, cfg_name: str) -> list[
         "-programPath", win_path(cfg.paths.cs2_dir, *str(cfg.generate.cs2_exe).split("/")),
         "-cmdLine", " ".join(cs2_args),
     ]  # fmt: skip
-    proc_utils.require_insecure(cmd)
+    proc_utils.require_offline(cmd)
     return cmd
 
 
@@ -305,6 +307,13 @@ def launch_hlae(
     HLAE has exited AND no cs2.exe image is left (polled with ``tasklist``). On timeout the HLAE process tree is
     killed with ``taskkill /T /F`` and so is every ``cs2.exe`` image (the game may not be a child of HLAE).
 
+    HLAE can exit before ``cs2.exe`` shows up in ``tasklist``, so after HLAE exits the wait only ends once cs2.exe
+    has been seen and is gone again, or when it was never seen within a grace window of 5 x ``render.poll_s``
+    (capped at ``render.startup_s``).
+
+    NOTE: the ``tasklist`` probe and ``taskkill /IM cs2.exe`` assume this stage owns the only CS2 on the machine
+    (the supervisor serializes the stages); another CS2 would be waited for, and killed on a timeout.
+
     Args:
         cfg: A validated cs2wm config.
         demo_path: Demo to play back.
@@ -323,20 +332,27 @@ def launch_hlae(
     exe = Path(str(cfg.generate.cs2_exe)).name
     probe = is_cs2_running or (lambda: cs2_running(hooks.run, exe))
     cmd = build_hlae_command(cfg, demo_path, cfg_name)
-    proc_utils.require_insecure(cmd)
+    proc_utils.require_offline(cmd)
     windows = _is_windows()
     log.info("launching HLAE: %s", " ".join(cmd))
     proc = hooks.popen(cmd, **proc_utils.spawn_kwargs(windows))
     start = hooks.clock()
     returncode: int | None = None
+    exited_at = 0.0
+    seen = False
+    grace = min(5 * float(cfg.render.poll_s), float(cfg.render.startup_s))
     try:
         while True:
             rc = proc.poll()
+            now = hooks.clock()
             if rc is not None:
-                returncode = rc
-                if not probe():
+                if returncode is None:
+                    returncode, exited_at = rc, now
+                if probe():
+                    seen = True
+                elif seen or now - exited_at >= grace:
                     return LaunchResult(returncode, False)
-            if hooks.clock() - start >= timeout_s:
+            if now - start >= timeout_s:
                 log.warning("render timeout after %.0f s; killing HLAE and CS2", timeout_s)
                 break
             hooks.sleep(float(cfg.render.poll_s))
@@ -353,10 +369,11 @@ def launch_hlae(
 
 
 def list_takes(raw: Path) -> list[Path]:
-    """The ``takeNNNN`` directories under ``raw``, in take order (= segment order)."""
+    """The ``takeNNNN`` directories under ``raw`` ordered by take number (= segment order)."""
     if not raw.is_dir():
         return []
-    return sorted(p for p in raw.iterdir() if p.is_dir() and _TAKE_RE.match(p.name))
+    takes = [p for p in raw.iterdir() if p.is_dir() and _TAKE_RE.match(p.name)]
+    return sorted(takes, key=lambda p: int(p.name[len("take") :]))  # numeric, so take10000 follows take9999
 
 
 def _image_files(directory: Path) -> list[Path]:
@@ -590,6 +607,8 @@ def _attempt(
     problems = [f"segment {i}: expected {e}, got {a} frames" for i, (e, a) in counts.items() if e != a]
     if n_takes != len(counts):
         problems.append(f"{n_takes} takes captured for {len(counts)} segments")
+    if counts and all(a == e - 1 for e, a in counts.values()) and n_takes == len(counts):
+        return "every segment is exactly one frame short (end tick not captured? see CONFIRM(#14))", {}
     if problems:
         code = "" if launched.returncode in (0, None) else f" (HLAE exit code {launched.returncode})"
         return "frame-count mismatch" + code + ": " + "; ".join(problems), {}
@@ -647,7 +666,12 @@ def run(
         result.reason = f"bad render plan: {exc}"
         log.error("%s: %s", demo_id, result.reason)
         return result
-    install_cfg(cfg_text, demo_id, cfg.paths.cs2_dir)
+    try:
+        install_cfg(cfg_text, demo_id, cfg.paths.cs2_dir)
+    except OSError as exc:
+        result.reason = f"could not install the render cfg: {exc}"
+        log.error("%s: %s", demo_id, result.reason)
+        return result
 
     length_s = plan["demo_end_tick"] / cfg.timing.tickrate
     timeout_s = float(cfg.render.timeout_factor) * length_s + float(cfg.render.startup_s)
@@ -673,3 +697,65 @@ def run(
     log.info("%s: %d frames in %.0f s (%.1fx realtime)", demo_id, sum(frames.values()), result.wall_s,
              result.realtime_factor)  # fmt: skip
     return result
+
+
+@dataclass(frozen=True)
+class CfgOnly:
+    """What ``cs2wm render --cfg-only`` wrote and would run.
+
+    Attributes:
+        installed: The cfg in ``<cs2_dir>/game/csgo/cfg``.
+        copy: A copy next to the plan (``render_<demo_id>.cfg``).
+        argv: The HLAE argv ``run`` would launch.
+        powershell: The same command for pasting into PowerShell.
+    """
+
+    installed: Path
+    copy: Path
+    argv: list[str]
+    powershell: str
+
+
+def powershell_command(argv: list[str]) -> str:
+    """Format ``argv`` as one PowerShell line.
+
+    ``--%`` (stop-parsing) hands the rest of the line to HLAE.exe verbatim, so the quoting is the Windows
+    command-line quoting that ``subprocess`` uses for the real launch (the inner ``\"`` of the ``-cmdLine`` value).
+
+    Args:
+        argv: Output of ``build_hlae_command``.
+
+    Returns:
+        The line, starting with ``&``.
+    """
+    exe = argv[0].replace("'", "''")
+    return f"& '{exe}' --% {subprocess.list2cmdline(argv[1:])}"
+
+
+def write_cfg_only(plan_path: Path, cfg: DictConfig, demo_path: Path | None = None) -> CfgOnly:
+    """Write the render cfg for a plan and build the HLAE command without launching (for the manual #14 session).
+
+    No demo file is needed: without ``demo_path`` the command points at ``paths.demos/<kind>/<plan demo_file>``.
+
+    Args:
+        plan_path: A ``render_plan.json``.
+        cfg: A validated cs2wm config.
+        demo_path: Demo to play back, if known.
+
+    Returns:
+        The written files and the command.
+
+    Raises:
+        RenderError: If the plan cannot be turned into a cfg.
+        ValueError: If the plan schema is unsupported, or the command would not be offline-only.
+    """
+    plan = read_render_plan(plan_path)
+    text = build_render_cfg(plan, cfg)
+    demo_id = plan["demo_id"]
+    if demo_path is None:
+        demo_path = Path(cfg.paths.demos) / str((plan.get("meta") or {}).get("kind", "dm")) / plan["demo_file"]
+    installed = install_cfg(text, demo_id, cfg.paths.cs2_dir)
+    copy = plan_path.with_name(f"render_{demo_id}.cfg")
+    copy.write_text(text, encoding="utf-8")
+    argv = build_hlae_command(cfg, demo_path, f"render_{demo_id}")
+    return CfgOnly(installed, copy, argv, powershell_command(argv))

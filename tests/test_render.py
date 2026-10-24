@@ -175,14 +175,46 @@ def test_launch_refuses_without_insecure(tmp_path: Path) -> None:
         _cfg(tmp_path, "render.launch_options=[-steam]")
 
 
-def test_require_insecure_sees_the_cmdline_value_only_after_cmdline() -> None:
+@pytest.mark.parametrize(
+    "cmd_line",
+    [
+        "-steam -insecure -secure",
+        "-steam -insecure +connect 1.2.3.4",
+        "-insecure -connect 1.2.3.4",
+        "-insecure connect x",
+    ],
+)
+def test_launch_refuses_secure_and_connect_options(tmp_path: Path, cmd_line: str) -> None:
+    popen_calls: list = []
+    hooks = Hooks(popen=lambda *a, **k: popen_calls.append(a))
+    raw = OmegaConf.create(OmegaConf.to_container(_cfg(tmp_path)))
+    raw.render.launch_options = cmd_line.split()
+    with pytest.raises(ValueError, match="not allowed"):
+        render.launch_hlae(raw, Path("d.dem"), "render_d", 10, hooks)
+    assert popen_calls == []
+    with pytest.raises(ConfigError, match="not allowed"):
+        _cfg(tmp_path, f"render.launch_options=[{','.join(cmd_line.split())}]")
+
+
+def test_require_offline_expands_only_the_cmdline_value() -> None:
     from cs2wm.pipeline import proc
 
-    proc.require_insecure(["HLAE.exe", "-cmdLine", "-steam -insecure -novid"])
+    proc.require_offline(["HLAE.exe", "-cmdLine", "-steam -insecure -novid"])
+    for bad in ("-steam -novid", "-insecure +connect 1.2.3.4", "-insecure -secure"):
+        with pytest.raises(ValueError):
+            proc.require_offline(["HLAE.exe", "-cmdLine", bad])
     with pytest.raises(ValueError):
-        proc.require_insecure(["HLAE.exe", "-cmdLine", "-steam -novid"])
-    with pytest.raises(ValueError):
-        proc.require_insecure(["HLAE.exe", "-steam -insecure"])  # not behind -cmdLine: not a real flag
+        proc.require_offline(["HLAE.exe", "-steam -insecure"])  # not behind -cmdLine: not a real flag
+    with pytest.raises(ValueError, match="unparsable"):
+        proc.require_offline(["HLAE.exe", "-cmdLine", '-insecure +playdemo "x'])
+
+
+def test_a_quoted_path_containing_insecure_is_not_the_flag() -> None:
+    from cs2wm.pipeline import proc
+
+    with pytest.raises(ValueError, match="-insecure"):
+        proc.require_offline(["HLAE.exe", "-cmdLine", r'-steam +playdemo "C:\a -insecure b\x.dem"'])
+    proc.require_offline(["HLAE.exe", "-cmdLine", r'-insecure +playdemo "C:\a -insecure b\x.dem"'])
 
 
 # --- launch / timeout ----------------------------------------------------------------------------------------------
@@ -422,7 +454,9 @@ class FakeLauncher:
         if behaviour == "ok":
             _fake_takes(raw, counts)
         elif behaviour == "short":
-            _fake_takes(raw, [counts[0] - 1, *counts[1:]])
+            _fake_takes(raw, [counts[0] - 2, *counts[1:]])
+        elif behaviour == "one_short":
+            _fake_takes(raw, [c - 1 for c in counts])
         elif behaviour == "timeout":
             _fake_takes(raw, [1])
             return LaunchResult(None, True)
@@ -501,6 +535,7 @@ def test_run_retries_once_after_a_mismatch_then_succeeds(tmp_path: Path) -> None
     ("behaviour", "reason"),
     [
         ("short", "frame-count mismatch"),
+        ("one_short", "end tick not captured"),
         ("timeout", "timeout"),
         ("crash", "(HLAE exit code 1)"),
         ("oserror", "start HLAE"),
@@ -560,3 +595,85 @@ def test_run_downscale_failure_is_retried_and_reported(tmp_path: Path) -> None:
 
     res = render.run(demo, cfg, _hooks_clock(), launcher)
     assert not res.ok and res.reason.startswith("downscale failed")
+
+
+# --- review fixes ----------------------------------------------------------------------------------------------
+
+
+def test_waits_for_a_late_cs2_and_gives_up_if_it_never_shows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(render, "_is_windows", lambda: False)
+
+    def popen(cmd, **kwargs):
+        p = FakePopen(cmd, **kwargs)
+        p.returncode = 0
+        return p
+
+    cfg = _cfg(tmp_path)
+    seq = iter([False, False, True, True, False])  # cs2.exe appears two polls after HLAE exited
+    clock = FakeClock()
+    hooks = Hooks(clock=clock, sleep=clock.sleep, popen=popen, run=lambda *a, **k: None)
+    assert render.launch_hlae(cfg, Path("d.dem"), "r", 100, hooks, lambda: next(seq)) == LaunchResult(0, False)
+    assert next(seq, "drained") == "drained"  # polled until cs2.exe was seen AND gone
+
+    clock2, polls = FakeClock(), []
+    hooks2 = Hooks(clock=clock2, sleep=clock2.sleep, popen=popen, run=lambda *a, **k: None)
+    res = render.launch_hlae(cfg, Path("d.dem"), "r", 100, hooks2, lambda: polls.append(1) or False)
+    assert res == LaunchResult(0, False)
+    assert (
+        clock2.now == 10 and len(polls) == 6
+    )  # grace = 5 x poll_s, then it stops waiting for a cs2.exe that never came
+
+
+def test_takes_are_ordered_numerically(tmp_path: Path) -> None:
+    for name in ("take10000", "take9999", "take0001", "take0000"):
+        (tmp_path / name).mkdir()
+    assert [p.name for p in render.list_takes(tmp_path)] == ["take0000", "take0001", "take9999", "take10000"]
+
+
+def test_run_reports_an_unwritable_cs2_cfg_dir(tmp_path: Path) -> None:
+    cfg, plan, demo = _setup(tmp_path)
+    (tmp_path / "cs2").write_text("a file, so game/csgo/cfg cannot be created")
+    launcher = FakeLauncher(plan, ["ok"])
+    res = render.run(demo, cfg, _hooks_clock(), launcher)
+    assert not res.ok and "could not install the render cfg" in res.reason and launcher.calls == 0
+
+
+def test_stream_name_is_validated(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="stream_name"):
+        _cfg(tmp_path, "render.stream_name=a b")
+    raw = OmegaConf.create(OmegaConf.to_container(_cfg(tmp_path)))
+    raw.render.stream_name = 'x"; quit'
+    with pytest.raises(RenderError, match="stream_name"):
+        render.build_render_cfg(_plan(_cfg(tmp_path)), raw)
+
+
+def test_cfg_quotes_a_raw_dir_with_spaces(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, "paths.raw=C:/my data/raw")
+    assert r'mirv_streams record name "C:\my data\raw\dm-0001"' in render.build_render_cfg(_plan(cfg), cfg).splitlines()
+    cmd = render.build_hlae_command(_cfg(tmp_path), Path("/a b/x.dem"), "render_d")
+    assert '+playdemo "/a b/x.dem"' in cmd[-1]
+
+
+def test_cfg_only_writes_files_and_builds_the_command_without_a_demo(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, f"paths.cs2_dir={tmp_path / 'cs2'}")
+    plan_path = _write_plan(cfg, _plan(cfg))
+    out = render.write_cfg_only(plan_path, cfg)  # the demo file does not exist
+    text = render.build_render_cfg(_plan(cfg), cfg)
+    assert out.installed.read_text() == text == out.copy.read_text()
+    assert out.copy == plan_path.with_name(f"render_{DEMO}.cfg") and out.installed.name == f"render_{DEMO}.cfg"
+    assert out.argv[0] == r"C:\hlae\HLAE.exe" and "-insecure" in out.argv[-1]
+    assert out.powershell.startswith(r"& 'C:\hlae\HLAE.exe' --% -customLoader -noGui -autoStart")
+    assert out.powershell.endswith(f' +exec render_{DEMO}"')
+    assert FakePopen.instances == []
+
+
+def test_cli_render_cfg_only_with_plan(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from cs2wm import cli
+
+    cfg = _cfg(tmp_path, f"paths.cs2_dir={tmp_path / 'cs2'}")
+    plan_path = _write_plan(cfg, _plan(cfg))
+    yaml = tmp_path / "cfg.yaml"
+    yaml.write_text(OmegaConf.to_yaml(OmegaConf.create(OmegaConf.to_container(cfg))), encoding="utf-8")
+    cli.main(["--config", str(yaml), "render", "--cfg-only", "--plan", str(plan_path)])
+    out = capsys.readouterr().out
+    assert "PowerShell:" in out and "HLAE.exe" in out and f"render_{DEMO}.cfg" in out
