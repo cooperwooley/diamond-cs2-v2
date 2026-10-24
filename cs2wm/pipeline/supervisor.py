@@ -321,6 +321,14 @@ def demo_leftovers(cfg: DictConfig, demo_id: str) -> list[Path]:
     return [path for path in paths if path.exists()]
 
 
+def retry_pending(cfg: DictConfig, rec: dict[str, Any]) -> bool:
+    """Whether a ``failed`` demo still has attempts left for its failed stage (it is only failed during the backoff)."""
+    stage = rec.get("failed_stage")
+    return rec["state"] == StageState.FAILED.value and rec.get("attempts", {}).get(stage, 0) < int(
+        cfg.supervisor.max_attempts
+    )
+
+
 def failed_leftovers(cfg: DictConfig, demo_ids: Iterable[str]) -> list[tuple[str, Path, int]]:
     """``(demo id, directory, bytes)`` for the working-set leftovers of the given demos."""
     return [(d, path, _dir_bytes(path)) for d in sorted(demo_ids) for path in demo_leftovers(cfg, d)]
@@ -339,7 +347,11 @@ def cleanup_failed(cfg: DictConfig, state: PipelineState, dry_run: bool = False)
     Returns:
         What was (or would be) deleted, as from ``failed_leftovers``.
     """
-    failed = [d for d, rec in state.demos.items() if rec["state"] == StageState.FAILED.value]
+    failed = [
+        d
+        for d, rec in state.demos.items()
+        if rec["state"] == StageState.FAILED.value and not retry_pending(cfg, rec)  # a retry still needs its files
+    ]
     found = failed_leftovers(cfg, failed)
     if not dry_run:
         for _, path, _ in found:
@@ -737,10 +749,10 @@ class Supervisor:
                 return "target reached"
             if h.now() >= night.deadline:
                 return "deadline reached"
+            if night.stalled and (progressed or generation == "generated"):
+                night.stalled = False
+                self._send(ntfy.Message("dcs2: stall cleared", "The pipeline is moving again.", "default", ("tada",)))
             if generation == "generated":
-                if night.stalled:
-                    night.stalled = False
-                    self._send(ntfy.Message("dcs2: stall cleared", "Generation resumed.", "default", ("tada",)))
                 continue
             if not progressed:
                 if not self._can_progress():
@@ -787,11 +799,15 @@ class Supervisor:
             )
 
     def _can_progress(self) -> bool:
-        """Whether any demo could still move: something to sync, or a demo whose next stage may run."""
-        for rec in self.state.demos.values():
+        """Whether any demo could still move tonight: something to sync, or a demo whose next stage may run.
+
+        A demo parked by ``supervisor.max_demo_wall_min`` is not started again before tomorrow.
+        """
+        cap_s = float(self.cfg.supervisor.max_demo_wall_min) * 60
+        for demo_id, rec in self.state.demos.items():
             if rec["state"] == "packed":
                 return True
-            if rec["state"] in _ADVANCEABLE:
+            if rec["state"] in _ADVANCEABLE and self.night.demo_wall_s[demo_id] < cap_s:
                 stage = next(s for s in STAGES if _INPUT_STATE[s].value == rec["state"])
                 if stage not in self.night.blocked:
                     return True
@@ -799,10 +815,9 @@ class Supervisor:
 
     def _recover(self) -> None:
         """Re-queue failed demos that still have attempts left (a crash between a failure and its retry)."""
-        limit = int(self.cfg.supervisor.max_attempts)
         for demo_id, rec in self.state.demos.items():
-            stage = rec.get("failed_stage")
-            if rec["state"] == "failed" and rec.get("attempts", {}).get(stage, 0) < limit:
+            if retry_pending(self.cfg, rec):
+                stage = rec["failed_stage"]
                 log.info("%s: failed in %s with attempts left; retrying", demo_id, stage)
                 self._requeue(demo_id, stage)
         self.state.save()

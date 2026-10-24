@@ -1039,6 +1039,7 @@ def test_cleanup_failed_deletes_only_the_failed_demos_working_dirs(cfg: DictConf
     from cs2wm.pipeline.supervisor import cleanup_failed
 
     state = _failed_world(cfg)
+    state.demos["bad"]["attempts"] = {"pack": 3}  # out of attempts: really failed
     dry = cleanup_failed(cfg, state, dry_run=True)
     assert len(dry) == 4 and Path(cfg.paths.frames, "bad").exists()  # nothing deleted
     done = cleanup_failed(cfg, state)
@@ -1052,7 +1053,9 @@ def test_cleanup_failed_deletes_only_the_failed_demos_working_dirs(cfg: DictConf
 
 def test_cli_cleanup(capsys: pytest.CaptureFixture[str]) -> None:
     cfg = load_config()
-    _failed_world(cfg)
+    state = _failed_world(cfg)
+    state.demos["bad"]["attempts"] = {"pack": 3}
+    state.save()
     assert cli.main(["cleanup", "--failed", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "would delete" in out and "4 dir(s)" in out and Path(cfg.paths.frames, "bad").exists()
@@ -1110,3 +1113,42 @@ def test_a_heartbeat_is_sent_right_after_a_long_generate_block(cfg: DictConfig) 
     sup.run_until("07:30", target_hours=0.3)
     (first, *_) = world.by_title("heartbeat")
     assert first["at"] == world.events.index("generate") + 1  # the 60 min block outlasted heartbeat_min
+
+
+def test_cleanup_skips_failed_demos_that_still_have_attempts_left(cfg: DictConfig) -> None:
+    from cs2wm.pipeline.supervisor import cleanup_failed
+
+    state = _failed_world(cfg)
+    state.demos["bad"]["attempts"] = {"pack": 1}  # failed only during the retry backoff
+    assert cleanup_failed(cfg, state) == [] and Path(cfg.paths.frames, "bad", "f.bin").exists()
+    state.demos["bad"]["attempts"] = {"pack": 3}
+    assert cleanup_failed(cfg, state) and not Path(cfg.paths.frames, "bad").exists()
+
+
+def test_a_demo_parked_by_the_wall_time_cap_does_not_count_as_progress_possible(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    sup.state.mark("p", StageState.SEGMENTED, kind="dm")
+    sup.night = Night(T0, T0 + timedelta(hours=8), 1.0, "dm")
+    assert sup._can_progress()
+    sup.night.demo_wall_s["p"] = 90 * 60
+    assert not sup._can_progress()
+
+    # in a night: the render takes 100 min, so extract is not started tonight; with the disk paused nothing else
+    # can move, which ends the night at once instead of a "Mill down?" stall until the deadline
+    sup, world = make(cfg)
+    world.working = 9.5
+    world.cost = {**World.cost, "render": 6000}
+    sup.state.mark("p", StageState.SEGMENTED, kind="dm")
+    night = sup.run_until("07:30", target_hours=99)
+    assert sup.state.state_of("p") is StageState.RENDERED
+    assert "pipeline stalled" not in night.alerts and "disk guard" in night.alerts and world.t < night.deadline
+
+
+def test_stall_clears_as_soon_as_a_pass_makes_progress(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    world.working, world.synced_working_gb = 9.5, 0.0  # sync does not free space: generation stays paused
+    world.sync_failures = 4
+    sup.state.mark("old", StageState.PACKED, kind="dm", frames=FRAMES)
+    night = sup.run_until("23:50", target_hours=99)
+    assert len(world.by_title("pipeline stalled")) == 1 and len(world.by_title("stall cleared")) == 1
+    assert world.generate_hours == [] and not night.stalled  # cleared by the sync, though generation is still paused

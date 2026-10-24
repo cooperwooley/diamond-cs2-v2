@@ -89,5 +89,6 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Pr
     -Description "cs2wm overnight pipeline: cs2wm supervise --until $Until --target-hours $hours --profile $Profile" | Out-Null
 
 Write-Host "Registered scheduled task $TaskName for $user: daily at $Start, until $Until, target $hours h, profile $Profile."
-Write-Host "Time limit $([int]$limit.TotalMinutes) min. The PC must stay on and $user must stay logged in (the screen may lock only if #14 says CS2 renders locked)."
+Write-Host "Time limit $([int]$limit.TotalMinutes) min. The PC must stay on and $user must stay logged in."
+Write-Host "The screen may lock only if the #14 locked-screen check says CS2 renders locked."
 Write-Host "Start it now with: Start-ScheduledTask -TaskName $TaskName"
