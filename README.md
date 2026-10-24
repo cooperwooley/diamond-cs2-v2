@@ -131,7 +131,7 @@ cs2wm status                      # every demo should be "synced"
 ```
 
 Useful extras: `cs2wm inspect-demo <demo.dem>`, `cs2wm render --cfg-only --plan <render_plan.json>` (writes the
-cfg and prints the HLAE command without launching), `cs2wm cleanup --failed --dry-run`, and the label hand-check:
+cfg and prints the HLAE command without launching), `cs2wm cleanup --failed [--dry-run] [--force]`, and the label hand-check:
 
 ```powershell
 # Windows PowerShell or WSL
@@ -232,17 +232,24 @@ cs2wm eval h1 --models v2=<v2> v1=<v1> shuffled=<shuf> \
   --data <test> --split-json <split.json> --fullres-data $DCS2_ROOT/hdf5_fullres \
   --upsampler-ckpt <v1> --contexts 50 --seed 0 --device cuda --batch-size 16 --denoising-steps 1 --out results/h1
 
-# WSL: H2 volumetric smoke (should-have)
-cs2wm eval h2 --models v2=<v2> v1=<v1> --seed 0           # TBD(#33): not implemented yet
+# WSL: H2 volumetric smoke (should-have). --data holds held-out FULL-RES smoke episodes, --demos the .dem files
+cs2wm eval h2 --models v2=<v2> v1=<v1> --data $DCS2_ROOT/hdf5_fullres/smoke --split-json <split.json> \
+  --demos $DCS2_ROOT/demos --upsampler-ckpt <v1> --seed 0 --device cuda --n-validate 20 --out results/h2
 
 # WSL: carried-over v1 evals (loss curves, rollouts, FID at 30x56)
 cs2wm eval carried --models v1=<v1> v2=<v2> --v2-metrics <run>/metrics.jsonl --v1-results results/v1 \
   --data <test> --split-json <split.json> --v1-data <v1 low_res/test> --out results/carried --seed 0 \
-  --device cuda --n-fid 2048 --frames 64 --contexts 16
+  --device cuda --n-fid 2048 --frames 64 --contexts 16 --v1-actions both --fid-seeds 3
 
-# WSL: regenerate report tables and figures from results/
-cs2wm report-assets --results results --out report      # TBD(#36): not implemented yet
+# WSL: regenerate report tables and figures from results/, then build the PDF
+cp <dataset>/stats.json results/dataset_stats.json       # from dataset_stats.py; the default for --stats
+cs2wm report-assets --results results --out report --stats results/dataset_stats.json
+cd report && latexmk -pdf main.tex
 ```
+
+`eval carried` drives v1 with zero actions by default (what it was trained on); `--v1-actions both` adds a row with
+ground-truth actions. `--s-cond 0` approximates v1's original sampler setting and `--zero-actions` forces zero actions
+for every model.
 
 H1 on contexts without `--split-json` may include training demos; the run warns and records `held_out: false`.
 
