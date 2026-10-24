@@ -528,7 +528,7 @@ def test_run_h1_end_to_end(ckpts, gt_root, tmp_path, cfg, agent_cfg, tiny_suite,
     for res in on_disk["results"].values():
         for key in ("fullres", "lowres"):
             r = res[key]
-            assert set(r) == {"estimator", "yaw", "pitch", "per_bin", "noop_drift"}
+            assert set(r) == {"estimator", "yaw", "pitch", "per_bin", "noop_drift", "scatter"}
             assert {"n", "pearson_r", "slope", "intercept", "sign_accuracy", "n_nonzero"} == set(r["yaw"])
             assert r["yaw"]["n"] == 2 * 6 * 2 and r["yaw"]["n_nonzero"] == 2 * 2 * 2 and len(r["per_bin"]) == 6
             assert {"mean", "ci_lo", "ci_hi"} == set(r["per_bin"][0]["yaw"])
@@ -864,3 +864,52 @@ def test_collect_gt_shifts_takes_an_equal_share_from_every_episode(gt_root, cfg,
     again = h1.collect_gt_shifts(files, 30, 0, spec)
     np.testing.assert_array_equal(gt["label_yaw"], again["label_yaw"])
     assert len(h1.collect_gt_shifts(files, 1000, 0, spec)["label_yaw"]) == 3 * 29
+
+
+def test_scatter_points_match_per_context_script_means_of_the_csv(ckpts, gt_root, tmp_path, agent_cfg) -> None:
+    cfg = load_config(
+        overrides=["pack.fullres_mod=1", "eval.h1.gt_pairs=30", "eval.h1.bootstrap=20", "eval.h1.skip_initial_steps=2"]
+    )
+    suite = h1.ScriptedSuite(yaw_units=(4,), pitch_units=(2,), keys=("w",), rollout_frames=5)
+    s = run(ckpts, gt_root, tmp_path, cfg, agent_cfg, suite)
+    on_disk = json.loads((tmp_path / "summary.json").read_text(), parse_constant=no_nan_constant)
+    names = [x["name"] for x in on_disk["scripts"]]
+    rows = [r.split(",") for r in (tmp_path / "v2_frames.csv").read_text().splitlines()]
+    header, rows = rows[0], rows[1:]
+    col = {k: header.index(k) for k in header}
+    for key, yaw_col, pitch_col in (
+        ("fullres", "est_yaw_deg", "est_pitch_deg"),
+        ("lowres", "est_yaw_deg_lowres", "est_pitch_deg_lowres"),
+    ):
+        scatter = on_disk["results"]["v2"][key]["scatter"]
+        assert scatter["unit"] == "per (context, script) mean over the in-stats frame pairs"
+        points = scatter["points"]
+        assert len(points) == 2 * len(names)  # contexts x scripts
+        assert [(p["script"], p["context"]) for p in points] == [(n, c) for n in names for c in range(2)]
+        assert set(points[0]) == {
+            "script", "context", "commanded_yaw_deg", "commanded_pitch_deg", "est_yaw_deg", "est_pitch_deg", "n_pairs",
+        }  # fmt: skip
+        for p in points:
+            group = [r for r in rows if r[col["script"]] == p["script"] and int(r[col["context"]]) == p["context"]]
+            group = [r for r in group if r[col["in_stats"]] == "1"]
+            assert p["n_pairs"] == len(group) == 5 - 2
+            assert p["est_yaw_deg"] == pytest.approx(np.mean([float(r[col[yaw_col]]) for r in group]))
+            assert p["est_pitch_deg"] == pytest.approx(np.mean([float(r[col[pitch_col]]) for r in group]))
+            assert p["commanded_yaw_deg"] == pytest.approx(float(group[0][col["cmd_yaw_deg"]]))
+            assert p["commanded_pitch_deg"] == pytest.approx(float(group[0][col["cmd_pitch_deg"]]))
+    assert (
+        s["results"]["v2"]["fullres"]["scatter"]["points"] == on_disk["results"]["v2"]["fullres"]["scatter"]["points"]
+    )
+
+
+def test_scatter_points_nan_becomes_null_and_order_is_script_then_context(spec) -> None:
+    scripts = h1.ScriptedSuite(yaw_units=(4,), pitch_units=(), keys=(), rollout_frames=3, noop=False).scripts(spec)
+    rec = {"script": np.array([1, 0, 0, 1, 0]), "context": np.array([0, 1, 0, 0, 1])}
+    est = {"yaw": np.array([1.0, 2.0, 3.0, 4.0, 6.0]), "pitch": np.array([np.nan, 1.0, np.nan, np.nan, np.nan])}
+    pts = h1.scatter_points(rec, est, scripts)["points"]
+    assert [(p["script"], p["context"], p["n_pairs"]) for p in pts] == [
+        ("yaw+4", 0, 1), ("yaw+4", 1, 2), ("yaw-4", 0, 2),
+    ]  # fmt: skip
+    assert [p["est_yaw_deg"] for p in pts] == [3.0, 4.0, 2.5]
+    assert np.isnan(pts[0]["est_pitch_deg"]) and pts[1]["est_pitch_deg"] == 1.0 and np.isnan(pts[2]["est_pitch_deg"])
+    assert [p["est_pitch_deg"] for p in h1._json_clean(pts)] == [None, 1.0, None]
