@@ -17,6 +17,7 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
 2. **segment** (#10, `cs2wm.pipeline.segment`). Turns `player_spawn`/`player_death` events into lives, picks whom to
    spectate (one in-eye point of view at a time, switching only at a death), and splits the view segments into
    episodes of at most 1000 frames. Writes `plans/<demo_id>/render_plan.json`.
+   The JSON schema is documented in the `cs2wm.pipeline.segment` module docstring.
 3. **render** (#15, `cs2wm.pipeline.render`). Replays the demo in CS2 through HLAE `mirv_streams` at a fixed 16 fps,
    captured before the UI (no HUD), and downscales the frames to 280x150. Verifies per-segment frame counts.
 4. **extract_actions** (#11, `cs2wm.pipeline.extract_actions`). Derives a 51-dim action per frame from player state

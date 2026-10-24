@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("segment", help="plan lives, spectate schedule and episodes (#10)")
     _add_demo_args(p)
     p.add_argument("--policy", choices=["longest_remaining", "fixed_player"], default=None)
-    p.add_argument("--player", default=None, help="player name for --policy fixed_player")
+    p.add_argument("--player", default=None, help="player name (or numeric user_id) for --policy fixed_player")
 
     p = sub.add_parser("render", help="render a demo with HLAE (#15)")
     _add_demo_args(p)
@@ -123,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_demo(arg: str, cfg: DictConfig) -> Path:
+    """Return the ``.dem`` file for a path or a demo id (searched as ``paths.demos/<kind>/<id>.dem``)."""
+    path = Path(arg)
+    if path.is_file():
+        return path
+    matches = sorted(Path(cfg.paths.demos).glob(f"*/{arg}.dem"))
+    if not matches:
+        raise SystemExit(f"demo not found: {arg} (not a file, and no {cfg.paths.demos}/*/{arg}.dem)")
+    return matches[0]
+
+
 def _cfg(args: argparse.Namespace) -> DictConfig:
     from cs2wm.config import load_config
 
@@ -139,8 +150,13 @@ def _dispatch(args: argparse.Namespace) -> None:
     elif cmd == "segment":
         from cs2wm.pipeline import segment
 
-        # TODO(#10): resolve --all-pending and demo ids through the supervisor state.
-        segment.run(Path(args.demo or ""), _cfg(args), args.policy, args.player)
+        cfg = _cfg(args)
+        if args.all_pending:
+            # TODO(#20): resolve --all-pending through the supervisor's persistent pipeline state.
+            raise NotImplementedError("TODO(#20): segment --all-pending")
+        if not args.demo:
+            raise SystemExit("segment: give a demo id or a path to a .dem file")
+        print(segment.run(_resolve_demo(args.demo, cfg), cfg, args.policy, args.player))
     elif cmd == "render":
         from cs2wm.pipeline import render
 
