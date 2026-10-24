@@ -100,6 +100,10 @@ class Transport:
             "--partial",
             f"--timeout={_RSYNC_IO_TIMEOUT_S}",
             "--exclude=*.tmp",
+            # pack stages, swaps and deletes whole demo dirs under these suffixes; never push a half-done one
+            "--exclude=*.staging/",
+            "--exclude=*.old/",
+            "--exclude=*.deleting/",
             "-e",
             shlex.join(["ssh", *_SSH_OPTS]),
         ]

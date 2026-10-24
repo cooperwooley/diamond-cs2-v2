@@ -414,6 +414,9 @@ def test_linux_argv() -> None:
         "--partial",
         "--timeout=300",
         "--exclude=*.tmp",
+        "--exclude=*.staging/",
+        "--exclude=*.old/",
+        "--exclude=*.deleting/",
         "-e",
         "ssh " + " ".join(SSH_OPTS),
         "/data/hdf5/",
@@ -599,3 +602,15 @@ def test_unsafe_manifest_file_names_are_errors_and_never_touched(cfg, tmp_path, 
     assert "bad file" in r.errors[0]
     assert outside.read_bytes() == b"precious"
     assert not any(f.exists() for f in files)  # the two honest entries still sync
+
+
+def test_push_skips_pack_staging_dirs(cfg, remote: Path) -> None:
+    """A crashed pack can leave <demo>.staging/.old/.deleting dirs; sync must never push them to the Mill."""
+    make_demo(cfg, "d1")
+    for suffix in ("staging", "old", "deleting"):
+        stray = Path(cfg.paths.hdf5) / "dm" / f"d1.{suffix}"
+        stray.mkdir(parents=True)
+        (stray / "d1_e0.hdf5").write_bytes(b"half-written")
+    sync.push(cfg, transport=LocalTransport())
+    assert (remote / "hdf5/dm/d1/d1_e0.hdf5").is_file()
+    assert not [p for p in remote.rglob("*") if p.suffix in (".staging", ".old", ".deleting")]
