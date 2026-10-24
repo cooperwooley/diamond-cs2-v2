@@ -36,8 +36,12 @@ def test_subcommand_help(argv: list[str]) -> None:
     assert exc.value.code == 0
 
 
-def test_unimplemented_command_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
-    assert cli.main(["report-assets"]) == 2
+def test_unimplemented_command_returns_2(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    def stub(args):
+        raise NotImplementedError("TODO(#0): stub")
+
+    monkeypatch.setattr(cli, "_dispatch", stub)  # every real command is implemented now; exercise the handler alone
+    assert cli.main(["status"]) == 2
     assert "not implemented yet" in capsys.readouterr().err
 
 
