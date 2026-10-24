@@ -377,6 +377,7 @@ def test_step_passes_context_in_the_right_order_to_the_samplers(agent, cfg) -> N
     world = WorldModel(agent, 1, use_upsampler=True)
     frames = torch.rand(4, 3, 30, 56) * 2 - 1
     acts = np.zeros((4, ACTION_DIM), np.float32)
+    acts[np.arange(4), np.arange(4) + 20] = 1.0  # a distinct action per context row
     world.reset(frames, acts)
     prev_full = world.full_res.clone()
     calls = {"den": [], "up": []}
@@ -391,13 +392,21 @@ def test_step_passes_context_in_the_right_order_to_the_samplers(agent, cfg) -> N
     assert obs.shape == (1, 4, 3, 30, 56) and torch.equal(obs[0], frames)
     assert act.shape == (1, 4, ACTION_DIM)
     assert torch.equal(act[0, -1], torch.from_numpy(action))  # the newest action is last
-    assert act[0, :3].sum() == 0
+    assert torch.equal(act[0, :3], torch.from_numpy(acts[:3]))  # the older context actions keep their order
 
     cond, up_act = calls["up"][0]
     assert up_act is None and cond.shape == (1, 2, 3, 150, 280)
     assert torch.equal(cond[0, 0], prev_full)  # previous full-res frame first
     expected = torch.nn.functional.interpolate(world.low_res[None], scale_factor=5, mode="bicubic")[0]
     torch.testing.assert_close(cond[0, 1], expected)  # then the bicubic of the new low-res frame
+
+    action2 = idle(cfg).copy()
+    action2[1] = 1.0
+    world.step(action2)
+    obs2, act2 = calls["den"][1]
+    assert torch.equal(obs2[0, :3], frames[1:])  # the context window rolled by one frame
+    assert torch.equal(act2[0, :2], torch.from_numpy(acts[1:3]))
+    assert torch.equal(act2[0, 2], torch.from_numpy(action)) and torch.equal(act2[0, 3], torch.from_numpy(action2))
 
 
 def test_benchmark_notes_what_is_excluded(agent, cfg, tmp_path) -> None:
