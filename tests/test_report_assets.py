@@ -39,6 +39,8 @@ MACRO_NAMES = {
     "TBDupsVone",
     "TBDupsBicubic",
     "TBDfps",
+    "TBDfpsgpu",
+    "TBDhTwoCondition",
 }
 TABLES = ("dataset", "label_accuracy", "h1", "h2", "carried", "play_fps")
 
@@ -111,37 +113,67 @@ H1_SCRIPTS = (
 )
 
 
-def _h1_model(r: float, slope: float, sign: float, drift: float) -> dict[str, Any]:
-    def axis() -> dict[str, Any]:
-        return {"n": 100, "pearson_r": r, "slope": slope, "intercept": 0.0, "sign_accuracy": sign, "n_nonzero": 90}
+def _h1_model(
+    yaw: tuple[float, float, float], pitch: tuple[float, float, float], drift: float, lowres_shift: float = 0.1
+) -> dict[str, Any]:
+    """One model of ``results``: ``yaw`` and ``pitch`` are ``(pearson_r, slope, sign_accuracy)``; lowres differs."""
 
-    per_bin = []
-    for name, kind, yaw, pitch in H1_SCRIPTS:
-        per_bin.append(
+    def axis(v: tuple[float, float, float], shift: float = 0.0) -> dict[str, Any]:
+        r, slope, sign = v
+        return {
+            "n": 100,
+            "pearson_r": r - shift,
+            "slope": slope - shift,
+            "intercept": 0.0,
+            "sign_accuracy": sign - shift,
+            "n_nonzero": 90,
+        }
+
+    def res(shift: float) -> dict[str, Any]:
+        per_bin = []
+        for name, kind, cyaw, cpitch in H1_SCRIPTS:
+            sy, sp = yaw[1] - shift, pitch[1] - shift
+            per_bin.append(
+                {
+                    "script": name,
+                    "kind": kind,
+                    "commanded_yaw_deg": cyaw,
+                    "commanded_pitch_deg": cpitch,
+                    "n_contexts": 5,
+                    "yaw": {"mean": sy * cyaw, "ci_lo": sy * cyaw - 0.05, "ci_hi": sy * cyaw + 0.05},
+                    "pitch": {"mean": sp * cpitch, "ci_lo": sp * cpitch - 0.05, "ci_hi": sp * cpitch + 0.05},
+                }
+            )
+        points = [
             {
                 "script": name,
-                "kind": kind,
-                "commanded_yaw_deg": yaw,
-                "commanded_pitch_deg": pitch,
-                "n_contexts": 5,
-                "yaw": {"mean": slope * yaw, "ci_lo": slope * yaw - 0.05, "ci_hi": slope * yaw + 0.05},
-                "pitch": {"mean": slope * pitch, "ci_lo": slope * pitch - 0.05, "ci_hi": slope * pitch + 0.05},
+                "context": c,
+                "commanded_yaw_deg": cyaw,
+                "commanded_pitch_deg": cpitch,
+                "est_yaw_deg": (yaw[1] - shift) * cyaw + 0.01 * c,
+                "est_pitch_deg": None if kind == "yaw" else (pitch[1] - shift) * cpitch,
+                "n_pairs": 28,
             }
-        )
-    fullres = {
-        "estimator": "phasecorr",
-        "yaw": axis(),
-        "pitch": axis(),
-        "per_bin": per_bin,
-        "noop_drift": {"mean_abs_dyaw_deg": {"mean": drift, "ci_lo": 0.0, "ci_hi": 1.0}},
-        "ws_divergence": {},
-    }
-    return {"fullres": fullres, "lowres": fullres}
+            for name, kind, cyaw, cpitch in H1_SCRIPTS
+            for c in range(3)
+        ]
+        return {
+            "estimator": "phasecorr",
+            "yaw": axis(yaw, shift),
+            "pitch": axis(pitch, shift),
+            "per_bin": per_bin,
+            "noop_drift": {"mean_abs_dyaw_deg": {"mean": drift + 10 * shift, "ci_lo": 0.0, "ci_hi": 1.0}},
+            "ws_divergence": {},
+            "scatter": {"unit": "per (context, script) mean over the in-stats frame pairs", "points": points},
+        }
+
+    return {"fullres": res(0.0), "lowres": res(lowres_shift)}
 
 
 def make_h1() -> dict[str, Any]:
-    """``h1/summary.json`` schema (module docstring of h1_controllability)."""
+    """``h1/summary.json`` schema (module docstring of h1_controllability). Yaw and pitch, full and low res all differ."""
     fit = {"n": 90, "r": 0.9312, "slope_px_per_deg": 2.6, "slope_deg_per_px": 0.38461, "passed": True}
+    pitch_fit = dict(fit, r=0.5123, slope_deg_per_px=0.77777)
     return {
         "schema_version": 1,
         "config": {"estimator": "phasecorr"},
@@ -150,13 +182,17 @@ def make_h1() -> dict[str, Any]:
             "threshold_r": 0.8,
             "passed": True,
             "resolutions": {
-                "150x280": {"available": True, "estimators": {"phasecorr": {"yaw": fit, "pitch": dict(fit, r=0.5)}}}
+                "150x280": {"available": True, "estimators": {"phasecorr": {"yaw": fit, "pitch": pitch_fit}}},
+                "30x56": {
+                    "available": True,
+                    "estimators": {"phasecorr": {"yaw": dict(fit, r=0.1111), "pitch": dict(pitch_fit, r=0.2222)}},
+                },
             },
         },
         "results": {
-            "shuffled": _h1_model(0.05, 0.02, 0.51, 0.01),
-            "v1": _h1_model(0.1, 0.0, 0.5, 0.02),
-            "v2": _h1_model(0.8765, 0.904, 0.9731, 0.0421),
+            "shuffled": _h1_model((-0.0123, 0.02, 0.51), (0.04, 0.03, 0.52), 0.01),
+            "v1": _h1_model((0.1, 0.0, 0.5), (0.09, 0.01, 0.49), 0.02),
+            "v2": _h1_model((0.8765, 0.904, 0.9731), (0.6123, 1.1, 0.8123), 0.0421),
         },
     }
 
@@ -177,8 +213,8 @@ def make_h2() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "results": {
-            "v2": {"single": cond((0.2, 0.7), (0.15, 0.8)), "rollout": cond((0.4, 0.5), (0.3, 0.6))},
-            "v1": {"single": cond((0.25, 0.65), (0.18, 0.75)), "rollout": cond((0.38, 0.55), (0.35, 0.58))},
+            "v2": {"single": cond((0.2, 0.65), (0.15, 0.75)), "rollout": cond((0.4, 0.5), (0.3, 0.6))},
+            "v1": {"single": cond((0.25, 0.7), (0.18, 0.8)), "rollout": cond((0.38, 0.55), (0.35, 0.58))},
         },
     }
 
@@ -330,19 +366,60 @@ def test_label_accuracy_table(results_dir: Path, tmp_path: Path) -> None:
     assert "weapon switch & 0 & 0 & -- & 90" in tex  # an unscored group is shown, not dropped
 
 
-def test_h1_table_bolds_best_per_column() -> None:
+def h1_cells(tex: str) -> dict[str, list[str]]:
+    """Model -> its eight cells."""
+    return {ln.split(" & ")[0]: ln.removesuffix(" \\\\").split(" & ") for ln in rows(tex)[2:]}
+
+
+def test_h1_table_exact_cells_and_null_controls_never_bold() -> None:
     tex = latex.h1_table(make_h1())
     assert tex is not None
-    body = {ln.split(" & ")[0]: ln for ln in rows(tex)[2:]}
+    body = h1_cells(tex)
     assert list(body) == ["v2", "v1", "shuffled"]  # report order, not alphabetical
-    assert all(ln.count("&") == 7 for ln in body.values())
-    v2 = body["v2"].split(" & ")
-    assert v2[1] == "\\textbf{0.88}"  # best r
-    assert v2[2] == "\\textbf{0.90}"  # slope closest to 1
-    assert v2[3] == "\\textbf{97.3}"  # best sign accuracy
-    assert "\\textbf" not in body["v1"].split(" & ")[1]
-    assert body["shuffled"].split(" & ")[7].startswith("\\textbf{0.010}")  # lowest drift
+    # Yaw and pitch differ in the fixture, so a swapped key shows up here.
+    assert body["v2"] == [
+        "v2",
+        *("\\textbf{0.88}", "\\textbf{0.90}", "\\textbf{97.3}"),
+        *("\\textbf{0.61}", "\\textbf{1.10}", "\\textbf{81.2}"),
+        "\\textbf{0.042}",
+    ]
+    assert body["v1"] == ["v1", "0.10", "0.00", "50.0", "0.09", "0.01", "49.0", "0.020"]
+    assert body["shuffled"] == ["shuffled", "\\ensuremath{-}0.01", "0.02", "51.0", "0.04", "0.03", "52.0", "0.010"]
+    assert "\\textbf" not in body["v1"] and "\\textbf" not in "".join(body["shuffled"])  # lower drift than v2
+    assert "% Bold marks the best controllable model per column; null controls (v1, shuffled) are never bold." in tex
     assert "\\cmidrule" in tex and "\\multicolumn{3}{c}{Yaw}" in tex
+    assert "no-op yaw" in tex and "drift ($^\\circ$/frame)" in tex
+
+
+def test_h1_table_best_is_not_always_the_first_row() -> None:
+    summary = make_h1()
+    summary["results"]["alt"] = _h1_model((0.95, 0.7, 0.99), (0.9, 0.7, 0.7), 0.001)
+    summary["results"]["v2_final"] = _h1_model((0.5, 0.95, 0.6), (0.99, 0.95, 0.6), 0.5)
+    tex = latex.h1_table(summary)
+    assert tex is not None
+    body = h1_cells(tex)
+    assert list(body) == ["v2", "v1", "shuffled", "alt", "v2\\_final"]
+    bold = {m: [i for i, c in enumerate(cells) if "\\textbf" in c] for m, cells in body.items()}
+    # columns: 1 yaw r, 2 yaw slope, 3 yaw sign, 4 pitch r, 5 pitch slope, 6 pitch sign, 7 drift
+    assert bold["v2"] == [6]  # only pitch sign accuracy 81.2 is not beaten... by alt (0.7) or v2_final (0.9)? see below
+    assert bold["alt"] == [1, 3, 7]  # yaw r, yaw sign, drift
+    assert bold["v2\\_final"] == [2, 4, 5]  # slope 0.95 beats 1.10 and 0.70; pitch r 0.99; pitch slope 0.95
+    assert "\\textbf{1.10}" not in tex and "\\textbf{0.70}" not in tex
+
+
+def test_h1_slope_distance_ties_in_exact_decimal() -> None:
+    summary = make_h1()
+    summary["results"]["alt"] = _h1_model((0.1, 1.1, 0.1), (0.1, 1.0, 0.1), 0.5)
+    summary["results"]["v2"] = _h1_model((0.1, 0.9, 0.1), (0.1, 1.0, 0.1), 0.5)
+    body = h1_cells(latex.h1_table(summary))
+    assert body["v2"][2] == "\\textbf{0.90}" and body["alt"][2] == "\\textbf{1.10}"  # |0.9-1| == |1.1-1|
+
+
+def test_best_uses_exact_decimals() -> None:
+    assert latex._best([0.9, 1.1, 0.7], 2, lambda v: abs(v - 1)) == {0, 1}
+    assert latex._best([0.1 + 0.2, 0.3], 2, lambda v: v) == {0, 1}  # equal once displayed
+    assert latex._best([0.5, None], 2, lambda v: v) == set()
+    assert latex._best([0.5, None], 2, lambda v: v, min_count=1) == {0}
 
 
 def test_h1_table_missing_keys_do_not_crash() -> None:
@@ -359,8 +436,9 @@ def test_h2_table_blocks_and_bold() -> None:
     assert tex.count("\\multicolumn{5}{l}") == 2
     single = tex.split("Autoregressive")[0]
     assert "\\multicolumn{2}{c}{LPIPS}" in tex
-    assert "v2 & \\textbf{0.200} & \\textbf{0.150} & \\textbf{0.700} & \\textbf{0.800}" in single
-    assert "v1 & 0.250 & 0.180 & 0.650 & 0.750" in single
+    # LPIPS and SSIM are won by different models.
+    assert "v2 & \\textbf{0.200} & \\textbf{0.150} & 0.650 & 0.750" in single
+    assert "v1 & 0.250 & 0.180 & \\textbf{0.700} & \\textbf{0.800}" in single
     assert latex.h2_table({"results": {"v2": {"single": {"smoke": {}}}}}) is not None  # sparse input is tolerated
     assert latex.h2_table({}) is None
 
@@ -411,7 +489,7 @@ def test_macros_defined_with_formatting(results_dir: Path, tmp_path: Path) -> No
         "TBDdegperpx": "0.385$^\\circ$/px",
         "TBDhOneRvTwo": "0.88",
         "TBDhOneRvOne": "0.10",
-        "TBDhOneRshuf": "0.05",
+        "TBDhOneRshuf": "\\ensuremath{-}0.01",  # a negative r must also work inside $r=...$
         "TBDhOneSignVtwo": "97.3\\%",
         "TBDhTwoSmoke": "0.200",
         "TBDhTwoStatic": "0.150",
@@ -422,6 +500,8 @@ def test_macros_defined_with_formatting(results_dir: Path, tmp_path: Path) -> No
         "TBDupsVone": "0.095",
         "TBDupsBicubic": "0.210",
         "TBDfps": "12.0",
+        "TBDfpsgpu": "NVIDIA GeForce RTX 3060",
+        "TBDhTwoCondition": "single-step",
     }
     assert m == expected
     text = (out / "tables" / "macros.tex").read_text()
@@ -469,11 +549,117 @@ def test_stats_override(results_dir: Path, tmp_path: Path) -> None:
 
 def test_number_formatting() -> None:
     assert latex._num(-0.001, 2) == "0.00"
-    assert latex._num(-0.5, 2) == "$-$0.50"
+    assert latex._num(-0.5, 2) == "\\ensuremath{-}0.50"
     assert latex._num(float("nan"), 2) == "--"
     assert latex._num(None, 2) == "--"
     assert latex._int(1234567) == "1{,}234{,}567"
     assert latex._pct(0.9731) == "97.3"
+
+
+# --- review fixes -----------------------------------------------------------------------------------------------------
+
+
+def test_tex_escape_covers_every_special_character() -> None:
+    assert latex._tex_escape("v2_final") == "v2\\_final"
+    assert latex._tex_escape("a\\b_c#d%e&f$g{h}i~j^k") == (
+        "a\\textbackslash{}b\\_c\\#d\\%e\\&f\\$g\\{h\\}i\\textasciitilde{}j\\textasciicircum{}k"
+    )
+    assert latex._tex_escape("two\nlines") == "two lines"  # never breaks out of a % comment line
+
+
+def test_free_text_cells_are_escaped_in_every_table() -> None:
+    odd = "v2_final#1"
+    h1 = make_h1()
+    h1["results"][odd] = h1["results"]["v2"]
+    h2 = make_h2()
+    h2["results"][odd] = h2["results"]["v2"]
+    carried = make_carried()
+    carried["fid"]["rows"].append({"model": odd, "dataset": "x_test", "action_source": "a_b", "fid": 1.0})
+    stats = make_stats()
+    stats["by_kind"]["we_ird"] = stats["by_kind"]["dm"]
+    acc = make_label_accuracy()
+    acc["groups"]["my_group"] = acc["groups"]["wasd"]
+    fps = make_fps()
+    fps["gpu"] = "RTX_3060 #1"
+    for tex in (
+        latex.h1_table(h1),
+        latex.h2_table(h2),
+        latex.carried_table(carried),
+        latex.dataset_table(stats),
+        latex.label_accuracy_table(acc),
+        latex.play_fps_table(fps),
+    ):
+        assert tex is not None
+        body = "\n".join(ln for ln in tex.splitlines() if not ln.startswith("%"))
+        assert not re.search(r"(?<!\\)[_#]", body)  # no unescaped _ or # outside math
+    assert "v2\\_final\\#1" in latex.h1_table(h1)
+    assert "x\\_test" in latex.carried_table(carried)
+    assert "my\\_group" in latex.label_accuracy_table(acc)
+    assert "RTX\\_3060 \\#1" in latex.play_fps_table(fps)
+
+
+def test_macro_values_are_escaped_and_negative_r_is_math_safe(results_dir: Path, tmp_path: Path) -> None:
+    fps = make_fps() | {"gpu": "RTX_3060"}
+    (results_dir / "play_fps.json").write_text(json.dumps(fps))
+    out = tmp_path / "report"
+    latex.build_tables(results_dir, out)
+    m = macros(out)
+    assert m["TBDfpsgpu"] == "RTX\\_3060"
+    assert m["TBDhOneRshuf"] == "\\ensuremath{-}0.01"
+
+
+def test_headline_macros_and_notes(results_dir: Path, tmp_path: Path) -> None:
+    out = tmp_path / "report"
+    latex.build_tables(results_dir, out)
+    m = macros(out)
+    assert m["TBDfpsgpu"] == "NVIDIA GeForce RTX 3060"
+    assert m["TBDhTwoCondition"] == "single-step"
+    text = (out / "tables" / "macros.tex").read_text()
+    assert "FELL BACK" not in text
+    assert "TBDhTwoSmoke, TBDhTwoStatic: the 'single' condition" in text
+    # fp32 headline did not run: fall back to bf16 and say so.
+    fps = make_fps()
+    fps["results"]["upsampler_1step_fp32"] = {"status": "skipped", "reason": "x"}
+    (results_dir / "play_fps.json").write_text(json.dumps(fps))
+    latex.build_tables(results_dir, out)
+    assert macros(out)["TBDfps"] == "18.0"
+    assert "TBDfps: FELL BACK to upsampler_1step_bf16" in (out / "tables" / "macros.tex").read_text()
+    # no gpu (CPU run): the macro is left undefined.
+    (results_dir / "play_fps.json").write_text(json.dumps(make_fps() | {"gpu": None}))
+    latex.build_tables(results_dir, out)
+    assert "TBDfpsgpu" not in macros(out)
+
+
+def test_labelmin_ignores_groups_without_judged_rows() -> None:
+    acc = make_label_accuracy()
+    acc["groups"]["switch"] = {"n": 0, "correct": 0, "accuracy": 0.0, "min_accuracy": 0.9}  # malformed but n == 0
+    assert latex._label_min(acc) == 0.9  # crouch 9/10, not the unjudged 0.0
+    assert latex._label_min({"groups": {}}) is None
+
+
+def test_model_colour_is_stable_across_subsets() -> None:
+    assert latex._model_color("v2") == latex.COLORS[0]
+    assert latex._model_color("v1") == latex.COLORS[1]
+    assert latex._model_color("shuffled") == latex.COLORS[2]
+    assert latex._model_color("extra") == latex._model_color("extra") not in latex.COLORS[:3]
+
+
+def test_scatter_prefers_summary_points_and_falls_back_to_csv(results_dir: Path, tmp_path: Path) -> None:
+    h1 = json.loads((results_dir / "h1" / "summary.json").read_text())
+    pts = latex._scatter_from_summary(h1, "v2")
+    assert pts is not None and len(pts["cmd_yaw_deg"]) == 12
+    assert np.isnan(pts["est_pitch_deg"][0]) and not np.isnan(pts["est_pitch_deg"][-1])  # null est stays NaN
+    assert latex._scatter_from_summary(h1, "nope") is None
+    for csv_file in (results_dir / "h1").glob("*_frames.csv"):
+        csv_file.unlink()
+    assert latex.fig_h1_scatter(h1, results_dir / "h1", tmp_path / "from_json.pdf")  # no CSVs needed
+    for m in h1["results"].values():
+        del m["fullres"]["scatter"]
+    assert not latex.fig_h1_scatter(h1, results_dir / "h1", tmp_path / "none.pdf")
+    write_frames_csv(results_dir / "h1" / "v2_frames.csv", 0.9)
+    assert latex.fig_h1_scatter(h1, results_dir / "h1", tmp_path / "from_csv.pdf")
+    pts = latex._read_frames_csv(results_dir / "h1" / "v2_frames.csv")
+    assert pts is not None and len(pts["cmd_yaw_deg"]) == 3  # the in_stats == 0 row is dropped
 
 
 # --- figures ---------------------------------------------------------------------------------------------------------
@@ -497,6 +683,21 @@ def test_figure_skipped_when_input_missing_and_stale_removed(results_dir: Path, 
     assert not (
         out / "figures" / "rollout_strip.pdf"
     ).exists()  # stale figure removed, the report shows its placeholder
+
+
+def test_stale_figure_removal_is_announced_and_empty_results_warn(
+    results_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "report"
+    latex.build_figures(results_dir, out)
+    capsys.readouterr()
+    (results_dir / "carried" / "rollout_strip_00.png").unlink()
+    latex.build_figures(results_dir, out)
+    assert "removed stale figures/rollout_strip.pdf (missing carried/rollout_strip_NN.png)" in capsys.readouterr().out
+    latex.build_figures(results_dir, out)
+    assert "removed stale" not in capsys.readouterr().out  # nothing left to remove
+    latex.run(tmp_path / "nothing", tmp_path / "report2")
+    assert "no recognised result files in" in capsys.readouterr().err
 
 
 def test_h2_triptych_prefers_producer_pdf(results_dir: Path, tmp_path: Path) -> None:
@@ -572,6 +773,16 @@ def test_report_compiles(complete: bool, results_dir: Path, tmp_path: Path, repo
     report = _report_sources(repo_root, tmp_path)
     if report is None:
         pytest.skip("no report draft (feat/37-report) to compile")
+    if complete:  # a model name with an underscore, and the fixture's negative shuffled r (in the abstract's math)
+        h1 = json.loads((results_dir / "h1" / "summary.json").read_text())
+        h1["results"]["v2_final"] = h1["results"]["v2"]
+        (results_dir / "h1" / "summary.json").write_text(json.dumps(h1))
+        h2 = make_h2()
+        h2["results"]["v2_final"] = h2["results"]["v2"]
+        (results_dir / "h2" / "summary.json").write_text(json.dumps(h2))
+        carried = make_carried()
+        carried["fid"]["rows"].append({"model": "v2_final", "dataset": "v2_test", "action_source": "gt", "fid": 50.0})
+        (results_dir / "carried" / "summary.json").write_text(json.dumps(carried))
     latex.run(results_dir if complete else tmp_path / "nothing", report)
     proc = subprocess.run(
         ["latexmk", "-pdf", "-interaction=nonstopmode", "-halt-on-error", "main.tex"],
@@ -585,3 +796,8 @@ def test_report_compiles(complete: bool, results_dir: Path, tmp_path: Path, repo
     assert proc.returncode == 0, proc.stdout[-2000:]
     assert "Undefined control sequence" not in log
     assert (report / "main.pdf").exists()
+    if complete and shutil.which("pdftotext"):
+        text = subprocess.run(
+            ["pdftotext", str(report / "main.pdf"), "-"], capture_output=True, text=True, check=False
+        ).stdout
+        assert re.search(r"r\s*=\s*[\u2212-]\s*0\.01", text)  # the negative r is typeset in math mode

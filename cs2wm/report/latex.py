@@ -29,16 +29,30 @@ import json
 import math
 import os
 import re
+import sys
+import zlib
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 TABLE_NAMES = ("dataset", "label_accuracy", "h1", "h2", "carried", "play_fps")
+SPLITS = ("train", "test")
 FIGURE_NAMES = ("dataset_stats", "h1_scatter", "h1_per_bin", "h2_triptych", "loss_curves", "rollout_strip")
+
+# What each figure is built from, for the message when it is removed.
+FIGURE_INPUTS = {
+    "dataset_stats": "dataset_stats.json",
+    "h1_scatter": "h1/summary.json scatter data or h1/<model>_frames.csv",
+    "h1_per_bin": "h1/summary.json",
+    "h2_triptych": "h2/<model>_triptychs.pdf or .png",
+    "loss_curves": "carried/summary.json",
+    "rollout_strip": "carried/rollout_strip_NN.png",
+}
 
 # Input file (relative to the results directory) and the issue that produces it.
 STATS_FILE, STATS_ISSUE = "dataset_stats.json", "#25"
@@ -50,6 +64,8 @@ UPS_FILE, UPS_ISSUE = "upsampler_check.json", "#27"
 FPS_FILE, FPS_ISSUE = "play_fps.json", "#28"
 
 MODEL_ORDER = ("v2", "v1", "shuffled")  # the report's order; any other model follows alphabetically
+# Null controls of H1: never bold, so a low-drift or high-r control cannot look like a result.
+H1_NULL_MODELS = ("v1", "shuffled")
 # Headline configuration of the play benchmark: the play loop's default (upsampler, 1 denoising step, fp32), then bf16.
 FPS_HEADLINE = ("upsampler_1step_fp32", "upsampler_1step_bf16")
 # Condition of the H2 macros: teacher-forced single-step predictions.
@@ -58,6 +74,7 @@ MISSING = "--"
 SOURCE_DATE_EPOCH = "0"
 
 COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9")
+SPLIT_COLORS = ("#CC79A7", "#E69F00")  # train, test of the dataset figure; distinct from the model colours
 FIG_FONT_SIZE = 7
 
 
@@ -91,14 +108,14 @@ def _finite(x: Any) -> float | None:
 
 
 def _num(x: Any, digits: int) -> str:
-    """Fixed-point text; ``--`` for a missing value; a typographic minus; never ``-0.00``."""
+    """Fixed-point text; ``--`` for a missing value; a minus that works in text and math mode; never ``-0.00``."""
     v = _finite(x)
     if v is None:
         return MISSING
     s = f"{v:.{digits}f}"
     if float(s) == 0:
         s = s.lstrip("-")
-    return "$-$" + s[1:] if s.startswith("-") else s
+    return "\\ensuremath{-}" + s[1:] if s.startswith("-") else s
 
 
 def _int(x: Any) -> str:
@@ -119,6 +136,32 @@ def _percent(x: Any) -> float | None:
     return None if v is None else 100 * v
 
 
+_TEX_SPECIAL = {
+    "\\": "\\textbackslash{}",
+    "_": "\\_",
+    "#": "\\#",
+    "%": "\\%",
+    "&": "\\&",
+    "$": "\\$",
+    "{": "\\{",
+    "}": "\\}",
+    "~": "\\textasciitilde{}",
+    "^": "\\textasciicircum{}",
+}
+
+
+def _tex_escape(text: Any) -> str:
+    """Escape free text (model, dataset, group and script names) for a LaTeX table cell or comment line."""
+    return re.sub(r"[\\_#%&${}~^]", lambda m: _TEX_SPECIAL[m[0]], " ".join(str(text).split()))
+
+
+def _model_color(model: str) -> str:
+    """A model's colour from its place in the canonical order, so it is the same in every figure."""
+    if model in MODEL_ORDER:
+        return COLORS[MODEL_ORDER.index(model)]
+    return COLORS[len(MODEL_ORDER) + zlib.crc32(model.encode()) % (len(COLORS) - len(MODEL_ORDER))]
+
+
 def _bold(text: str, on: bool) -> str:
     return f"\\textbf{{{text}}}" if on else text
 
@@ -129,16 +172,19 @@ def _ordered(names: Sequence[str]) -> list[str]:
     return known + sorted(n for n in names if n not in MODEL_ORDER)
 
 
-def _best(values: Sequence[float | None], digits: int, pick: Callable[[float], float]) -> set[int]:
-    """Indices holding the best value, judged on the displayed (rounded) value; needs at least two values.
+def _best(
+    values: Sequence[float | None], digits: int, pick: Callable[[Decimal], Decimal], min_count: int = 2
+) -> set[int]:
+    """Indices holding the best value, judged on the displayed value in exact decimal.
 
     Args:
-        values: One value per row (None where missing).
-        digits: Decimals shown, so ties in the table are all bold.
+        values: One value per row (None where missing or not eligible).
+        digits: Decimals shown, so ties in the table are all bold (0.90 and 1.10 are equally far from 1).
         pick: Maps a value to a score; the lowest score wins (``-v`` for larger-is-better, ``abs(v - 1)`` for slopes).
+        min_count: Fewest values that make a comparison; below it nothing is bold.
     """
-    scored = {i: pick(round(v, digits)) for i, v in enumerate(values) if v is not None}
-    if len(scored) < 2:
+    scored = {i: pick(Decimal(f"{v:.{digits}f}")) for i, v in enumerate(values) if v is not None}
+    if len(scored) < min_count:
         return set()
     top = min(scored.values())
     return {i for i, s in scored.items() if s == top}
@@ -190,8 +236,8 @@ def dataset_table(stats: dict[str, Any]) -> str | None:
             lines.append(
                 _row(
                     [
-                        f"\\texttt{{{kind}}}",
-                        split,
+                        f"\\texttt{{{_tex_escape(kind)}}}",
+                        _tex_escape(split),
                         _int(v.get("episodes")),
                         _int(v.get("frames")),
                         _num(v.get("hours"), 1),
@@ -233,7 +279,7 @@ def label_accuracy_table(acc: dict[str, Any]) -> str | None:
         return None
     lines = [_row(["Group", "Judged", "Correct", "Acc.\\ (\\%)", "Req.\\ (\\%)"]), "\\midrule"]
     for name, g in groups.items():
-        label = GROUP_LABELS.get(name, name.replace("_", " "))
+        label = GROUP_LABELS.get(name) or _tex_escape(name)
         lines.append(
             _row(
                 [
@@ -255,7 +301,8 @@ def _h1_axis(summary: dict[str, Any], model: str, axis: str) -> dict[str, Any]:
 def h1_table(summary: dict[str, Any]) -> str | None:
     """Yaw and pitch Pearson r, slope and sign accuracy per model, plus no-op yaw drift (``h1/summary.json``, 150x280).
 
-    The best model per column is bold: highest r and sign accuracy, slope closest to 1, lowest drift.
+    The best model per column is bold among the controllable models only (``H1_NULL_MODELS`` are never bold):
+    highest r and sign accuracy, slope closest to 1, lowest drift.
 
     Args:
         summary: ``run_h1`` summary.
@@ -267,7 +314,7 @@ def h1_table(summary: dict[str, Any]) -> str | None:
     if not isinstance(results, dict) or not results:
         return None
     models = _ordered(list(results))
-    cols: list[tuple[str, str, int, Callable[[float], float], Callable[[str], Any]]] = []
+    cols: list[tuple[str, str, int, Callable[[Decimal], Decimal], Callable[[str], Any]]] = []
     for axis in ("yaw", "pitch"):
         cols += [
             (axis, "r", 2, lambda v: -v, lambda m, a=axis: _finite(_h1_axis(summary, m, a).get("pearson_r"))),
@@ -290,17 +337,29 @@ def h1_table(summary: dict[str, Any]) -> str | None:
         )
     )
     table = [[col[4](m) for col in cols] for m in models]
-    winners = [_best([row[j] for row in table], cols[j][2], cols[j][3]) for j in range(len(cols))]
+    controls = [m for m in models if m in H1_NULL_MODELS]
+    winners = [
+        _best(
+            [None if m in H1_NULL_MODELS else row[j] for m, row in zip(models, table)],
+            cols[j][2],
+            cols[j][3],
+            min_count=1,
+        )
+        for j in range(len(cols))
+    ]
     lines = [
-        "& \\multicolumn{3}{c}{Yaw} & \\multicolumn{3}{c}{Pitch} & \\\\",
+        "& \\multicolumn{3}{c}{Yaw} & \\multicolumn{3}{c}{Pitch} & no-op yaw \\\\",
         "\\cmidrule(lr){2-4}\\cmidrule(lr){5-7}",
-        _row(["Model", "$r$", "slope", "sign (\\%)", "$r$", "slope", "sign (\\%)", "drift ($^\\circ$)"]),
+        _row(["Model", "$r$", "slope", "sign (\\%)", "$r$", "slope", "sign (\\%)", "drift ($^\\circ$/frame)"]),
         "\\midrule",
     ]
     for i, m in enumerate(models):
         cells = [_num(table[i][j], cols[j][2]) for j in range(len(cols))]
-        lines.append(_row([m, *(_bold(c, i in winners[j]) for j, c in enumerate(cells))]))
-    return _tabular(
+        lines.append(_row([_tex_escape(m), *(_bold(c, i in winners[j]) for j, c in enumerate(cells))]))
+    note = ""
+    if controls:
+        note = f"% Bold marks the best controllable model per column; null controls ({', '.join(map(_tex_escape, controls))}) are never bold.\n"
+    return note + _tabular(
         "@{}l@{\\hspace{5pt}}r@{\\hspace{3pt}}r@{\\hspace{3pt}}r@{\\hspace{6pt}}r@{\\hspace{3pt}}r@{\\hspace{3pt}}r@{\\hspace{6pt}}r@{}",
         lines,
     )
@@ -340,9 +399,11 @@ def h2_table(summary: dict[str, Any]) -> str | None:
             _best([row[j] for row in values], 3, (lambda v: v) if cols[j][1] == "lpips" else (lambda v: -v))
             for j in range(len(cols))
         ]
-        lines += ["\\midrule", f"\\multicolumn{{5}}{{l}}{{\\emph{{{titles.get(cond, cond)}}}}} \\\\"]
+        lines += ["\\midrule", f"\\multicolumn{{5}}{{l}}{{\\emph{{{titles.get(cond) or _tex_escape(cond)}}}}} \\\\"]
         for i, m in enumerate(present):
-            lines.append(_row([m, *(_bold(_num(values[i][j], 3), i in winners[j]) for j in range(len(cols)))]))
+            lines.append(
+                _row([_tex_escape(m), *(_bold(_num(values[i][j], 3), i in winners[j]) for j in range(len(cols)))])
+            )
     return _tabular("@{}lrrrr@{}", lines)
 
 
@@ -376,9 +437,9 @@ def carried_table(summary: dict[str, Any]) -> str | None:
         lines.append(
             _row(
                 [
-                    str(r.get("model", MISSING)),
-                    set_names.get(r.get("dataset"), str(r.get("dataset", MISSING)).replace("_", " ")),
-                    source_names.get(source, str(source if source is not None else MISSING)),
+                    _tex_escape(r.get("model", MISSING)),
+                    set_names.get(r.get("dataset")) or _tex_escape(r.get("dataset", MISSING)),
+                    source_names.get(source) or _tex_escape(source if source is not None else MISSING),
                     fid,
                 ]
             )
@@ -421,7 +482,7 @@ def play_fps_table(report: dict[str, Any]) -> str | None:
             _row([label, *(_bold(_num(configs[c].get(p), 1), i in winners[j]) for j, p in enumerate(precisions))])
         )
     gpu = _get(report, "gpu") or _get(report, "device")
-    comment = f"% Measured on: {gpu}.\n" if isinstance(gpu, str) else ""
+    comment = f"% Measured on: {_tex_escape(gpu)}.\n" if isinstance(gpu, str) else ""
     return comment + _tabular("lrr", lines)
 
 
@@ -498,17 +559,34 @@ def _fid_row(carried: dict[str, Any], model: str, dataset: str) -> Any:
     return _finite(rows[0].get("fid")) if rows else None
 
 
-def _fps_headline(fps: dict[str, Any]) -> float | None:
+def _fps_headline(fps: dict[str, Any]) -> tuple[str, float] | None:
+    """The headline configuration's name and fps: the first of ``FPS_HEADLINE`` that ran."""
     for name in FPS_HEADLINE:
-        if _get(fps, "results", name, "status") == "ok":
-            return _finite(_get(fps, "results", name, "fps"))
+        value = _finite(_get(fps, "results", name, "fps")) if _get(fps, "results", name, "status") == "ok" else None
+        if value is not None:
+            return name, value
     return None
 
 
 def _label_min(label: dict[str, Any]) -> float | None:
-    accs = [_finite(_get(g, "accuracy")) for g in (_get(label, "groups") or {}).values()]
+    """Lowest accuracy over the groups that were judged (``n > 0``; unscored groups do not count)."""
+    groups = _get(label, "groups")
+    accs = [
+        _finite(_get(g, "accuracy"))
+        for g in (groups.values() if isinstance(groups, dict) else ())
+        if (_finite(_get(g, "n")) or 0) > 0
+    ]
     accs = [a for a in accs if a is not None]
     return min(accs) if accs else None
+
+
+H2_CONDITION_NAMES = {"single": "single-step", "rollout": "rollout"}
+
+
+def _h2_condition(h2: dict[str, Any]) -> str:
+    name = H2_CONDITION_NAMES.get(H2_HEADLINE, H2_HEADLINE)
+    steps = _finite(_get(h2, "config", "rollout_steps"))
+    return f"{int(steps)}-step rollout" if H2_HEADLINE == "rollout" and steps else name
 
 
 # name, human-readable source, value builder (None -> undefined). The names are those of the report's placeholders.tex.
@@ -535,7 +613,7 @@ _MACROS: list[tuple[str, str, Callable[[Inputs], str | None]]] = [
     ),
     (
         "TBDlabelmin",
-        "label_accuracy.json min over groups.*.accuracy (percent)",
+        "label_accuracy.json min of groups.*.accuracy over the groups with n > 0 (percent)",
         lambda i: _opt(i.label, lambda s: _pct(_label_min(s))),
     ),
     (
@@ -616,7 +694,19 @@ _MACROS: list[tuple[str, str, Callable[[Inputs], str | None]]] = [
     (
         "TBDfps",
         "play_fps.json results.upsampler_1step_fp32.fps (else upsampler_1step_bf16)",
-        lambda i: _opt(i.fps, lambda s: _num(_fps_headline(s), 1)),
+        lambda i: _opt(i.fps, lambda s: _num((_fps_headline(s) or (None, None))[1], 1)),
+    ),
+    (
+        "TBDfpsgpu",
+        "play_fps.json gpu",
+        lambda i: _opt(
+            i.fps, lambda s: _tex_escape(s["gpu"]) if isinstance(s.get("gpu"), str) and s["gpu"] else MISSING
+        ),
+    ),
+    (
+        "TBDhTwoCondition",
+        f"constant H2_HEADLINE = {H2_HEADLINE!r} (the condition of TBDhTwoSmoke and TBDhTwoStatic)",
+        lambda i: _opt(i.h2, _h2_condition),
     ),
 ]
 
@@ -640,6 +730,21 @@ def _opt(data: dict[str, Any] | None, fn: Callable[[dict[str, Any]], str], suffi
     return None if value == MISSING else value + suffix
 
 
+def _macro_notes(inputs: Inputs) -> list[str]:
+    """Comment lines for macros whose value depends on a choice or a fallback."""
+    notes = [
+        f"%   TBDhTwoSmoke, TBDhTwoStatic: the {H2_HEADLINE!r} condition (see TBDhTwoCondition); the h2 table has both.",
+        f"%   TBDlabelmin: lowest accuracy over the label groups with n > 0, of {', '.join(LABEL_GROUPS_NOTE)}.",
+    ]
+    headline = _fps_headline(inputs.fps) if inputs.fps is not None else None
+    if headline is not None and headline[0] != FPS_HEADLINE[0]:
+        notes.append(f"%   TBDfps: FELL BACK to {headline[0]} because {FPS_HEADLINE[0]} did not run.")
+    return notes
+
+
+LABEL_GROUPS_NOTE = ("wasd", "jump", "crouch", "fire", "reload", "switch", "mouse_x_sign", "mouse_x_bin", "mouse_y")
+
+
 def build_macros(inputs: Inputs) -> str:
     """The text of ``tables/macros.tex``: a header listing every macro and its source, then the definitions.
 
@@ -661,6 +766,8 @@ def build_macros(inputs: Inputs) -> str:
         "%",
         "% Defined (macro: source):",
         *(f"%   \\{n}: {s}" for n, s, _ in defined),
+        "% Notes:",
+        *_macro_notes(inputs),
         "% Not defined (missing input):",
         *(f"%   \\{n}: {s}" for n, s in undefined),
         "% Not computable from any results JSON:",
@@ -723,7 +830,7 @@ def fig_dataset_stats(stats: dict[str, Any], path: Path) -> bool:
     Returns:
         Whether a figure was written (False if the statistics lack the label rates).
     """
-    splits = [s for s in ("train", "test") if isinstance(_get(stats, s, "label_rates"), dict)]
+    splits = [s for s in SPLITS if isinstance(_get(stats, s, "label_rates"), dict)]
     if not splits:
         return False
     with _reproducible_pdf() as plt:
@@ -733,7 +840,13 @@ def fig_dataset_stats(stats: dict[str, Any], path: Path) -> bool:
         width = 0.8 / len(splits)
         for i, split in enumerate(splits):
             rates = [_finite(stats[split]["label_rates"].get(n)) or 0.0 for n in names]
-            axes[0].bar(pos + (i - (len(splits) - 1) / 2) * width, rates, width, label=split, color=COLORS[i])
+            axes[0].bar(
+                pos + (i - (len(splits) - 1) / 2) * width,
+                rates,
+                width,
+                label=split,
+                color=SPLIT_COLORS[SPLITS.index(split)],
+            )
         axes[0].set_xticks(pos, names, rotation=60)
         axes[0].set_ylabel("fraction of frames")
         axes[0].set_title("Label rates")
@@ -746,7 +859,10 @@ def fig_dataset_stats(stats: dict[str, Any], path: Path) -> bool:
                 if len(counts) != len(bins):
                     continue
                 ax.bar(
-                    bins + (i - (len(splits) - 1) / 2) * width, counts / max(counts.sum(), 1), width, color=COLORS[i]
+                    bins + (i - (len(splits) - 1) / 2) * width,
+                    counts / max(counts.sum(), 1),
+                    width,
+                    color=SPLIT_COLORS[SPLITS.index(split)],
                 )
             ax.set_xticks(bins, [f"{float(k):g}" for k in hist], rotation=90)
             ax.set_yscale("log")
@@ -772,13 +888,33 @@ def _read_frames_csv(path: Path) -> dict[str, np.ndarray] | None:
     return {c: np.array(v) for c, v in out.items()} if out[cols[0]] else None
 
 
+def _scatter_from_summary(h1: dict[str, Any], model: str) -> dict[str, np.ndarray] | None:
+    """The compact scatter block ``results.<model>.fullres.scatter.points`` (per context and script means)."""
+    points = _get(h1, "results", model, "fullres", "scatter", "points")
+    if not isinstance(points, list) or not points:
+        return None
+    cols = ("cmd_yaw_deg", "cmd_pitch_deg", "est_yaw_deg", "est_pitch_deg")
+    keys = ("commanded_yaw_deg", "commanded_pitch_deg", "est_yaw_deg", "est_pitch_deg")
+    out = {c: [] for c in cols}
+    for pt in points:
+        for c, k in zip(cols, keys):
+            v = _finite(_get(pt, k))
+            out[c].append(math.nan if v is None else v)
+    return {c: np.array(v) for c, v in out.items()}
+
+
 def fig_h1_scatter(h1: dict[str, Any], h1_dir: Path, path: Path) -> bool:
-    """Commanded vs estimated rotation per generated frame pair, all models overlaid (``h1/<model>_frames.csv``).
+    """Commanded vs estimated rotation, all models overlaid.
+
+    Plots ``results.<model>.fullres.scatter.points`` of the summary (the mean over the in-stats frame pairs of every
+    context and script); if a model has none, falls back to its per-frame ``<model>_frames.csv`` (rows with
+    ``in_stats`` 1).
 
     Returns:
-        Whether a figure was written (False if no model has a frames CSV).
+        Whether a figure was written (False if no model has scatter data).
     """
-    data = {m: _read_frames_csv(h1_dir / f"{m}_frames.csv") for m in _ordered(list(_get(h1, "models") or {}))}
+    names = _ordered(sorted({*(_get(h1, "models") or {}), *(_get(h1, "results") or {})}))
+    data = {m: _scatter_from_summary(h1, m) or _read_frames_csv(h1_dir / f"{m}_frames.csv") for m in names}
     data = {m: d for m, d in data.items() if d is not None}
     if not data:
         return False
@@ -786,10 +922,12 @@ def fig_h1_scatter(h1: dict[str, Any], h1_dir: Path, path: Path) -> bool:
         fig, axes = plt.subplots(1, 2, figsize=(3.4, 2.0), constrained_layout=True)
         for ax, axis in zip(axes, ("yaw", "pitch")):
             lim = 0.0
-            for color, (m, d) in zip(COLORS, data.items()):
+            for m, d in data.items():
                 cmd, est = d[f"cmd_{axis}_deg"], d[f"est_{axis}_deg"]
                 ok = np.isfinite(cmd) & np.isfinite(est)
-                ax.scatter(cmd[ok], est[ok], s=1.5, alpha=0.15, color=color, linewidths=0, rasterized=True, label=m)
+                ax.scatter(
+                    cmd[ok], est[ok], s=2, alpha=0.4, color=_model_color(m), linewidths=0, rasterized=True, label=m
+                )
                 if ok.any():
                     lim = max(lim, float(np.abs(np.r_[cmd[ok], est[ok]]).max()))
             lim = max(lim * 1.05, 0.5)
@@ -834,12 +972,20 @@ def fig_h1_per_bin(h1: dict[str, Any], path: Path) -> bool:
         fig, axes = plt.subplots(1, 2, figsize=(3.4, 2.0), constrained_layout=True)
         for ax, axis in zip(axes, ("yaw", "pitch")):
             lim = 0.1
-            for color, (m, per_axis) in zip(COLORS, series.items()):
+            for m, per_axis in series.items():
                 if axis not in per_axis:
                     continue
                 x, y, lo, hi = (np.array(c) for c in zip(*per_axis[axis]))
                 ax.errorbar(
-                    x, y, yerr=np.vstack([y - lo, hi - y]), marker="o", ms=2, lw=0.8, capsize=1.5, color=color, label=m
+                    x,
+                    y,
+                    yerr=np.vstack([y - lo, hi - y]),
+                    marker="o",
+                    ms=2,
+                    lw=0.8,
+                    capsize=1.5,
+                    color=_model_color(m),
+                    label=m,
                 )
                 lim = max(lim, float(np.abs(np.r_[x, lo, hi]).max()))
             lim *= 1.1
@@ -911,8 +1057,8 @@ def fig_loss_curves(carried: dict[str, Any], path: Path) -> bool:
         return False
     with _reproducible_pdf() as plt:
         fig, ax = plt.subplots(figsize=(3.4, 2.2), constrained_layout=True)
-        for color, (name, x, y) in zip(COLORS, series):
-            ax.plot(x, y, marker="o", ms=2.5, lw=1, color=color, label=name)
+        for name, x, y in series:
+            ax.plot(x, y, marker="o", ms=2.5, lw=1, color=_model_color(name), label=name)
         ax.set_xlabel("epoch")
         ax.set_ylabel("test loss (denoiser MSE)")
         ax.legend(frameon=False)
@@ -1001,8 +1147,9 @@ def build_figures(results_dir: Path, out_dir: Path, stats: Path | None = None) -
         path = fig_dir / f"{name}.pdf"
         if makers[name](path):
             written.append(path)
-        else:
-            path.unlink(missing_ok=True)
+        elif path.exists():
+            path.unlink()
+            print(f"removed stale figures/{name}.pdf (missing {FIGURE_INPUTS[name]})")
     return written
 
 
@@ -1014,6 +1161,9 @@ def run(results_dir: Path, out_dir: Path, stats: Path | None = None) -> None:
         out_dir: Report directory.
         stats: Dataset statistics JSON (default ``<results_dir>/dataset_stats.json``).
     """
+    inputs = load_inputs(results_dir, stats)
+    if all(getattr(inputs, f) is None for f in ("stats", "label", "h1", "h2", "carried", "ups", "fps")):
+        print(f"warning: no recognised result files in {results_dir}; every table is TBD", file=sys.stderr)
     tables = build_tables(results_dir, out_dir, stats)
     figures = build_figures(results_dir, out_dir, stats)
     tbd = [p.stem for p in tables if p.stem != "macros" and "\\textbf{TBD}" in p.read_text()]
