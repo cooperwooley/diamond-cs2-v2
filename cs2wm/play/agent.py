@@ -21,6 +21,17 @@ if TYPE_CHECKING:
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AGENT_CONFIG_PATH = _REPO_ROOT / "config" / "agent" / "cs2.yaml"
+DENOISER_ONLY_CONFIG_PATH = _REPO_ROOT / "config" / "agent" / "cs2_denoiser_only.yaml"
+
+
+def _import_agent() -> type[Agent]:
+    """Import ``agent.Agent``. src/ keeps v1's flat imports (agent, models, ...), so it has to be on sys.path."""
+    src = str(_REPO_ROOT / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from agent import Agent
+
+    return Agent
 
 
 def build_play_agent(
@@ -44,11 +55,7 @@ def build_play_agent(
     Raises:
         ValueError: If ``agent_cfg`` has no upsampler.
     """
-    # src/ keeps v1's flat imports (agent, models, ...), so it has to be on sys.path, as in src/main.py.
-    src = str(_REPO_ROOT / "src")
-    if src not in sys.path:
-        sys.path.insert(0, src)
-    from agent import Agent
+    Agent = _import_agent()
 
     if agent_cfg is None:
         agent_cfg = OmegaConf.load(DEFAULT_AGENT_CONFIG_PATH)
@@ -57,4 +64,20 @@ def build_play_agent(
     agent = Agent(instantiate(agent_cfg, num_actions=ACTION_DIM))
     agent.load(v2_ckpt, load_denoiser=True, load_upsampler=False)
     agent.load(v1_upsampler_ckpt, load_denoiser=False, load_upsampler=True)
+    return agent.to(device).eval().requires_grad_(False)
+
+
+def build_denoiser_agent(v2_ckpt: Path, device: str | torch.device = "cpu") -> Agent:
+    """Build an eval-mode denoiser-only agent (play with ``--no-upsampler``).
+
+    Args:
+        v2_ckpt: Agent checkpoint holding the denoiser.
+        device: Device to put the agent on.
+
+    Returns:
+        The agent in eval mode, with ``upsampler`` None.
+    """
+    Agent = _import_agent()
+    agent = Agent(instantiate(OmegaConf.load(DENOISER_ONLY_CONFIG_PATH), num_actions=ACTION_DIM))
+    agent.load(v2_ckpt, load_denoiser=True, load_upsampler=False)
     return agent.to(device).eval().requires_grad_(False)

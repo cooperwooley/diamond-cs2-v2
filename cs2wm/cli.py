@@ -86,6 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--denoising-steps", type=int, choices=[1, 3], default=1)
     p.add_argument("--context", type=Path, default=None, help="held-out test HDF5 for the initial context")
     p.add_argument("--record", type=Path, default=None, help="write the session to this MP4 (#35)")
+    p.add_argument("--bf16", action="store_true", help="sample under bf16 autocast (CUDA); FPS fallback #2")
+    p.add_argument("--compile", action="store_true", help="torch.compile the models; FPS fallback #3")
     p.add_argument("--benchmark", type=int, default=None, metavar="N", help="benchmark FPS over N frames and exit")
 
     p = sub.add_parser("eval", help="evaluations (#27, #32, #33, #34)")
@@ -192,6 +194,8 @@ def _dispatch(args: argparse.Namespace) -> None:
             args.context,
             args.record,
             args.benchmark,
+            args.bf16,
+            args.compile,
         )
     elif cmd == "eval":
         _dispatch_eval(args)
