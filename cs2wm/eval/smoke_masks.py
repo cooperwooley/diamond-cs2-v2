@@ -1,8 +1,8 @@
 """Smoke and static masks for H2 (#33), from smoke events and the spectated player's eye pose.
 
-Each smoke volume is a sphere (``eval.h2.smoke_radius_units``) centred on the detonation point. It is projected to a
-screen ellipse, the union of the ellipses of the smokes active at the frame's tick is dilated by
-``eval.h2.mask_dilate_px``, and that is the smoke mask. The static mask is its complement minus a viewmodel box, and
+Each smoke volume is a sphere (``eval.h2.smoke_radius_units``) centred on the detonation point. A pixel is in the
+smoke if its camera ray hits the sphere; the union over the smokes active at the frame's tick, dilated by
+``eval.h2.mask_dilate_px``, is the smoke mask. The static mask is its complement minus a viewmodel box, and
 only exists for frames with no enemy in view.
 
 Conventions (each is pinned by ``tests/test_smoke_masks.py``)
@@ -19,16 +19,17 @@ Conventions (each is pinned by ``tests/test_smoke_masks.py``)
 * **Focal lengths**: per-axis pinhole as in H1 (``rotation.focal_lengths_px``): ``f_x`` from ``eval.h1.hfov_deg`` over
   the frame width, ``f_y`` from the capture aspect ratio over the frame height. The stored frames are squashed
   horizontally, so ``f_x != f_y``, and a sphere is projected with its own per-axis angular extent.
-* **Sphere to ellipse** (``project_sphere``): in the camera's x-z plane the sphere subtends the angles
-  ``phi_x +- asin(r / rho_xz)`` (``phi_x`` the direction of the centre, ``rho_xz`` its distance to the y axis); the same
-  in the y-z plane. The image extents are ``f tan`` of those angles, and the ellipse is inscribed in the resulting
-  box. A camera inside the sphere gets the whole frame (infinite radii). A sphere crossing the camera plane is cut
-  off at a far-away edge of the box, so the ellipse still covers its visible part. Entirely behind: no mask.
+* **Sphere mask** (``sphere_mask``): exact per pixel. The ray of pixel ``(col, row)`` in camera space is
+  ``normalise((col + 0.5 - W/2) / f_x, -(row + 0.5 - H/2) / f_y, 1)``; with ``c`` the sphere centre in camera space it
+  hits the sphere iff ``b = ray . c > 0`` and ``b^2 - (|c|^2 - r^2) >= 0``, or the camera is inside the sphere
+  (``|c| < r``), which masks the whole frame. A sphere that crosses the camera plane is therefore handled exactly
+  (an approximating ellipse is not: it is far off for the near, large smokes that matter most).
 * **Eye position** (``eye_position``): pawn origin + view offset. The offset is the tick table's view-offset column
   when ``eval.h2.view_offset_prop`` names one, else it is interpolated between the standing and the crouching
   height (64 and 46 units) by ``duck_amount``. CONFIRM(#14): the demoparser2 prop and whether those heights hold in
   CS2.
-* **Frame to tick**: frame ``k`` shows the demo state at ``start_tick + k * ticks_per_frame + render.tick_offset``.
+* **Frame to tick**: frame ``k`` shows the demo state at ``start_tick + k * ticks_per_frame`` (``render.tick_offset``
+  only shifts when the render commands are scheduled, see ``pipeline/segment.py``).
 * **Active smoke**: ``detonate_tick <= tick < expire_tick``.
 * **Line-of-sight filter** (``eval.h2.max_los_units``): a smoke only counts if its centre is within that distance of
   the view axis (the ray from the eye along ``forward``; behind the eye, of the eye itself). Smokes far off to the
@@ -46,6 +47,7 @@ line-of-sight filter keep false positives low but do not remove them; the masks 
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Sequence
 
@@ -118,29 +120,20 @@ def project_point(
     return size[1] / 2 + f_x * x / z, size[0] / 2 - f_y * y / z, float(z)
 
 
-def _angular_extent(a: float, z: float, r: float, focal: float) -> tuple[float, float]:
-    """Image-plane extent (relative to the principal point) of a sphere along one camera axis.
-
-    Args:
-        a: Camera-space coordinate of the centre along the axis (right or up).
-        z: Camera-space depth of the centre.
-        r: Sphere radius.
-        focal: Focal length in pixels for this axis.
-
-    Returns:
-        ``(lo, hi)`` with ``lo < hi``, limited to ``+-_LIMIT_PX``.
-    """
-    rho = math.hypot(a, z)
-    if rho <= r:  # the sphere reaches the camera's axis in this plane: unbounded on both sides
-        return -_LIMIT_PX, _LIMIT_PX
-    phi, beta = math.atan2(a, z), math.asin(r / rho)
-    lo, hi = phi - beta, phi + beta
-    lo_px = focal * math.tan(lo) if lo > -math.pi / 2 else -_LIMIT_PX
-    hi_px = focal * math.tan(hi) if hi < math.pi / 2 else _LIMIT_PX
-    return max(lo_px, -_LIMIT_PX), min(hi_px, _LIMIT_PX)
+@functools.lru_cache(maxsize=8)
+def _pixel_rays(size: tuple[int, int], hfov_deg: float, capture_hw: tuple[int, int]) -> np.ndarray:
+    """Unit camera-space rays ``(right, up, forward)`` through the pixel centres: ``float[H, W, 3]``."""
+    h, w = size
+    f_x, f_y = _focal(size, hfov_deg, capture_hw)
+    x = (np.arange(w) + 0.5 - w / 2) / f_x
+    y = -(np.arange(h) + 0.5 - h / 2) / f_y
+    rays = np.stack(np.broadcast_arrays(x[None, :], y[:, None], np.ones((h, w))), axis=-1)
+    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+    rays.flags.writeable = False
+    return rays
 
 
-def project_sphere(
+def sphere_mask(
     center: np.ndarray,
     radius: float,
     eye: np.ndarray,
@@ -149,8 +142,8 @@ def project_sphere(
     hfov_deg: float,
     size: tuple[int, int],
     capture_hw: tuple[int, int] = rotation.DEFAULT_CAPTURE_HW,
-) -> tuple[float, float, float, float] | None:
-    """Project a world-space sphere to a screen ellipse.
+) -> np.ndarray:
+    """Pixels whose camera ray hits a world-space sphere (exact ray/sphere test).
 
     Args:
         center: ``float[3]`` sphere centre (Source units).
@@ -163,40 +156,15 @@ def project_sphere(
         capture_hw: ``(H, W)`` of the capture, which sets the vertical FOV.
 
     Returns:
-        ``(cx, cy, rx, ry)`` in pixels (centre column, centre row, half-width, half-height), or None if the sphere is
-        entirely behind the camera or outside the frame. A camera inside the sphere gives the frame centre with
-        infinite radii, which covers the whole frame.
+        ``bool[H, W]``. All True if the camera is inside the sphere; all False if it is entirely behind the camera
+        or outside the frustum.
     """
-    x, y, z = _camera_space(center, eye, yaw_deg, pitch_deg)
-    h, w = size
-    if math.sqrt(x * x + y * y + z * z) <= radius:
-        return w / 2, h / 2, math.inf, math.inf
-    if z + radius <= 0:
-        return None
-    f_x, f_y = _focal(size, hfov_deg, capture_hw)
-    u_lo, u_hi = _angular_extent(x, z, radius, f_x)
-    # Image rows grow downwards, so the up axis is flipped.
-    v_top, v_bottom = (-e for e in reversed(_angular_extent(y, z, radius, f_y)))
-    left, right, top, bottom = w / 2 + u_lo, w / 2 + u_hi, h / 2 + v_top, h / 2 + v_bottom
-    if right <= 0 or left >= w or bottom <= 0 or top >= h:
-        return None
-    return (left + right) / 2, (top + bottom) / 2, (right - left) / 2, (bottom - top) / 2
-
-
-def rasterize_ellipse(ellipse: tuple[float, float, float, float], size: tuple[int, int]) -> np.ndarray:
-    """Boolean mask of an axis-aligned ellipse, sampled at pixel centres.
-
-    Args:
-        ellipse: ``(cx, cy, rx, ry)`` as returned by ``project_sphere`` (radii may be infinite).
-        size: Image ``(H, W)``.
-
-    Returns:
-        ``bool[H, W]``.
-    """
-    cx, cy, rx, ry = ellipse
-    cols = (np.arange(size[1]) + 0.5 - cx) / rx
-    rows = (np.arange(size[0]) + 0.5 - cy) / ry
-    return (rows[:, None] ** 2 + cols[None, :] ** 2) <= 1.0
+    c = _camera_space(center, eye, yaw_deg, pitch_deg)
+    outside = float(c @ c) - radius * radius
+    if outside < 0:
+        return np.ones(size, dtype=bool)
+    b = _pixel_rays((int(size[0]), int(size[1])), float(hfov_deg), tuple(capture_hw)) @ c
+    return (b > 0) & (b * b >= outside)
 
 
 def eye_position(
@@ -235,6 +203,22 @@ def _dilate(mask: np.ndarray, px: int) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
 
 
+def _smokes_in_los(
+    tick: int, events: pd.DataFrame, eye: np.ndarray, yaw_deg: float, pitch_deg: float, cfg: DictConfig
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Centres of the active smokes that pass and that fail the line-of-sight filter."""
+    forward = view_basis(yaw_deg, pitch_deg)[0]
+    eye = np.asarray(eye, dtype=np.float64)
+    kept, dropped = [], []
+    for center in active_smokes(events, tick)[["x", "y", "z"]].to_numpy(dtype=np.float64):
+        d = center - eye
+        along = float(d @ forward)
+        # Distance from the smoke centre to the line of sight: to the ray in front of the eye, to the eye behind it.
+        off_axis = float(np.linalg.norm(d - along * forward)) if along > 0 else float(np.linalg.norm(d))
+        (kept if off_axis <= float(cfg.eval.h2.max_los_units) else dropped).append(center)
+    return kept, dropped
+
+
 def smoke_mask_for_frame(
     tick: int,
     events: pd.DataFrame,
@@ -261,23 +245,39 @@ def smoke_mask_for_frame(
     h = cfg.eval.h2
     hw = (int(size[0]), int(size[1]))
     capture = tuple(int(v) for v in cfg.resolution.capture)
-    forward = view_basis(yaw_deg, pitch_deg)[0]
-    eye = np.asarray(eye, dtype=np.float64)
     mask = np.zeros(hw, dtype=bool)
-    for x, y, z in active_smokes(events, tick)[["x", "y", "z"]].to_numpy(dtype=np.float64):
-        center = np.array([x, y, z])
-        d = center - eye
-        along = float(d @ forward)
-        # Distance from the smoke centre to the line of sight: to the ray in front of the eye, to the eye behind it.
-        off_axis = float(np.linalg.norm(d - along * forward)) if along > 0 else float(np.linalg.norm(d))
-        if off_axis > float(h.max_los_units):
-            continue
-        ellipse = project_sphere(
+    for center in _smokes_in_los(tick, events, eye, yaw_deg, pitch_deg, cfg)[0]:
+        mask |= sphere_mask(
             center, float(h.smoke_radius_units), eye, yaw_deg, pitch_deg, float(cfg.eval.h1.hfov_deg), hw, capture
         )
-        if ellipse is not None:
-            mask |= rasterize_ellipse(ellipse, hw)
     return _dilate(mask, int(h.mask_dilate_px))
+
+
+def los_dropped_count(
+    tick: int,
+    events: pd.DataFrame,
+    eye: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+    cfg: DictConfig,
+    size: Sequence[int] = (150, 280),
+) -> int:
+    """Number of active smokes that are in the frustum but left out of the mask by the line-of-sight filter.
+
+    Those pixels end up in the static region (if no wall hides the smoke, they would be smoke), so this counts the
+    possible contamination of the static region.
+    """
+    h = cfg.eval.h2
+    hw = (int(size[0]), int(size[1]))
+    capture = tuple(int(v) for v in cfg.resolution.capture)
+    return sum(
+        bool(
+            sphere_mask(
+                c, float(h.smoke_radius_units), eye, yaw_deg, pitch_deg, float(cfg.eval.h1.hfov_deg), hw, capture
+            ).any()
+        )
+        for c in _smokes_in_los(tick, events, eye, yaw_deg, pitch_deg, cfg)[1]
+    )
 
 
 def viewmodel_mask(cfg: DictConfig, size: Sequence[int] = (150, 280)) -> np.ndarray:

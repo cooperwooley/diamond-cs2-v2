@@ -46,7 +46,9 @@ SMOKE_EXPIRED_EVENT = "smokegrenade_expired"
 SMOKE_ENTITY_COLUMN = "entityid"
 SMOKE_POSITION_COLUMNS = ("x", "y", "z")
 SMOKE_COLUMNS = ("entity_id", "detonate_tick", "expire_tick", "x", "y", "z", "thrower_user_id")
-SMOKE_DURATION_TICKS = 1152  # CONFIRM(#14): 18 s at 64 Hz; used when a smoke has no expired event (demo cut off)
+SMOKE_DURATION_TICKS = (
+    1152  # CONFIRM(#14): 18 s at 64 Hz; used when a smoke has no expired event and as the cap on every smoke's lifetime
+)
 
 _BUILD_ID_RE = re.compile(r'"buildid"\s+"(\d+)"', re.IGNORECASE)
 _APPMANIFEST = "appmanifest_730.acf"
@@ -240,8 +242,12 @@ def smoke_events(demo_path: str | Path) -> pd.DataFrame:
     joined = pd.merge_asof(
         start, end, left_on="detonate_tick", right_on="expire_tick", by="entity_id", direction="forward"
     )
+    # A smoke ends at its expiry, but never lasts longer than SMOKE_DURATION_TICKS and never past the next smoke of the
+    # same (recycled) entity: this also bounds a smoke whose own expired event is missing.
+    cap = joined["detonate_tick"] + SMOKE_DURATION_TICKS
+    next_use = joined.groupby("entity_id")["detonate_tick"].shift(-1)
     joined["expire_tick"] = (
-        joined["expire_tick"].fillna(joined["detonate_tick"] + SMOKE_DURATION_TICKS).astype(np.int64)
+        joined["expire_tick"].fillna(cap).clip(upper=cap).clip(upper=next_use.fillna(cap)).astype(np.int64)
     )
     return joined[list(SMOKE_COLUMNS)].sort_values("detonate_tick").reset_index(drop=True)
 

@@ -117,6 +117,33 @@ def test_smoke_events_joins_detonate_and_expired_by_entity_id(monkeypatch) -> No
     assert parser.calls == [("events", (demo.SMOKE_DETONATE_EVENT, demo.SMOKE_EXPIRED_EVENT), ("user_id",))]
 
 
+def test_smoke_events_recycled_entity_without_its_own_expiry(monkeypatch) -> None:
+    det = pd.DataFrame(
+        {
+            "tick": [100, 500, 3000],
+            "entityid": [10, 10, 10],  # smoke A (no expiry in the demo), smoke B (expires 700), smoke C (cut off)
+            "x": [0.0] * 3,
+            "y": [0.0] * 3,
+            "z": [0.0] * 3,
+            "user_user_id": [1, 2, 3],
+        }
+    )
+    exp = pd.DataFrame({"tick": [700], "entityid": [10]})
+    parser = FakeParser(pd.DataFrame(), [(demo.SMOKE_DETONATE_EVENT, det), (demo.SMOKE_EXPIRED_EVENT, exp)])
+    monkeypatch.setattr(demo, "_make_parser", lambda path: parser)
+    table = demo.smoke_events("x.dem")
+    # A must not borrow B's expiry (700): it ends when entity 10 is reused at 500. B keeps its early expiry; C is capped.
+    assert table["expire_tick"].tolist() == [500, 700, 3000 + demo.SMOKE_DURATION_TICKS]
+
+
+def test_smoke_events_clamps_a_late_expiry_to_the_smoke_duration(monkeypatch) -> None:
+    det = pd.DataFrame({"tick": [100], "entityid": [10], "x": [0.0], "y": [0.0], "z": [0.0]})
+    exp = pd.DataFrame({"tick": [100 + 5000], "entityid": [10]})
+    parser = FakeParser(pd.DataFrame(), [(demo.SMOKE_DETONATE_EVENT, det), (demo.SMOKE_EXPIRED_EVENT, exp)])
+    monkeypatch.setattr(demo, "_make_parser", lambda path: parser)
+    assert demo.smoke_events("x.dem")["expire_tick"].tolist() == [100 + demo.SMOKE_DURATION_TICKS]
+
+
 def test_smoke_events_without_smokes_or_thrower(monkeypatch) -> None:
     monkeypatch.setattr(demo, "_make_parser", lambda path: FakeParser(pd.DataFrame(), []))
     empty = demo.smoke_events("x.dem")
@@ -196,6 +223,28 @@ def test_build_geoms_pose_eye_enemies_and_tick_mapping(cfg) -> None:
     assert geoms[10].tick == 1040 and geoms[10].enemies.tolist() == [[800.0, 100.0, 0.0]]
     dead = [g for g in geoms if 1100 <= g.tick <= 1120]
     assert dead and all(len(g.enemies) == 0 for g in dead)  # the dead are not enemies
+
+
+def test_frame_ticks_ignore_render_tick_offset(cfg) -> None:
+    shifted = load_config(overrides=["render.tick_offset=2"])
+    attrs = attrs_for()
+    assert (
+        h2.frame_ticks(attrs, 4, shifted).tolist() == [1000, 1004, 1008, 1012] == h2.frame_ticks(attrs, 4, cfg).tolist()
+    )
+    geoms = h2.build_geoms(attrs, 4, h2.DemoTables(pd.DataFrame(), tick_table(990, 1100)), shifted)
+    assert [g.tick for g in geoms] == [1000, 1004, 1008, 1012]  # frame k still shows T_k
+
+
+def test_a_smoke_detonating_at_frame_k_masks_frame_k_but_not_the_one_before(cfg) -> None:
+    k = 5
+    t_k = START_TICK + 4 * k
+    smokes = pd.DataFrame(
+        {"entity_id": [1], "detonate_tick": [t_k], "expire_tick": [t_k + 40], "x": [1000.0], "y": [0.0], "z": [64.0]}
+    )
+    geoms = h2.build_geoms(attrs_for(), 25, h2.DemoTables(smokes, tick_table(990, 1200)), cfg)
+    masks = [h2.frame_regions(g, smokes, cfg, (H, W))[0] for g in geoms]
+    assert not masks[k - 1].any() and masks[k].any()
+    assert masks[k + 9].any() and not masks[k + 10].any()  # expires at T_k + 40 = frame k + 10
 
 
 def test_build_geoms_fills_small_gaps_and_marks_big_ones(cfg) -> None:
@@ -460,6 +509,7 @@ def test_run_h2_end_to_end(ckpts, smoke_data, parser, tmp_path, cfg, agent_cfg, 
     assert any("Smoke masks are geometric approximations" in x for x in on_disk["limitations"])
     stats = on_disk["mask_stats"]
     assert stats["frames"] == 60 and stats["no_pose"] == 0 and stats["with_smoke"] > 20
+    assert stats["los_dropped_smokes"] == 0 and stats["frames_with_los_dropped"] == 0
     assert 0 < stats["enemy_excluded"] < stats["frames"] and 0 < stats["mean_smoke_fraction"] < 0.2
     assert set(on_disk["models"]) == set(on_disk["results"]) == {"v2", "v1"}
     assert on_disk["models"]["v2"]["upsampler"]["path"] == str(ckpts["v1"])
@@ -523,6 +573,77 @@ def test_single_step_one_is_rollout_step_one_and_models_share_contexts(
         == v1[["episode", "frame", "tick", "smoke_px", "static_px"]].to_numpy()
     ).all()
     assert not np.allclose(v2["lpips_smoke"], v1["lpips_smoke"], equal_nan=True)  # but the models differ
+
+
+def test_triptychs_do_not_depend_on_n_validate(ckpts, smoke_data, parser, tmp_path, cfg, agent_cfg) -> None:
+    run(ckpts, smoke_data, tmp_path, cfg, agent_cfg, n_validate=0)
+    assert list((tmp_path / "mask_validation").glob("*.png")) == []
+    assert len(list((tmp_path / "triptychs").glob("*.png"))) == 2 * 2 * 2  # models x eval.h2.examples x conditions
+    assert (tmp_path / "v2_triptychs.pdf").stat().st_size > 0
+    run(ckpts, smoke_data, tmp_path / "many", cfg, agent_cfg, n_validate=50)
+    assert len(list((tmp_path / "many" / "mask_validation").glob("*.png"))) == 3 * STEPS  # all target frames
+    assert len(list((tmp_path / "many" / "triptychs").glob("*.png"))) == 2 * 2 * 2
+
+
+class StubWorld:
+    """A world whose generated frames are fixed noise, optionally overwritten in a box (a rollout of any length)."""
+
+    n_cond = h2.N_COND
+
+    def __init__(self, box: tuple[slice, slice] | None = None) -> None:
+        self.box = box
+
+    def rollout(self, frames, ctx_actions, actions, generators):
+        b, t = actions.shape[:2]
+        g = torch.Generator().manual_seed(7 + t)
+        full = torch.rand(b, t, 3, H, W, generator=g) * 2 - 1
+        if self.box is not None:
+            full[..., self.box[0], self.box[1]] = torch.rand(b, t, 3, 1, 1, generator=g) * 2 - 1
+        return torch.zeros(b, t, 3, 30, 56), full
+
+
+def stub_rows(smoke_data, cfg, box):
+    files = h2.list_episodes(smoke_data / "full")
+    episodes, _ = h2.prepare_episodes(files, smoke_data / "demos", None, cfg)
+    ctxs = h2.select_contexts(episodes, 3, STEPS, 50, 2, 0)
+    rows, _ = h2.evaluate_model(
+        "m", StubWorld(box), ctxs, h2.EpisodeReader(), cfg, fake_lpips, 0, 4, STEPS, torch.device("cpu")
+    )
+    return pd.DataFrame(rows)
+
+
+def test_masked_metrics_do_not_leak_from_outside_the_masks(smoke_data, parser, cfg) -> None:
+    base = stub_rows(smoke_data, cfg, None)
+    # Inside the viewmodel box and far (>5 px, the SSIM window) from both the smoke and the static region.
+    outside = stub_rows(smoke_data, cfg, (slice(110, 145), slice(100, 240)))
+    cols = ["lpips_smoke", "lpips_static", "ssim_smoke", "ssim_static", "ssim_px_smoke", "ssim_px_static"]
+    assert base[cols].notna().all().all() or base["status"].eq("enemy").any()
+    assert np.allclose(base[cols], outside[cols], equal_nan=True)
+    # Control: the same kind of change inside the smoke does move the smoke metrics and leaves the static ones alone.
+    inside = stub_rows(smoke_data, cfg, (slice(70, 80), slice(135, 145)))
+    assert not np.allclose(base["lpips_smoke"], inside["lpips_smoke"])
+    assert not np.allclose(base["ssim_smoke"], inside["ssim_smoke"])
+    assert np.allclose(base["lpips_static"], inside["lpips_static"], equal_nan=True)
+
+
+def test_scan_counts_smokes_dropped_by_the_line_of_sight_filter() -> None:
+    tight = load_config(overrides=["eval.h2.max_los_units=500"])
+    smokes = pd.DataFrame(
+        {
+            "entity_id": [1, 2],
+            "detonate_tick": [1000, 1000],
+            "expire_tick": [1040, 2000],
+            "x": [1000.0, 1000.0],
+            "y": [0.0, -700.0],  # on axis; 700 units off the axis
+            "z": [64.0, 64.0],
+        }
+    )
+    tables = h2.DemoTables(smokes, tick_table(990, 1200))
+    geoms = h2.build_geoms(attrs_for(), 20, tables, tight)
+    ep = h2.scan_episode(Path("e"), attrs_for(), 20, tables, geoms, tight)
+    assert ep.counts["los_dropped_smokes"] == 20 and ep.counts["frames_with_los_dropped"] == 20
+    stats = h2.mask_statistics([ep, ep])
+    assert stats["los_dropped_smokes"] == 40 and stats["frames_with_los_dropped"] == 40 and stats["with_smoke"] == 20
 
 
 def test_run_h2_is_reproducible_seed_dependent_and_batch_size_invariant(

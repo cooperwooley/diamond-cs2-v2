@@ -26,8 +26,38 @@ def cfg_plain():
     return load_config(overrides=["eval.h2.mask_dilate_px=0"])
 
 
-def sphere(center, yaw=0.0, pitch=0.0, eye=EYE):
-    return sm.project_sphere(np.array(center, dtype=float), R, eye, yaw, pitch, HFOV, SIZE)
+def sphere(center, yaw=0.0, pitch=0.0, eye=EYE, radius=R):
+    """Exact (undilated) mask of one sphere."""
+    return sm.sphere_mask(np.array(center, dtype=float), radius, eye, yaw, pitch, HFOV, SIZE)
+
+
+def extent(mask):
+    """``(left, right, top, bottom)`` of a mask's bounding box in pixels."""
+    rows, cols = np.where(mask)
+    return cols.min(), cols.max() + 1, rows.min(), rows.max() + 1
+
+
+def centroid(mask):
+    rows, cols = np.where(mask)
+    return cols.mean() + 0.5, rows.mean() + 0.5
+
+
+def reference_mask(center, eye, yaw, pitch, radius=R, step=0.5):
+    """Brute force, independent of the camera-space algebra: march every pixel's world-space ray in small steps."""
+    f_x, f_y = 140 / math.tan(math.radians(HFOV / 2)), 75 / (math.tan(math.radians(HFOV / 2)) * 720 / 1280)
+    fwd, right, up = sm.view_basis(yaw, pitch)
+    cols, rows = np.meshgrid(np.arange(W) + 0.5, np.arange(H) + 0.5)
+    d = ((cols - W / 2) / f_x)[..., None] * right + (-(rows - H / 2) / f_y)[..., None] * up + fwd
+    d /= np.linalg.norm(d, axis=-1, keepdims=True)
+    eye, center = np.asarray(eye, float), np.asarray(center, float)
+    hit = np.zeros((H, W), dtype=bool)
+    for t in np.arange(0.0, np.linalg.norm(center - eye) + radius + 1, step):
+        hit |= np.linalg.norm(eye + t * d - center, axis=-1) <= radius
+    return hit
+
+
+def iou(a, b):
+    return (a & b).sum() / max((a | b).sum(), 1)
 
 
 def smokes(*rows, detonate=0, expire=1000):
@@ -62,91 +92,127 @@ def test_view_basis_is_orthonormal_and_follows_the_source_convention() -> None:
     assert np.allclose(sm.view_basis(0, 30)[0], [math.cos(math.radians(30)), 0, -0.5])
 
 
-def test_smoke_straight_ahead_is_a_centred_ellipse() -> None:
-    cx, cy, rx, ry = sphere([1000, 0, 64])
-    assert (cx, cy) == (pytest.approx(W / 2), pytest.approx(H / 2))
+def test_smoke_straight_ahead_is_a_centred_disc() -> None:
+    m = sphere([1000, 0, 64])
+    cx, cy = centroid(m)
+    assert (cx, cy) == (pytest.approx(W / 2, abs=0.01), pytest.approx(H / 2, abs=0.01))
     f_x, f_y = 140 / math.tan(math.radians(HFOV / 2)), 75 / (math.tan(math.radians(HFOV / 2)) * 720 / 1280)
     alpha = math.asin(R / 1000)
-    assert rx == pytest.approx(f_x * math.tan(alpha)) and ry == pytest.approx(f_y * math.tan(alpha))
-    assert rx > ry  # f_x > f_y: the stored frames are squashed horizontally, so a sphere is wider than tall
+    left, right, top, bottom = extent(m)
+    assert (right - left) / 2 == pytest.approx(f_x * math.tan(alpha), abs=1)
+    assert (bottom - top) / 2 == pytest.approx(f_y * math.tan(alpha), abs=1)
 
 
 def test_smoke_to_the_right_is_on_the_right_half() -> None:
     # Facing +x, the right-hand side is -y in Source.
-    cx, cy, rx, ry = sphere([1000, -600, 64])
-    assert cx - rx > W / 2 and cy == pytest.approx(H / 2)
-    mask = sm.rasterize_ellipse((cx, cy, rx, ry), SIZE)
-    assert mask[:, W // 2 :].any() and not mask[:, : W // 2].any()
+    m = sphere([1000, -600, 64])
+    assert m[:, W // 2 :].any() and not m[:, : W // 2].any() and centroid(m)[1] == pytest.approx(H / 2, abs=0.5)
     left = sphere([1000, 600, 64])  # +y is the left
-    assert left[0] == pytest.approx(W - cx) and left[2] == pytest.approx(rx)
+    assert np.array_equal(left, m[:, ::-1])
 
 
 def test_yaw_rotates_counter_clockwise() -> None:
     # Facing +y (yaw 90), +x is on the right and -x on the left.
-    assert sphere([600, 1000, 64], yaw=90)[0] > W / 2
-    assert sphere([-600, 1000, 64], yaw=90)[0] < W / 2
-    assert sphere([0, 1000, 64], yaw=90)[0] == pytest.approx(W / 2)
-    assert sphere([-1000, 0, 64], yaw=180)[0] == pytest.approx(W / 2)
+    assert centroid(sphere([600, 1000, 64], yaw=90))[0] > W / 2
+    assert centroid(sphere([-600, 1000, 64], yaw=90))[0] < W / 2
+    assert centroid(sphere([0, 1000, 64], yaw=90))[0] == pytest.approx(W / 2, abs=0.01)
+    assert centroid(sphere([-1000, 0, 64], yaw=180))[0] == pytest.approx(W / 2, abs=0.01)
 
 
 def test_smoke_above_is_on_the_upper_half() -> None:
-    cx, cy, rx, ry = sphere([1000, 0, 500])
-    assert cx == pytest.approx(W / 2) and cy + ry < H / 2  # rows grow downwards
-    mask = sm.rasterize_ellipse((cx, cy, rx, ry), SIZE)
-    assert mask[: H // 2].any() and not mask[H // 2 :].any()
-    below = sphere([1000, 0, -400])
-    assert below[1] > H / 2
+    m = sphere([1000, 0, 500])
+    assert centroid(m)[0] == pytest.approx(W / 2, abs=0.01) and m[: H // 2].any() and not m[H // 2 :].any()
+    assert centroid(sphere([1000, 0, -400]))[1] > H / 2  # rows grow downwards
 
 
 def test_smoke_behind_the_camera_has_no_mask(cfg) -> None:
-    assert sphere([-1000, 0, 64]) is None
-    assert sphere([-300, 200, 64]) is None
+    assert not sphere([-1000, 0, 64]).any()
+    assert not sphere([-300, 200, 64]).any()
     assert not sm.smoke_mask_for_frame(10, smokes((-1000, 0, 64)), EYE, 0.0, 0.0, cfg).any()
-    assert sphere([-1000, 0, 64], yaw=180) is not None  # turn around and it is there
+    assert sphere([-1000, 0, 64], yaw=180).any()  # turn around and it is there
 
 
 def test_looking_down_at_a_smoke_below_is_centred() -> None:
-    cx, cy, *_ = sphere([0, 0, -300], pitch=90)
-    assert (cx, cy) == (pytest.approx(W / 2), pytest.approx(H / 2))
+    cx, cy = centroid(sphere([0, 0, -300], pitch=90))
+    assert (cx, cy) == (pytest.approx(W / 2, abs=0.01), pytest.approx(H / 2, abs=0.01))
     # Looking down, "up" on the screen is the heading: a smoke ahead of the player is in the upper half.
-    assert sphere([300, 0, -300], pitch=90)[1] < H / 2
-    assert sphere([0, -300, -300], pitch=90)[0] > W / 2  # and -y stays on the right
+    assert centroid(sphere([300, 0, -300], pitch=90))[1] < H / 2
+    assert centroid(sphere([0, -300, -300], pitch=90))[0] > W / 2  # and -y stays on the right
 
 
 def test_positive_pitch_looks_down() -> None:
     # A smoke at eye height is above the screen centre once the camera looks down, below it when it looks up.
-    assert sphere([1000, 0, 64], pitch=20)[1] < H / 2
-    assert sphere([1000, 0, 64], pitch=-20)[1] > H / 2
+    assert centroid(sphere([1000, 0, 64], pitch=20))[1] < H / 2
+    assert centroid(sphere([1000, 0, 64], pitch=-20))[1] > H / 2
     # The exact angle: looking down 20 degrees puts the horizon 20 degrees above the centre.
     f_y = 75 / (math.tan(math.radians(HFOV / 2)) * 720 / 1280)
-    assert H / 2 - sphere([1000, 0, 64], pitch=20)[1] == pytest.approx(f_y * math.tan(math.radians(20)), rel=0.05)
+    assert H / 2 - centroid(sphere([1000, 0, 64], pitch=20))[1] == pytest.approx(
+        f_y * math.tan(math.radians(20)), rel=0.05
+    )
 
 
-def test_ellipse_shrinks_with_distance_by_the_angular_radius() -> None:
-    near, far = sphere([1000, 0, 64]), sphere([2000, 0, 64])
-    assert near[2] > far[2] and near[3] > far[3]
-    assert near[2] / far[2] == pytest.approx(math.tan(math.asin(R / 1000)) / math.tan(math.asin(R / 2000)))
-    assert near[2] / far[2] == pytest.approx(2.0, rel=0.03)  # about 1 / distance
+def test_smoke_shrinks_with_distance_by_the_angular_radius() -> None:
+    def width(d):
+        left, right, *_ = extent(sphere([d, 0, 64]))
+        return right - left
+
+    assert width(1000) > width(2000)
+    assert width(1000) / width(2000) == pytest.approx(  # whole-pixel widths of 30 and 16 px: allow a pixel
+        math.tan(math.asin(R / 1000)) / math.tan(math.asin(R / 2000)), rel=0.08
+    )
+    assert sphere([1000, 0, 64]).sum() > 3 * sphere([2000, 0, 64]).sum()  # area about 1 / distance^2
 
 
 def test_camera_inside_the_sphere_masks_the_whole_frame(cfg_plain) -> None:
-    assert sphere([100, 0, 64])[2:] == (math.inf, math.inf)
-    mask = sm.smoke_mask_for_frame(10, smokes((100, 0, 64)), EYE, 0.0, 0.0, cfg_plain)
-    assert mask.all()
+    assert sphere([100, 0, 64]).all()
+    assert sm.smoke_mask_for_frame(10, smokes((100, 0, 64)), EYE, 0.0, 0.0, cfg_plain).all()
     assert sm.smoke_mask_for_frame(10, smokes((60, 60, 0)), EYE, 270.0, 45.0, cfg_plain).all()  # any viewing direction
 
 
-def test_a_sphere_that_crosses_the_camera_plane_covers_its_visible_side(cfg_plain) -> None:
-    centre = (-50.0, -150.0, 64.0)  # outside the sphere (distance 158), centre behind, mostly to the right
-    ellipse = sphere(centre)
-    assert ellipse is not None
-    mask = sm.smoke_mask_for_frame(10, smokes(centre), EYE, 0.0, 0.0, cfg_plain)
-    assert mask[:, -1].all() and not mask[:, 0].any() and mask.any()
+def test_a_sphere_that_crosses_the_camera_plane_covers_its_visible_side() -> None:
+    m = sphere([-50.0, -150.0, 64.0])  # outside the sphere (distance 158), centre behind, mostly to the right
+    assert m[:, -1].all() and not m[:, 0].any() and m.any()
 
 
-def test_sphere_outside_the_frustum_is_none() -> None:
-    assert sphere([1000, -3000, 64]) is None  # far to the right of the 106 degree view
-    assert sphere([1000, 0, 3000]) is None
+def test_sphere_outside_the_frustum_has_no_mask() -> None:
+    assert not sphere([1000, -3000, 64]).any()  # far to the right of the 106 degree view
+    assert not sphere([1000, 0, 3000]).any()
+
+
+NEAR_CASES = [  # (centre relative to an eye at the origin, yaw, pitch)
+    ((150, -150, 100), 0, 0),  # the reviewed 0 px case
+    ((100, -200, 60), 0, 0),
+    ((60, -200, 0), 0, 0),
+    ((150, 0, 0), 0, 0),  # 150 units straight ahead
+    ((200, 40, 30), 0, 0),
+    ((0, 250, -80), 90, 10),
+    ((-50, -150, 64), 0, 0),  # crosses the camera plane
+    ((-20, -150, 100), 0, 0),  # crosses the camera plane
+    ((300, 0, 0), 0, 0),
+    ((0, 0, -250), 0, 90),
+    ((180, 120, 90), 20, -15),
+]
+
+
+@pytest.mark.parametrize(("center", "yaw", "pitch"), NEAR_CASES)
+def test_near_smokes_match_the_brute_force_reference(center, yaw, pitch) -> None:
+    eye = np.zeros(3)
+    got = sphere(center, yaw, pitch, eye=eye)
+    ref = reference_mask(center, eye, yaw, pitch)
+    assert ref.sum() > 300
+    assert iou(got, ref) > 0.95, (center, int(got.sum()), int(ref.sum()))
+
+
+def test_near_smoke_iou_summary_and_reviewed_pixel_counts() -> None:
+    eye = np.zeros(3)
+    ious = [iou(sphere(c, y, p, eye=eye), reference_mask(c, eye, y, p)) for c, y, p in NEAR_CASES]
+    print(f"IoU vs brute force over {len(ious)} near cases: min {min(ious):.4f}, mean {np.mean(ious):.4f}")
+    assert min(ious) > 0.95
+    # The cases an inscribed-ellipse model got wrong (it gave 0 px for the first): the exact count is the reference's.
+    for center in ((150, -150, 100), (100, -200, 60), (60, -200, 0)):
+        exact, ref = sphere(center, eye=eye), reference_mask(center, eye, 0, 0)
+        print(f"{center}: exact {int(exact.sum())} px, reference {int(ref.sum())} px")
+        assert exact.sum() > 2000 and iou(exact, ref) > 0.99
 
 
 # --- eye position --------------------------------------------------------------------------------------------------
@@ -179,7 +245,7 @@ def test_mask_is_the_union_of_ellipses_and_matches_the_projection(cfg_plain) -> 
     only_a = sm.smoke_mask_for_frame(10, smokes(a), EYE, 0.0, 0.0, cfg_plain)
     only_b = sm.smoke_mask_for_frame(10, smokes(b), EYE, 0.0, 0.0, cfg_plain)
     assert np.array_equal(both, only_a | only_b) and only_a.any() and only_b.any() and not (only_a & only_b).any()
-    assert np.array_equal(only_a, sm.rasterize_ellipse(sphere(a), SIZE))
+    assert np.array_equal(only_a, sphere(a))
     assert both.shape == SIZE and both.dtype == bool
 
 
@@ -200,6 +266,19 @@ def test_line_of_sight_filter_drops_smokes_far_from_the_view_axis(cfg_plain) -> 
     assert sm.smoke_mask_for_frame(10, ev, EYE, 0.0, 0.0, cfg_plain).any()
     tight = load_config(overrides=["eval.h2.mask_dilate_px=0", "eval.h2.max_los_units=500"])
     assert not sm.smoke_mask_for_frame(10, ev, EYE, 0.0, 0.0, tight).any()
+
+
+def test_los_dropped_count_reports_only_smokes_in_the_frustum(cfg_plain) -> None:
+    tight = load_config(overrides=["eval.h2.mask_dilate_px=0", "eval.h2.max_los_units=500"])
+    ev = smokes((1000, -600, 64), (1000, 0, 64), (1000, -3000, 64))  # off-axis in view, on axis, off-axis out of view
+
+    def n(cfg):
+        return sm.los_dropped_count(10, ev, EYE, 0.0, 0.0, cfg)
+
+    assert n(tight) == 1 and n(cfg_plain) == 0  # the third is out of the frustum, so it is not contamination
+    assert sm.los_dropped_count(2000, ev, EYE, 0.0, 0.0, tight) == 0  # none active
+    only_on_axis = sm.smoke_mask_for_frame(10, ev, EYE, 0.0, 0.0, tight)
+    assert np.array_equal(only_on_axis, sm.smoke_mask_for_frame(10, ev.iloc[[1]], EYE, 0.0, 0.0, tight))
 
 
 def test_a_synthetic_scene_two_smokes_one_expired(cfg) -> None:

@@ -11,7 +11,7 @@ Method
    ``pack.to_low_res``. Only episodes with ``kind == "smoke"`` of test demos (``--split-json``) are used. Without
    ``--split-json`` the data are not known to be held out: ``data.held_out`` is false and a warning is printed.
 2. **Episode to demo.** An episode's ``demo_id`` attr names ``<--demos>/<demo_id>.dem``; frame ``k`` is at tick
-   ``start_tick + k * ticks_per_frame + render.tick_offset``. The spectated player is the episode's ``user_id`` attr
+   ``start_tick + k * ticks_per_frame``. The spectated player is the episode's ``user_id`` attr
    if it has one, else the player whose ``name`` equals its ``player`` attr. Each demo is parsed once: the tick table
    (``cs2wm.demo.load_ticks``: position, view angles, ``duck_amount``, health for every player) and the smoke events
    (``cs2wm.demo.smoke_events``, or ``<paths.events>/<demo_id>.parquet`` when that exists). A tick missing from the table
@@ -43,7 +43,9 @@ Method
 ``seed``; ``data``: ``dir``, ``split_json``, ``held_out``, ``demos_dir``, ``n_episodes`` (smoke episodes used),
     ``skipped`` (list of ``{episode, reason}``), ``contexts`` (list of ``{index, episode, demo_id, start}``).
 ``mask_stats``: over all frames of the used episodes: ``frames``, ``no_pose``, ``with_smoke``, ``static_ok``,
-    ``enemy_excluded`` and ``mean_smoke_fraction`` (of the frame, over frames with smoke).
+    ``enemy_excluded``, ``los_dropped_smokes`` (active smokes in the frustum that the line-of-sight filter left out of
+    the mask, summed over frames; their pixels sit in the static region), ``frames_with_los_dropped`` and
+    ``mean_smoke_fraction`` (of the frame, over frames with smoke).
 ``models``: name -> ``{checkpoint: {path, sha256_16}, upsampler: {path, sha256_16}}``.
 ``results``: model -> condition (``single`` | ``rollout``) -> ``{smoke: {...}, static: {...}, smoke_minus_static: {...}}``;
     ``smoke`` and ``static`` map ``lpips`` and ``ssim`` to ``{mean, ci_lo, ci_hi, n_contexts, n_frames, n_pixels}``
@@ -228,10 +230,12 @@ def read_attrs(path: Path) -> dict[str, Any]:
 
 
 def frame_ticks(attrs: dict[str, Any], n_frames: int, cfg: DictConfig) -> np.ndarray:
-    """Demo ticks at which the frames of an episode are shown (``render.tick_offset`` included)."""
-    return frame_to_tick(np.arange(n_frames), int(attrs["start_tick"]), ticks_per_frame(cfg)) + int(
-        cfg.render.tick_offset
-    )
+    """Demo ticks at which the frames of an episode are shown: ``T_k = start_tick + k * ticks_per_frame``.
+
+    ``render.tick_offset`` is not applied: it only shifts when the render commands are scheduled
+    (``pipeline/segment.py`` ``mirv_tick = demo_tick + tick_offset``), so frame ``k`` still shows ``T_k``.
+    """
+    return frame_to_tick(np.arange(n_frames), int(attrs["start_tick"]), ticks_per_frame(cfg))
 
 
 def load_demo_tables(
@@ -445,6 +449,8 @@ def scan_episode(
         "with_smoke": 0,
         "static_ok": 0,
         "enemy_excluded": 0,
+        "los_dropped_smokes": 0,
+        "frames_with_los_dropped": 0,
         "smoke_fraction_sum": 0.0,
     }
     for k, geom in enumerate(geoms):
@@ -452,6 +458,9 @@ def scan_episode(
         if smoke is None:
             counts["no_pose"] += 1
             continue
+        dropped = sm.los_dropped_count(geom.tick, tables.smokes, geom.eye, geom.yaw, geom.pitch, cfg, size)
+        counts["los_dropped_smokes"] += dropped
+        counts["frames_with_los_dropped"] += dropped > 0
         smoke_px[k] = smoke.sum()
         if smoke_px[k] >= min_px:
             counts["with_smoke"] += 1
@@ -804,6 +813,17 @@ def pick_frames(candidates: Sequence[tuple[int, int]], n: int) -> list[tuple[int
     return [candidates[int(i)] for i in np.linspace(0, len(candidates) - 1, n).round()]
 
 
+def target_frames(
+    contexts: Sequence[H2Context], steps: int, min_px: int
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Split the ``(context index, step)`` target frames into those with a smoke of ``min_px`` pixels and the rest."""
+    smoky, other = [], []
+    for c in contexts:
+        for t in range(steps):
+            (smoky if c.episode.smoke_px[c.start + N_COND + t] >= min_px else other).append((c.index, t + 1))
+    return smoky, other
+
+
 def write_mask_validation(
     contexts: Sequence[H2Context], reader: EpisodeReader, cfg: DictConfig, n: int, steps: int, out_dir: Path
 ) -> list[tuple[int, int]]:
@@ -818,15 +838,11 @@ def write_mask_validation(
         out_dir: Directory for the PNGs (created).
 
     Returns:
-        The chosen ``(context index, step)`` pairs (steps are 1-based), which the triptychs reuse.
+        The chosen ``(context index, step)`` pairs (steps are 1-based).
     """
     size = tuple(int(v) for v in cfg.resolution.render)
     min_px = int(cfg.eval.h2.min_region_px)
-    smoky, other = [], []
-    for c in contexts:
-        for t in range(steps):
-            frame = c.start + N_COND + t
-            (smoky if c.episode.smoke_px[frame] >= min_px else other).append((c.index, t + 1))
+    smoky, other = target_frames(contexts, steps, min_px)
     chosen = pick_frames(smoky, n)
     if len(chosen) < n:
         chosen += pick_frames(other, n - len(chosen))
@@ -1023,10 +1039,8 @@ def run_h2(
     stats = mask_statistics(episodes)
 
     reader = EpisodeReader()
-    chosen = write_mask_validation(ctxs, reader, cfg, n_validate, rollout_steps, out_dir / "mask_validation")
-    smoky = [
-        k for k in chosen if ctxs[k[0]].episode.smoke_px[ctxs[k[0]].start + N_COND + k[1] - 1] >= int(h.min_region_px)
-    ]
+    write_mask_validation(ctxs, reader, cfg, n_validate, rollout_steps, out_dir / "mask_validation")
+    smoky = target_frames(ctxs, rollout_steps, int(h.min_region_px))[0]  # independent of n_validate
     example_pairs = pick_frames(smoky, int(h.examples))
     example_keys = [(ci, cond, step) for ci, step in example_pairs for cond in CONDITIONS]
 
