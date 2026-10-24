@@ -616,6 +616,7 @@ def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
                 "demo_id": demo_id,
                 "kind": ep.kind,
                 "player": ep.player_name,
+                "user_id": ep.user_id,  # demo user_id of the spectated player (bots share steamid 0); H2 needs it
                 "start_tick": ep.start_tick,
                 **provenance,
             }

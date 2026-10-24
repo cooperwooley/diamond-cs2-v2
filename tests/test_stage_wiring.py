@@ -242,6 +242,7 @@ def test_labels_and_frames_are_aligned_in_the_packed_files(cfg, use_parser, fake
     assert np.array_equal(frames, to_low_res(np.stack(src)))  # frames 20..39 of the segment, not 0..19
     assert attrs["start_tick"] == rendered["segments"][0]["start_tick"] + 20 * 4
     assert (attrs["player"], attrs["demo_id"], attrs["kind"], attrs["cs2_build"]) == ("Bot A", DEMO, "dm", 4242)
+    assert attrs["user_id"] == 1  # the spectated bot is told apart by user_id (steamid 0 is shared)
     assert (attrs["cs2wm_git_sha"], attrs["demoparser2_version"]) == ("deadbeef", demo.parser_version())
     # the fake shots: bot 1 fires at ticks 13, 14 (episode 0) and 120 (episode 1); bot 2's shots must not leak in
     assert lmb0.sum() >= 1 and lmb0[0] == 1  # tick 13 is in frame 0 (window (10, 14])
