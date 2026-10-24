@@ -320,7 +320,16 @@ def test_failure_mid_loop_still_cleans_up(dummy_pygame, agent, cfg, tmp_path, mo
             raise RuntimeError("boom")
         return []
 
-    session = make_session(cfg, agent, tmp_path, record=tmp_path / "x.mp4", event_source=events, max_frames=10)
+    # exactly 1/16 s per frame, so each frame is written once regardless of machine load
+    session = make_session(
+        cfg,
+        agent,
+        tmp_path,
+        record=tmp_path / "x.mp4",
+        event_source=events,
+        max_frames=10,
+        clock=FakeClock(step=1 / 32),
+    )
     with pytest.raises(RuntimeError, match="boom"):
         session.run()
     assert FakeWriter.instances[0].released and FakeWriter.instances[0].written == 2
