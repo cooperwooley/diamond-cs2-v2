@@ -95,18 +95,18 @@ def _gaussian_window(channels: int, device: torch.device) -> torch.Tensor:
     return (g[:, None] * g[None, :]).expand(channels, 1, _SSIM_WINDOW, _SSIM_WINDOW).contiguous()
 
 
-def ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Per-image SSIM for images in [0, 1] (data range 1).
+def ssim_map(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-position SSIM map for images in [0, 1] (data range 1), averaged over channels.
 
     11x11 Gaussian window with sigma 1.5, K1 = 0.01, K2 = 0.03, computed per channel over the valid region (no
-    padding) and averaged over channels and positions.
+    padding). Entry ``(i, j)`` belongs to the window centred on pixel ``(i + 5, j + 5)``.
 
     Args:
         pred: ``float[b, c, H, W]`` with ``H, W >= 11``.
         target: ``float[b, c, H, W]``.
 
     Returns:
-        ``float[b]``; 1 for identical images.
+        ``float[b, H - 10, W - 10]``.
     """
     pred, target = pred.float(), target.float()
     win = _gaussian_window(pred.shape[1], pred.device)
@@ -121,7 +121,20 @@ def ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     cov = blur(pred * target) - mu_p * mu_t
     num = (2 * mu_p * mu_t + c1) * (2 * cov + c2)
     den = (mu_p**2 + mu_t**2 + c1) * (var_p + var_t + c2)
-    return (num / den).flatten(1).mean(1)
+    return (num / den).mean(1)
+
+
+def ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-image SSIM for images in [0, 1] (data range 1): the mean of ``ssim_map``.
+
+    Args:
+        pred: ``float[b, c, H, W]`` with ``H, W >= 11``.
+        target: ``float[b, c, H, W]``.
+
+    Returns:
+        ``float[b]``; 1 for identical images.
+    """
+    return ssim_map(pred, target).flatten(1).mean(1)
 
 
 def make_lpips_fn(device: torch.device) -> LpipsFn:
