@@ -21,6 +21,13 @@ Method
    (bicubic). The first criterion is one-sided: a v2 score better than v1's is not an incompatibility. Without
    ``--v1-fullres`` the first criterion cannot be evaluated and the verdict is incomplete, not a pass.
 
+Caveats (also under ``notes`` in the JSON):
+
+* v2 ground truth, and so the previous-frame conditioning, is JPEG-decoded (the 10% JPEG subset, quality 95) while v1
+  is raw. That adds compression error to v2 only and biases the comparison against v2, i.e. conservatively.
+* Scores are teacher-forced (previous frame = GT t-1) with ``s_cond = 0``. In play the previous frame is the
+  upsampler's own output, so these scores are optimistic relative to play.
+
 Outputs: ``upsampler_check.json`` and ``upsampler_check_grid.png`` in ``out_dir``, plus a printed summary table.
 """
 
@@ -52,6 +59,17 @@ TILE_LABELS = ("low-res (nearest)", "bicubic", "upsampler", "ground truth")
 _SSIM_WINDOW = 11
 _SSIM_SIGMA = 1.5
 _SSIM_K1, _SSIM_K2 = 0.01, 0.03
+
+NOTES = (
+    (
+        "v2 ground truth and the previous-frame conditioning are JPEG-decoded (10% JPEG subset) while v1 is raw: "
+        "this biases the comparison against v2 (conservative)."
+    ),
+    (
+        "Scores are teacher-forced (previous frame = GT t-1, s_cond=0); in play the previous frame is generated, "
+        "so they are optimistic relative to play."
+    ),
+)
 
 LpipsFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
@@ -318,13 +336,22 @@ def format_table(results: dict[str, dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def write_grid(path: Path, rows_by_dataset: dict[str, list[list[np.ndarray]]]) -> None:
+def write_grid(path: Path, rows_by_dataset: dict[str, list[list[np.ndarray]]]) -> bool:
     """Write the side-by-side grid: low-res (nearest), bicubic, upsampler, ground truth per frame.
 
     Args:
         path: Output PNG.
-        rows_by_dataset: Dataset name to rows of four ``uint8[H, W, 3]`` RGB tiles.
+        rows_by_dataset: Dataset name to rows of four ``uint8[H, W, 3]`` RGB tiles (any number of rows per dataset).
+
+    Returns:
+        True if the PNG was written; False (nothing written) if there are no rows at all.
+
+    Raises:
+        OSError: If the PNG cannot be written.
     """
+    rows_by_dataset = {k: v for k, v in rows_by_dataset.items() if v}
+    if not rows_by_dataset:
+        return False
     font, band = cv2.FONT_HERSHEY_SIMPLEX, 26
 
     def label(text: str, width: int) -> np.ndarray:
@@ -341,6 +368,7 @@ def write_grid(path: Path, rows_by_dataset: dict[str, list[list[np.ndarray]]]) -
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), np.ascontiguousarray(grid[..., ::-1])):
         raise OSError(f"could not write {path}")
+    return True
 
 
 def _git_sha() -> str | None:
@@ -389,8 +417,13 @@ def run_upsampler_check(
 
     Returns:
         The report dict that was written to JSON: per-dataset metrics (``v2``, and ``v1`` if given), the verdict
-        under ``verdict`` and run provenance.
+        under ``verdict``, the ``grid`` status, ``notes`` and run provenance.
+
+    Raises:
+        ValueError: If ``n < 1``, or a dataset has no usable frames.
     """
+    if n < 1:
+        raise ValueError(f"n must be at least 1, got {n}")
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(out_dir)
     agent = load_upsampler_agent(ckpt, dev, agent_cfg)
@@ -417,10 +450,12 @@ def run_upsampler_check(
         "device": str(dev),
         "torch_version": torch.__version__,
         "git_sha": _git_sha(),
+        "notes": list(NOTES),
     }
     out_dir.mkdir(parents=True, exist_ok=True)
+    written = write_grid(out_dir / "upsampler_check_grid.png", grid_rows)
+    report["grid"] = {"written": written, "rows": {k: len(v) for k, v in grid_rows.items()}}
     (out_dir / "upsampler_check.json").write_text(json.dumps(report, indent=2) + "\n")
-    write_grid(out_dir / "upsampler_check_grid.png", grid_rows)
     print(format_table(results))
     print(verdict["summary"])
     return report

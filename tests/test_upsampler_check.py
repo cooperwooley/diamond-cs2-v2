@@ -20,6 +20,7 @@ from cs2wm.pipeline.pack import to_low_res, write_episode
 from cs2wm.play.agent import DEFAULT_AGENT_CONFIG_PATH
 
 H, W = 150, 280
+EXPECTED_SSIM = 0.7039242527751228  # numpy_ssim on the default_rng(123) pair below
 
 
 def smooth_frames(n: int, seed: int) -> np.ndarray:
@@ -295,3 +296,116 @@ def test_cli_passes_options_and_exits_nonzero_on_fail(monkeypatch, tmp_path) -> 
     assert str(seen["v1_fullres_dir"]) == "v1" and seen["out"] == tmp_path
     monkeypatch.setattr(uc, "run_upsampler_check", lambda *a, **k: {"verdict": {"passed": True}})
     assert cli.main(argv) == 0
+
+
+def test_cli_exit_code_2_when_incomplete(monkeypatch) -> None:
+    monkeypatch.setattr(uc, "run_upsampler_check", lambda *a, **k: {"verdict": {"passed": None}})
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["eval", "upsampler", "--ckpt", "c.pt", "--fullres", "f"])
+    assert exc.value.code == 2
+
+
+# --- grid, notes, references -------------------------------------------------------------------------------------
+
+
+def test_write_grid_with_no_rows_writes_nothing(tmp_path) -> None:
+    assert uc.write_grid(tmp_path / "g.png", {}) is False
+    assert uc.write_grid(tmp_path / "g.png", {"v2": [], "v1": []}) is False
+    assert not (tmp_path / "g.png").exists()
+
+
+def test_write_grid_skips_empty_dataset_but_keeps_others(tmp_path) -> None:
+    row = [np.zeros((H, W, 3), np.uint8)] * 4
+    assert uc.write_grid(tmp_path / "g.png", {"v2": [row], "v1": []}) is True
+    assert cv2.imread(str(tmp_path / "g.png")).shape == (26 + 26 + H, 4 * W, 3)
+
+
+def test_n_below_one_is_rejected(ckpt, v2_dir, agent_cfg, tmp_path) -> None:
+    with pytest.raises(ValueError, match="n must be at least 1"):
+        run(ckpt, v2_dir, None, tmp_path, agent_cfg, n=0)
+
+
+def test_fewer_than_four_grid_rows_and_json_records_grid_and_notes(ckpt, v2_dir, agent_cfg, tmp_path) -> None:
+    report = run(ckpt, v2_dir, None, tmp_path, agent_cfg, n=2)
+    assert report["grid"] == {"written": True, "rows": {"v2": 2}}
+    assert cv2.imread(str(tmp_path / "upsampler_check_grid.png")).shape == (26 + 26 + 2 * H, 4 * W, 3)
+    on_disk = json.loads((tmp_path / "upsampler_check.json").read_text())
+    assert on_disk["grid"] == report["grid"]
+    assert any("JPEG" in note and "conservative" in note for note in on_disk["notes"])
+    assert any("teacher-forced" in note and "optimistic" in note for note in on_disk["notes"])
+
+
+def numpy_ssim(x: np.ndarray, y: np.ndarray, size: int = 11, sigma: float = 1.5) -> float:
+    """Straightforward reference SSIM for ``[H, W]`` images in [0, 1]: explicit window, valid region only."""
+    ax = np.arange(size) - (size - 1) / 2
+    win = np.exp(-(ax[:, None] ** 2 + ax[None, :] ** 2) / (2 * sigma**2))
+    win /= win.sum()
+    c1, c2 = 0.01**2, 0.03**2
+    vals = []
+    for i in range(x.shape[0] - size + 1):
+        for j in range(x.shape[1] - size + 1):
+            a, b = x[i : i + size, j : j + size], y[i : i + size, j : j + size]
+            mu_a, mu_b = (win * a).sum(), (win * b).sum()
+            var_a, var_b = (win * a * a).sum() - mu_a**2, (win * b * b).sum() - mu_b**2
+            cov = (win * a * b).sum() - mu_a * mu_b
+            vals.append((2 * mu_a * mu_b + c1) * (2 * cov + c2) / ((mu_a**2 + mu_b**2 + c1) * (var_a + var_b + c2)))
+    return float(np.mean(vals))
+
+
+def test_ssim_matches_independent_numpy_reference_and_fixed_value() -> None:
+    rng = np.random.default_rng(123)
+    x = rng.random((3, 20, 24)).cumsum(1).cumsum(2)  # spatially correlated, so the window shape matters
+    x = (x - x.min()) / (x.max() - x.min())
+    y = np.clip(x + 0.05 * rng.standard_normal(x.shape), 0, 1)
+    ref = np.mean([numpy_ssim(x[c], y[c]) for c in range(3)])
+    got = uc.ssim(torch.from_numpy(x)[None], torch.from_numpy(y)[None]).item()
+    assert got == pytest.approx(ref, abs=1e-6)
+    # Value of numpy_ssim above (11x11 window, sigma 1.5, K1 0.01, K2 0.03) for default_rng(123), computed once in
+    # float64 and pinned, so that changing sigma, the window size or the constants fails this test.
+    assert ref == pytest.approx(EXPECTED_SSIM, abs=1e-6)
+    # Sanity that the pin is sensitive: another sigma or window size gives a clearly different number.
+    for kw in ({"sigma": 1.0}, {"sigma": 2.5}, {"size": 7}):
+        other = np.mean([numpy_ssim(x[c], y[c], **kw) for c in range(3)])
+        assert abs(other - ref) > 1e-4, kw
+
+
+def test_lpips_inputs_are_in_range_and_ordered_pred_then_gt(ckpt, v2_dir, agent_cfg, tmp_path) -> None:
+    from data import CS2Hdf5Dataset
+
+    calls = []
+
+    def spy(pred, target):
+        calls.append((pred.clone(), target.clone()))
+        return fake_lpips(pred, target)
+
+    run(ckpt, v2_dir, None, tmp_path, agent_cfg, n=4, batch_size=4, lpips_fn=spy)
+    assert len(calls) == 2  # upsampler, then bicubic
+    ds = CS2Hdf5Dataset(v2_dir)
+    gt = torch.stack([uc._load_pair(ds, e, t)[1] for e, t in uc.sample_frame_indices(ds.lengths, 4, seed=0)])
+    for pred, target in calls:
+        assert pred.min() >= -1 and pred.max() <= 1 and target.min() >= -1 and target.max() <= 1
+        torch.testing.assert_close(target, gt)  # second argument is the ground truth
+        assert not torch.equal(pred, gt)
+    bicubic = torch.nn.functional.interpolate(
+        uc.frames_to_tensor(to_low_res(uc._to_bgr_uint8(gt))), size=(H, W), mode="bicubic", align_corners=False
+    ).clamp(-1, 1)
+    torch.testing.assert_close(calls[1][0], bicubic)
+
+
+def test_low_res_clamps_bicubic_overshoot_instead_of_wrapping() -> None:
+    """Golden case: a bright pixel next to black overshoots above 255 after bicubic, which a bare ``.byte()`` wraps."""
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TF
+
+    gt = np.zeros((1, H, W, 3), np.uint8)
+    gt[0, 60:90, 100:180] = 255  # a white block on black: hard edges all round
+    x = torch.from_numpy(gt).flip(3).permute(0, 3, 1, 2).float().div(255).mul(2).sub(1)
+    y = TF.resize(x, [30, 56], interpolation=InterpolationMode.BICUBIC, antialias=True).add(1).div(2).mul(255)
+    assert y.max() > 255 and y.min() < 0  # the overshoot exists
+    wrapped = y.byte().permute(0, 2, 3, 1).numpy()  # v1: wraps (257.5 -> 1, -3 -> 253)
+    expected = y.clamp(0, 255).byte().permute(0, 2, 3, 1).numpy()
+    assert (wrapped != expected).any()
+    low = uc.frames_to_tensor(to_low_res(uc._to_bgr_uint8(uc.frames_to_tensor(gt))))
+    np.testing.assert_array_equal(((low + 1) / 2 * 255).round().permute(0, 2, 3, 1).numpy().astype(np.uint8), expected)
+    # Saturated, not wrapped: the overshooting white-edge pixels are 255 and the dark ones 0.
+    assert low.max() == 1.0 and low.min() == -1.0
