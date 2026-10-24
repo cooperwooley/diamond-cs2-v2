@@ -44,7 +44,16 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
    smoke test of the most recent demo's plan (`render_smoke_test`, in `<root>/smoke`) must pass first, else generation
    and rendering stop and a high-priority alert goes out. ntfy messages: start, hourly heartbeat, alerts (guard trips,
    repeated failures, sync down) and the morning summary. The exit code is 3 if the night ended on an alert. The
-   scheduled task is `scripts/windows/install_task.ps1` (task `dcs2-supervisor`, interactive session);
+   Render's own `render.retries` launches count against `max_attempts`, a timeout is not retried again, and a demo
+   is given up on after `max_demo_wall_min` of wall time in one night; the first demo to run out of attempts in a stage
+   raises an alert at once. Paused with packed demos that cannot sync (Mill down), the supervisor alerts once and
+   retries every `stall_backoff_min` until the deadline; it ends early only when nothing at all can progress. The
+   leftovers of `failed` demos are not counted by the disk guard (one alert per night lists them);
+   `cs2wm cleanup --failed [--dry-run]` deletes them (not while `supervise` runs; demos and QA are never touched).
+   Only demos of the `--profile` kind count toward `--target-hours`. Heartbeats are checked between stages and
+   around each generate block, but not inside one (`generate.run` has no hook), so a block can delay one. The
+   scheduled task has no "start when available": if the PC is off at the start time the night is skipped. It is
+   `scripts/windows/install_task.ps1` (task `dcs2-supervisor`, interactive session);
    `run_supervisor.ps1` logs to `logs/supervisor-<date>.log`.
 
 By hand (the #19 pilot): `cs2wm segment|render|extract|pack --all-pending` runs a stage over every demo that is ready

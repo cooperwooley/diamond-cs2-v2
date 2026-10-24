@@ -152,6 +152,8 @@ supervisor:
   heartbeat_min: 60
   max_attempts: 3                   # attempts per stage per demo, then the demo is failed and the night goes on
   backoff_s: 60                     # wait before attempt n+1 is backoff_s * 2^(n-1): 60 s, then 120 s
+  max_demo_wall_min: 90             # wall time one demo may use per night (all stages and attempts); then it is given up on
+  stall_backoff_min: 10             # when paused with packed demos that cannot sync, retry this often until the deadline
   alert_failed_in_row: 3            # alert after this many demos in a row failed, or this many failures in one stage with no success
   max_generate_failures: 2          # stop generating after this many generate blocks in a row that failed or gave no demo
   smoke_s: 10                       # length of the render smoke test after a CS2 patch (seconds of footage)

@@ -72,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="print the pipeline state table (#20)")
 
+    p = sub.add_parser("cleanup", help="free working-set disk (#20); do not run while `supervise` is running")
+    p.add_argument("--failed", action="store_true", help="delete frames/raw/labels (and pack .staging) of failed demos")
+    p.add_argument("--dry-run", action="store_true", help="only list what would be deleted")
+
     p = sub.add_parser("qa-summary", help="summarise extract QA (#19)")
     p.add_argument("--kind", choices=["dm", "human", "smoke"], default=None)
     p.add_argument("--since", default=None, help="only demos newer than this, e.g. 24h")
@@ -277,6 +281,19 @@ def _dispatch(args: argparse.Namespace) -> int:
             return _supervisor(cfg).run_until(args.until, args.target_hours, args.profile).exit_code
         except ValueError as exc:
             raise SystemExit(f"supervise: {exc}") from exc
+    elif cmd == "cleanup":
+        from cs2wm.pipeline.supervisor import cleanup_failed
+
+        if not args.failed:
+            raise SystemExit("cleanup: say what to clean; the only choice is --failed")
+        cfg = _cfg(args)
+        found = cleanup_failed(cfg, _supervisor(cfg).state, args.dry_run)
+        for demo_id, path, size in found:
+            print(f"{'would delete' if args.dry_run else 'deleted'} {path} ({size / 1e6:.1f} MB) [{demo_id}]")
+        total = sum(size for _, _, size in found)
+        print(
+            f"{len(found)} dir(s), {total / 1e9:.2f} GB{' (dry run)' if args.dry_run else ''}; demos and QA untouched"
+        )
     elif cmd == "status":
         cfg = _cfg(args)
         sup = _supervisor(cfg)

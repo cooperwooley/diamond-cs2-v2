@@ -48,6 +48,7 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from cs2wm import demo as demo_utils
+from cs2wm.config import SAFE_NAME_RE
 from cs2wm.pipeline import generate, ntfy, proc
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ _INPUT_STATE = {
     "pack": StageState.EXTRACTED,
     "sync": StageState.PACKED,
 }
+_RENDER_OK = ("rendered", "extracted", "packed", "synced")  # demos whose render succeeded: known-good smoke inputs
 _ADVANCEABLE = ("pending", "segmented", "rendered", "extracted")  # states a demo is advanced from by the loop
 _OUTPUT_STATE = {
     "segment": StageState.SEGMENTED,
@@ -95,7 +97,19 @@ class StateError(ValueError):
 
 
 class StageFailure(RuntimeError):
-    """A stage ran but did not produce its output (the message is recorded as the failure reason)."""
+    """A stage ran but did not produce its output (the message is recorded as the failure reason).
+
+    Args:
+        message: The failure reason.
+        attempts: Launches the stage already used internally (render retries a crash or timeout itself), so the
+            supervisor can count them against ``supervisor.max_attempts``.
+        timed_out: The stage hit its timeout; it is not retried again (it had its internal retry already).
+    """
+
+    def __init__(self, message: str, attempts: int = 1, timed_out: bool = False) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.timed_out = timed_out
 
 
 def _now() -> str:
@@ -247,11 +261,15 @@ class StageReport:
         done: Demos that finished the stage.
         failed: Failed demos with their reasons.
         outputs: Path written by each finished demo, for the stages that name one (segment: the plan).
+        attempts: Launches a failed demo used inside the stage (default 1).
+        timed_out: Failed demos whose stage hit its timeout.
     """
 
     done: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
+    attempts: dict[str, int] = field(default_factory=dict)
+    timed_out: set[str] = field(default_factory=set)
 
 
 def resolve_deadline(now: datetime, until: str) -> datetime:
@@ -287,7 +305,49 @@ def _dir_bytes(path: Path) -> int:
     return total
 
 
-def measure_disk(cfg: DictConfig) -> tuple[float, float]:
+def demo_leftovers(cfg: DictConfig, demo_id: str) -> list[Path]:
+    """The working-set directories of one demo that exist: frames, raw, labels and pack's ``.staging``/``.old`` dirs.
+
+    Never the demo, its plan or its QA file. A demo id that is not a plain file name yields nothing.
+    """
+    if not SAFE_NAME_RE.match(demo_id):
+        return []
+    p = cfg.paths
+    paths = [Path(p.frames) / demo_id, Path(p.frames) / f"{demo_id}.deleting", Path(p.raw) / demo_id]
+    paths += [Path(p.labels) / demo_id, Path(p.labels) / f"{demo_id}.deleting"]
+    for base in (p.hdf5, p.hdf5_fullres):
+        for kind in cfg.episodes.kinds:
+            paths += [Path(base) / kind / f"{demo_id}{suffix}" for suffix in (".staging", ".old")]
+    return [path for path in paths if path.exists()]
+
+
+def failed_leftovers(cfg: DictConfig, demo_ids: Iterable[str]) -> list[tuple[str, Path, int]]:
+    """``(demo id, directory, bytes)`` for the working-set leftovers of the given demos."""
+    return [(d, path, _dir_bytes(path)) for d in sorted(demo_ids) for path in demo_leftovers(cfg, d)]
+
+
+def cleanup_failed(cfg: DictConfig, state: PipelineState, dry_run: bool = False) -> list[tuple[str, Path, int]]:
+    """Delete the working-set directories of ``failed`` demos (``cs2wm cleanup --failed``).
+
+    Demos, plans, QA files and the state are never touched. A failed demo that is re-run later must be re-rendered.
+
+    Args:
+        cfg: A validated cs2wm config.
+        state: The pipeline state.
+        dry_run: Only report what would be deleted.
+
+    Returns:
+        What was (or would be) deleted, as from ``failed_leftovers``.
+    """
+    failed = [d for d, rec in state.demos.items() if rec["state"] == StageState.FAILED.value]
+    found = failed_leftovers(cfg, failed)
+    if not dry_run:
+        for _, path, _ in found:
+            shutil.rmtree(path, ignore_errors=True)
+    return found
+
+
+def measure_disk(cfg: DictConfig, exclude: Iterable[str] = ()) -> tuple[float, float]:
     """Measure the disk guard's inputs.
 
     The working set is ``frames``, ``raw``, ``labels``, ``hdf5`` and ``hdf5_fullres`` (the pack ``.staging`` dirs live
@@ -295,11 +355,14 @@ def measure_disk(cfg: DictConfig) -> tuple[float, float]:
 
     Args:
         cfg: A validated cs2wm config.
+        exclude: Demo ids whose leftovers (``demo_leftovers``) are not counted: failed demos never free them, so
+            they must not keep the guard tripped (``cs2wm cleanup --failed`` deletes them).
 
     Returns:
         ``(working set GB, free GB)``.
     """
     working = sum(_dir_bytes(Path(cfg.paths[name])) for name in WORKING_SET_DIRS)
+    working -= sum(size for _, _, size in failed_leftovers(cfg, exclude))
     probe = Path(cfg.paths.root)
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
@@ -373,7 +436,7 @@ class Hooks:
         now: Local wall clock.
         sleep: Sleep, used for the backoff.
         notify: ``ntfy.notify``-like; default posts to ``supervisor.ntfy_server``/``ntfy_topic``.
-        disk: ``cfg -> (working set GB, free GB)``; default ``measure_disk``.
+        disk: ``(cfg, failed demo ids) -> (working set GB, free GB)``; default ``measure_disk``.
         build_id: ``cs2_dir -> CS2 buildid``.
         generate: ``(cfg, profile, hours) -> demos``; default ``generate.run``.
         sync: ``() -> summary with .ok``; default ``Supervisor.run_sync``.
@@ -387,7 +450,7 @@ class Hooks:
     now: Callable[[], datetime] = datetime.now
     sleep: Callable[[float], None] = time.sleep
     notify: Callable[..., None] | None = None
-    disk: Callable[[DictConfig], tuple[float, float]] = measure_disk
+    disk: Callable[[DictConfig, Iterable[str]], tuple[float, float]] = measure_disk
     build_id: Callable[[Path], int] = demo_utils.cs2_build_id
     generate: Callable[[DictConfig, str, float], Any] | None = None
     sync: Callable[[], Any] | None = None
@@ -411,6 +474,8 @@ class Night:
         stage_wall_s: Wall seconds per stage (``generate`` and ``smoke`` included).
         stage_runs: Successful runs per stage.
         stopped_generation: Why generation stopped before the end (``None`` while it may continue).
+        pause_reason: Why generation is paused right now (disk guard).
+        stalled: The pipeline is waiting for a sync to work again (a stall alert was sent).
         blocked: Stages that cannot run tonight (``render`` after a failed smoke test).
     """
 
@@ -423,6 +488,7 @@ class Night:
     stage_wall_s: Counter = field(default_factory=Counter)
     stage_runs: Counter = field(default_factory=Counter)
     stopped_generation: str | None = None
+    pause_reason: str = ""
     blocked: set[str] = field(default_factory=set)
     # bookkeeping for the alerts
     failed_in_row: int = 0
@@ -431,6 +497,8 @@ class Night:
     generate_failures: int = 0
     alerted: set[str] = field(default_factory=set)
     bad_builds: set[int] = field(default_factory=set)
+    demo_wall_s: Counter = field(default_factory=Counter)
+    stalled: bool = False
 
     @property
     def exit_code(self) -> int:
@@ -512,7 +580,8 @@ class Supervisor:
 
             result = rnd.run(self.demo_path(demo_id), cfg)
             if not result.ok:
-                raise StageFailure(result.reason or "render failed")
+                reason = result.reason or "render failed"
+                raise StageFailure(reason, result.attempts, reason.startswith("timeout"))
             return {"rendered_frames": sum(result.frames.values()), "realtime_factor": round(result.realtime_factor, 2)}
 
         def extract(demo_id: str) -> dict[str, Any]:
@@ -559,6 +628,9 @@ class Supervisor:
                 log.error("%s %s: FAILED after %.1f s: %s", stage, demo_id, wall, reason, exc_info=not expected)
                 self.state.mark(demo_id, StageState.FAILED, reason, wall, stage)
                 report.failed[demo_id] = reason
+                report.attempts[demo_id] = getattr(exc, "attempts", 1)
+                if getattr(exc, "timed_out", False):
+                    report.timed_out.add(demo_id)
             else:
                 wall = clock() - start
                 if "_output" in info:
@@ -636,7 +708,7 @@ class Supervisor:
         log.info("supervise: target %.2f h, until %s, profile %s", target_hours, night.deadline, profile)
         try:
             self._recover()
-            working, free = self.hooks.disk(self.cfg)
+            working, free = self._disk()
             self._send(ntfy.format_start(target_hours, night.deadline, now, self._read_build(), working, free, profile))
             night.reason = self._loop()
         except BaseException as exc:
@@ -658,6 +730,7 @@ class Supervisor:
                 return "deadline reached"
             self._heartbeat()
             self._check_patch()
+            self._check_leftovers()
             generation = self._generate_block()
             progressed = self._drain()
             if self._target_reached():
@@ -665,17 +738,64 @@ class Supervisor:
             if h.now() >= night.deadline:
                 return "deadline reached"
             if generation == "generated":
+                if night.stalled:
+                    night.stalled = False
+                    self._send(ntfy.Message("dcs2: stall cleared", "Generation resumed.", "default", ("tada",)))
                 continue
-            if generation == "paused" and not progressed:
-                self._alert(
-                    "disk guard",
-                    "The working set is over the limit and nothing can be drained (sync failing, or leftovers "
-                    "from failed demos). Generation is paused; the night ends.",
-                    "disk-stall",
-                )
-                return "disk guard: working set stuck above the limit"
-            if generation == "stopped" and not progressed:
-                return night.stopped_generation or "nothing left to do"
+            if not progressed:
+                if not self._can_progress():
+                    if generation == "paused":
+                        self._alert(
+                            "disk guard",
+                            f"Generation is paused ({night.pause_reason}) and nothing is left to drain, so nothing "
+                            "can free space. The night ends; free disk space or run `cs2wm cleanup --failed`.",
+                            "disk-stall",
+                        )
+                        return f"disk guard: {night.pause_reason}"
+                    return night.stopped_generation or "nothing left to do"
+                # Something is left but the drain got nowhere (the Mill is down): wait and retry until the deadline.
+                why = night.pause_reason if generation == "paused" else night.stopped_generation or "no progress"
+                if not night.stalled:
+                    night.stalled = True
+                    self._alert(
+                        "pipeline stalled",
+                        f"No progress ({why}); packed demos cannot sync (Mill down?). "
+                        f"Retrying every {self.cfg.supervisor.stall_backoff_min} min until the deadline.",
+                        "stall",
+                    )
+                remaining_s = (night.deadline - h.now()).total_seconds()
+                h.sleep(min(float(self.cfg.supervisor.stall_backoff_min) * 60, max(remaining_s, 0.0)))
+
+    def _disk(self) -> tuple[float, float]:
+        """``(working set GB, free GB)``, not counting the leftovers of failed demos."""
+        failed = [d for d, rec in self.state.demos.items() if rec["state"] == StageState.FAILED.value]
+        return self.hooks.disk(self.cfg, failed)
+
+    def _check_leftovers(self) -> None:
+        """Alert once per night about the working-set dirs of failed demos (they are not counted by the disk guard)."""
+        failed = [d for d, rec in self.state.demos.items() if rec["state"] == StageState.FAILED.value]
+        found = failed_leftovers(self.cfg, failed) if failed and "leftovers" not in self.night.alerted else []
+        if found:
+            ids = sorted({d for d, _, _ in found})
+            gb = sum(size for _, _, size in found) / 1e9
+            shown = ", ".join(ids[:8]) + (f" and {len(ids) - 8} more" if len(ids) > 8 else "")
+            self._alert(
+                "failed demos hold disk",
+                f"{gb:.2f} GB of frames/raw/labels from {len(ids)} failed demo(s): {shown}. They are not counted by "
+                "the disk guard; free them with `cs2wm cleanup --failed`.",
+                "leftovers",
+            )
+
+    def _can_progress(self) -> bool:
+        """Whether any demo could still move: something to sync, or a demo whose next stage may run."""
+        for rec in self.state.demos.values():
+            if rec["state"] == "packed":
+                return True
+            if rec["state"] in _ADVANCEABLE:
+                stage = next(s for s in STAGES if _INPUT_STATE[s].value == rec["state"])
+                if stage not in self.night.blocked:
+                    return True
+        return False
 
     def _recover(self) -> None:
         """Re-queue failed demos that still have attempts left (a crash between a failure and its retry)."""
@@ -700,14 +820,17 @@ class Supervisor:
             night.stopped_generation = "deadline close: generation stopped to drain the pipeline"
             log.info("%s (%.0f min to the deadline)", night.stopped_generation, remaining_min)
             return "stopped"
-        working, free = self.hooks.disk(self.cfg)
+        working, free = self._disk()
         if free < float(sup.min_free_gb):
-            night.stopped_generation = f"free disk {free:.1f} GB is below supervisor.min_free_gb"
+            night.pause_reason = f"free disk {free:.1f} GB is below supervisor.min_free_gb"
             self._alert(
-                "disk almost full", f"Only {free:.1f} GB free (minimum {sup.min_free_gb}). Generation stopped.", "free"
+                "disk almost full",
+                f"Only {free:.1f} GB free (minimum {sup.min_free_gb}). Generation is paused until space is freed.",
+                "free",
             )
-            return "stopped"
+            return "paused"
         if working > float(sup.max_working_gb):
+            night.pause_reason = f"working set {working:.1f} GB is over supervisor.max_working_gb"
             log.info(
                 "disk guard: working set %.1f GB > %s GB; generation paused until the pipeline drains",
                 working,
@@ -736,6 +859,7 @@ class Supervisor:
             log.error("generate failed: %s", error, exc_info=not isinstance(exc, generate.GenerateError))
         finally:
             night.stage_wall_s["generate"] += (self.hooks.now() - start).total_seconds()
+            self._heartbeat()  # a block can outlast the heartbeat interval; there is no hook inside generate.run
         added = self.state.discover(self.cfg)  # also what a failed block published before it died
         self.state.save()
         if error is None and not added:
@@ -805,7 +929,8 @@ class Supervisor:
     def render_smoke_test(self) -> str | None:
         """Render ~``supervisor.smoke_s`` seconds of a real, known-good plan to check that rendering survived a patch.
 
-        The most recent demo that still has its ``render_plan.json`` and its ``.dem`` is used. ``make_smoke_plan``
+        The most recent demo whose render succeeded (state rendered or later) and that still has its
+        ``render_plan.json`` and its ``.dem`` is used. ``make_smoke_plan``
         cuts the first ``smoke_s`` seconds of its first episode into a plan of the same demo, which goes through
         ``render.run`` (HLAE, spectate, capture, downscale, frame-count check) with ``paths.plans``, ``frames`` and
         ``raw`` pointed at ``<root>/smoke``, so the demo's real plan, frames and state are untouched. The scratch
@@ -820,6 +945,8 @@ class Supervisor:
 
         cfg = self.cfg
         for demo_id in sorted(self.state.demos, reverse=True):
+            if self.state.demos[demo_id]["state"] not in _RENDER_OK:
+                continue  # a demo that failed to render says nothing about the new build
             plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
             try:
                 demo_path = self.demo_path(demo_id)
@@ -863,7 +990,7 @@ class Supervisor:
                 break
             finished += self._advance(demo_id)
             self._heartbeat()
-            if self.hooks.disk(self.cfg)[0] > float(sup.max_working_gb):
+            if self._disk()[0] > float(sup.max_working_gb):
                 finished += self._sync_packed()  # the packed hdf5 is what is left to free
         return finished + self._sync_packed()
 
@@ -873,26 +1000,35 @@ class Supervisor:
         while True:
             state = self.state.state_of(demo_id)
             stage = next((s for s in STAGES[:-1] if _INPUT_STATE[s] is state), None)
-            if stage is None or stage in self.night.blocked or not self._run_with_retries(stage, demo_id):
+            if stage is None or stage in self.night.blocked or self.hooks.now() >= self.night.deadline:
+                return finished  # the rest of this demo waits for the next night
+            if not self._run_with_retries(stage, demo_id):
                 return finished
             finished += 1
 
     def _run_with_retries(self, stage: str, demo_id: str) -> bool:
         """Run one stage of one demo, up to ``supervisor.max_attempts`` attempts with exponential backoff.
 
-        A failed attempt kills stray CS2/HLAE processes (render), counts in ``attempts[stage]`` and puts the demo
-        back to the stage's input state. The last failed attempt leaves it ``failed`` with the reason.
+        Launches a stage made internally (render retries a crash or timeout ``render.retries`` times) count against
+        the same budget, and a timeout is not retried again. A demo that used ``supervisor.max_demo_wall_min`` this
+        night is given up on at its next failure and not started on a new stage. A failed attempt kills stray
+        CS2/HLAE processes (render), counts in ``attempts[stage]`` and puts the demo back to the stage's input state;
+        the last one leaves it ``failed`` with the reason. Nothing is started after the deadline.
 
         Returns:
             True if the stage finished; False if the demo failed or must wait for the next night.
         """
-        night, rec = self.night, self.state.demos[demo_id]
-        limit = int(self.cfg.supervisor.max_attempts)
+        night, rec, sup = self.night, self.state.demos[demo_id], self.cfg.supervisor
+        limit, wall_cap_s = int(sup.max_attempts), float(sup.max_demo_wall_min) * 60
         while True:
+            if self.hooks.now() >= night.deadline or night.demo_wall_s[demo_id] >= wall_cap_s:
+                return False  # stays queued for the next night
             self._current = f"{stage} {demo_id}"
             start = self.hooks.now()
             report = self.run_stage(stage, [demo_id])
-            night.stage_wall_s[stage] += (self.hooks.now() - start).total_seconds()
+            wall = (self.hooks.now() - start).total_seconds()
+            night.stage_wall_s[stage] += wall
+            night.demo_wall_s[demo_id] += wall
             if demo_id in report.done:
                 night.stage_runs[stage] += 1
                 night.stage_ok[stage] += 1
@@ -905,7 +1041,14 @@ class Supervisor:
             if stage == "render":
                 self._kill_cs2()
             attempts = rec.setdefault("attempts", {})
-            attempts[stage] = attempts.get(stage, 0) + 1
+            attempts[stage] = attempts.get(stage, 0) + report.attempts.get(demo_id, 1)
+            over_cap = night.demo_wall_s[demo_id] >= wall_cap_s
+            if demo_id in report.timed_out:
+                attempts[stage] = max(attempts[stage], limit)  # it had its internal retry: no more
+            if over_cap and attempts[stage] < limit:
+                attempts[stage] = limit
+                reason += f" (gave up: {night.demo_wall_s[demo_id] / 60:.0f} min spent on this demo tonight)"
+                self.state.demos[demo_id]["reason"] = reason
             if attempts[stage] >= limit:
                 self.state.save()
                 self._count_failure(stage, demo_id, reason)
@@ -923,8 +1066,6 @@ class Supervisor:
                 delay,
             )
             self.hooks.sleep(delay)
-            if self.hooks.now() >= night.deadline:
-                return False  # stays queued for the next night
 
     def _requeue(self, demo_id: str, stage: str) -> None:
         """Put a demo that failed in ``stage`` back to the state the stage starts from, keeping the reason."""
@@ -939,6 +1080,12 @@ class Supervisor:
         night.failed_in_row += 1
         night.stage_failed[stage] += 1
         log.error("%s %s: giving up after %s attempts: %s", stage, demo_id, self.cfg.supervisor.max_attempts, reason)
+        self._alert(
+            f"{stage} failed for a demo",
+            f"{demo_id} failed in {stage} after {self.cfg.supervisor.max_attempts} attempts: {reason}. "
+            "The night goes on with the next demo.",
+            f"exhausted-{stage}",
+        )  # the first one per stage; the streak alerts below add to it
         if night.failed_in_row == limit:  # once per streak
             self._alert(
                 "repeated failures",
@@ -991,17 +1138,17 @@ class Supervisor:
     def _count(self, state: str) -> int:
         return sum(1 for rec in self.state.demos.values() if rec["state"] == state)
 
-    def _hours(self, states: tuple[str, ...], key: str) -> float:
-        """Hours (at ``timing.fps``) of the ``key`` frames of the demos in ``states``."""
-        frames = sum(rec.get(key, 0) for rec in self.state.demos.values() if rec["state"] in states)
-        return frames / float(self.cfg.timing.fps) / 3600
+    def _hours(self, states: tuple[str, ...], key: str, kind: str | None = None) -> float:
+        """Hours (at ``timing.fps``) of the ``key`` frames of the demos in ``states`` (of one ``kind``, if given)."""
+        recs = (r for r in self.state.demos.values() if r["state"] in states and kind in (None, r.get("kind")))
+        return sum(r.get(key, 0) for r in recs) / float(self.cfg.timing.fps) / 3600
 
-    def synced_hours(self) -> float:
-        """QA-passing hours that reached the Mill."""
-        return self._hours(("synced",), "frames")
+    def synced_hours(self, kind: str | None = None) -> float:
+        """QA-passing hours that reached the Mill (of one episode kind, if given)."""
+        return self._hours(("synced",), "frames", kind)
 
     def _target_reached(self) -> bool:
-        return self.synced_hours() >= self.night.target_hours
+        return self.synced_hours(self.night.profile) >= self.night.target_hours  # only the profile's kind counts
 
     def _snapshot(self) -> ntfy.Snapshot:
         demos = self.state.demos.values()
@@ -1009,7 +1156,7 @@ class Supervisor:
         past_segment = [r for r in demos if r["state"] != "pending"]
         extracted = [r for r in demos if "qa_episodes" in r]
         qa_total = sum(r["qa_episodes"] for r in extracted)
-        working, free = self.hooks.disk(self.cfg)
+        working, free = self._disk()
         return ntfy.Snapshot(
             generated_h=sum(r.get("demo_s", 0.0) for r in past_segment) / 3600,
             rendered_h=sum(r.get("rendered_frames", 0) for r in demos) / float(self.cfg.timing.fps) / 3600,

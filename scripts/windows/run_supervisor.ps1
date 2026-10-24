@@ -36,7 +36,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 if (-not $env:DCS2_ROOT) {
-    Write-Error "DCS2_ROOT is not set (see issue #2)."
+    [Console]::Error.WriteLine("DCS2_ROOT is not set (see issue #2).")
     exit 2
 }
 
@@ -50,11 +50,19 @@ Set-Location $Repo
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-"$(Get-Date -Format s) run_supervisor: cs2wm supervise --until $Until --target-hours $hours --profile $Profile" | Tee-Object -FilePath $log -Append
+# Windows PowerShell 5.1 would write UTF-16 with Tee-Object, so the log is written with Out-File -Encoding utf8
+# (UTF-8 with a BOM on 5.1). Output is also echoed to the console for a manual run.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+function Write-Log([string]$Line) {
+    $Line | Out-File -FilePath $log -Append -Encoding utf8
+    Write-Host $Line
+}
+
+Write-Log "$(Get-Date -Format s) run_supervisor: cs2wm supervise --until $Until --target-hours $hours --profile $Profile"
 
 # cmd.exe merges stderr (where the Python logging goes) into stdout, so PowerShell 5.1 does not wrap it as errors.
-& cmd.exe /c "cs2wm supervise --until $Until --target-hours $hours --profile $Profile 2>&1" | Tee-Object -FilePath $log -Append
+& cmd.exe /c "cs2wm supervise --until $Until --target-hours $hours --profile $Profile 2>&1" | ForEach-Object { Write-Log $_ }
 $code = $LASTEXITCODE
 
-"$(Get-Date -Format s) run_supervisor: exit code $code" | Tee-Object -FilePath $log -Append
+Write-Log "$(Get-Date -Format s) run_supervisor: exit code $code"
 exit $code

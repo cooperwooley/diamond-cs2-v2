@@ -73,6 +73,9 @@ class World:
         self.smoke_calls = 0
         self.synced_working_gb = 0.0  # working set freed per synced demo
         self.render_working_gb = 0.0  # working set added per rendered demo
+        self.free_on_sync: float | None = None  # free GB after the first successful sync
+        self.excluded: list[str] = []
+        self.render_failure: StageFailure | None = None  # raised by every render, instead of fail[]
 
     # -- hooks --------------------------------------------------------------------------------------------------------
     def now(self) -> datetime:
@@ -86,7 +89,9 @@ class World:
         self.advance(seconds)
 
     def notify(self, message: str, title: str | None = None, priority: str = "default", tags: Any = ()) -> None:
-        self.sent.append({"title": title, "body": message, "priority": priority, "tags": tuple(tags)})
+        self.sent.append(
+            {"at": len(self.events), "title": title, "body": message, "priority": priority, "tags": tuple(tags)}
+        )
 
     def generate(self, cfg: DictConfig, profile: str, hours: float) -> list[Path]:
         assert len(self.generate_hours) < 40, "runaway loop"
@@ -114,6 +119,8 @@ class World:
             self.advance(self.cost[stage])
             if self.crash_at == (stage, demo_id):
                 raise Crash
+            if stage == "render" and self.render_failure:
+                raise self.render_failure
             for key in ((stage, demo_id), (stage, "*")):
                 if self.fail.get(key, 0) > 0:
                     self.fail[key] -= 1
@@ -138,6 +145,8 @@ class World:
         for demo_id in sup.state.pending_for("sync"):
             sup.state.mark(demo_id, StageState.SYNCED, stage_wall_s=1.0)
             self.working -= self.synced_working_gb
+            if self.free_on_sync is not None:
+                self.free = self.free_on_sync
         sup.state.save()
         return SimpleNamespace(ok=True)
 
@@ -146,7 +155,7 @@ class World:
             now=self.now,
             sleep=self.sleep,
             notify=self.notify,
-            disk=lambda cfg: (self.working, self.free),
+            disk=self.disk,
             build_id=lambda cs2_dir: self.build,
             generate=self.generate,
             sync=lambda: self.sync(sup_ref[0]),
@@ -155,6 +164,10 @@ class World:
             backoff=lambda n: 10.0 * n,
             stage_fns={s: self.stage_fn(s) for s in ("segment", "render", "extract", "pack")},
         )
+
+    def disk(self, cfg: DictConfig, exclude: Any = ()) -> tuple[float, float]:
+        self.excluded = list(exclude)
+        return self.working, self.free
 
     def smoke(self) -> str | None:
         self.smoke_calls += 1
@@ -259,8 +272,8 @@ def test_deadline_mid_drain_starts_no_new_demo_but_syncs_what_is_packed(cfg: Dic
     sup, world = make(cfg, world)
     night = sup.run_until("23:50", target_hours=99)  # block ends 23:20; each demo takes ~26 min
     states = {d: r["state"] for d, r in sup.state.demos.items()}
-    assert states["d001"] == "synced" and states["d002"] == "synced"  # d002 finished after the deadline, then synced
-    assert states["d003"] == "pending"  # never started
+    assert states["d001"] == "synced"  # packed before the deadline, synced at the end
+    assert states["d002"] == "rendered" and states["d003"] == "pending"  # the rest waits for the next night
     assert night.reason == "deadline reached" and night.exit_code == 0
 
 
@@ -361,7 +374,8 @@ def test_a_demo_is_failed_after_max_attempts_and_the_night_goes_on(cfg: DictConf
     assert bad["attempts"] == {"render": 3}
     assert world.stage_events("render d001") == ["render d001"] * 3 and world.sleeps == [10.0, 20.0]
     assert world.stage_events("segment d002") and sup.state.demos["d002"]["state"] == "synced"
-    assert night.exit_code == 0  # one bad demo is not an alert
+    assert world.by_title("render failed for a demo")  # the first exhausted demo is reported at once
+    assert night.exit_code == EXIT_ALERT
 
 
 def test_non_render_failures_do_not_kill_cs2(cfg: DictConfig) -> None:
@@ -415,7 +429,7 @@ def test_a_success_resets_the_failure_streak(cfg: DictConfig) -> None:
         world.fail[("segment", demo)] = 99
     night = sup.run_until("23:40", target_hours=99)
     assert sup.state.demos["d003"]["state"] == "synced"
-    assert night.exit_code == 0  # 2 + 2 failures in a row, never 3
+    assert "repeated failures" not in night.alerts  # 2 + 2 failures in a row, never 3
 
 
 def test_sync_failures_are_retried_then_alert_but_never_fail_the_demos(cfg: DictConfig) -> None:
@@ -792,6 +806,8 @@ def test_state_meta_round_trips_and_old_files_load(tmp_path: Path) -> None:
         ("supervisor.generate_block_min=abc", "generate_block_min"),
         ("supervisor.alert_failed_in_row=0", "alert_failed_in_row"),
         ("supervisor.drain_min=null", "drain_min"),
+        ("supervisor.max_demo_wall_min=0", "max_demo_wall_min"),
+        ("supervisor.stall_backoff_min=-1", "stall_backoff_min"),
     ],
 )
 def test_supervisor_config_is_validated(override: str, fragment: str) -> None:
@@ -844,11 +860,16 @@ def test_install_task_script_registers_the_interactive_task() -> None:
         "-Profile",
     ):
         assert expected in text, expected
+    assert "-StartWhenAvailable" not in text.replace(
+        'no "start when available"', ""
+    )  # a late start would run into the morning
+    assert "Write-Error" not in text
     assert "RunLevel Highest" not in text and "-RunLevel" not in text  # no elevation needed
 
 
 def test_run_supervisor_script_runs_cs2wm_supervise_and_propagates_the_exit_code() -> None:
     text = (SCRIPTS / "run_supervisor.ps1").read_text(encoding="utf-8")
+    assert "Tee-Object |" not in text and "Write-Error" not in text  # UTF-16 log on 5.1; Stop turns Write-Error fatal
     for expected in (
         r"C:\dcs2\venv",
         "Activate.ps1",
@@ -858,7 +879,9 @@ def test_run_supervisor_script_runs_cs2wm_supervise_and_propagates_the_exit_code
         "--profile",
         "$env:DCS2_ROOT",
         "supervisor-",
-        "Tee-Object",
+        "Out-File",
+        "-Encoding utf8",
+        "[Console]::Error.WriteLine",
         "exit $",
         "Set-Location",
     ):
@@ -887,3 +910,203 @@ def test_kill_by_name_uses_taskkill_on_windows_only() -> None:
     calls.clear()
     proc.kill_by_name(lambda cmd, **kw: calls.append(cmd), False, ["cs2.exe"])
     assert calls == []
+
+
+# --- review fixes: retry budget, stalls, leftovers, smoke inputs, deadline checks -------------------------------
+
+
+def test_render_that_always_times_out_alerts_after_one_demo_and_the_night_goes_on(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    world.render_failure = StageFailure("timeout after 1980 s (killed HLAE and CS2)", attempts=2, timed_out=True)
+    sup.run_until("23:50", target_hours=99)
+    assert world.stage_events("render d001") == ["render d001"]  # its internal retry is all it gets
+    assert world.sleeps == []
+    (alert,) = world.by_title("render failed for a demo")
+    assert alert["at"] <= world.events.index("segment d002") and world.stage_events(
+        "render d002"
+    )  # next demo still runs
+    rec = sup.state.demos["d001"]
+    assert rec["state"] == "failed" and rec["reason"].startswith("timeout")
+
+
+def test_render_internal_retries_count_against_max_attempts(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    world.render_failure = StageFailure("frame-count mismatch", attempts=2)
+    sup.run_until("23:50", target_hours=99)
+    assert world.stage_events("render d001") == ["render d001"] * 2  # 2 + 2 launches >= 3 attempts: not 3 x 2
+    assert sup.state.demos["d001"]["attempts"] == {"render": 4}
+
+
+def test_a_demo_that_used_its_wall_time_budget_is_given_up_on(tmp_path: Path) -> None:
+    cfg = load_config(
+        overrides=[
+            f"paths.root={tmp_path / 'data'}",
+            f"paths.cs2_dir={tmp_path / 'cs2'}",
+            "supervisor.max_demo_wall_min=90",
+        ]
+    )
+    world = World(cfg)
+    world.cost = {**World.cost, "render": 3000}  # 50 min per attempt
+    sup, world = make(cfg, world)
+    world.fail[("render", "d001")] = 99
+    sup.run_until("07:30", target_hours=0.3)
+    rec = sup.state.demos["d001"]
+    assert world.stage_events("render d001") == ["render d001"] * 2  # the second pushed it over 90 min
+    assert rec["state"] == "failed" and "gave up" in rec["reason"]
+    assert sup.state.demos["d002"]["state"] == "synced"
+
+
+def test_sync_outage_while_paused_is_waited_out_and_generation_resumes(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    world.working, world.synced_working_gb = 9.5, 2.0
+    world.sync_failures = 4  # the first drain (3 tries) fails, the next one recovers
+    sup.state.mark("old", StageState.PACKED, kind="dm", frames=FRAMES)
+    night = sup.run_until("07:30", target_hours=99)
+    assert 600.0 in world.sleeps  # supervisor.stall_backoff_min
+    assert len(world.by_title("pipeline stalled")) == 1 and len(world.by_title("stall cleared")) == 1
+    assert sup.state.state_of("old") is StageState.SYNCED and world.generate_hours
+    assert "pipeline stalled" in night.alerts and "disk guard" not in night.alerts
+
+
+def test_stall_waits_until_the_deadline_while_the_mill_stays_down(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    world.working = 9.5
+    world.sync_failures = 10_000
+    sup.state.mark("old", StageState.PACKED, kind="dm", frames=FRAMES)
+    night = sup.run_until("23:50", target_hours=99)
+    assert world.generate_hours == [] and world.t >= night.deadline  # kept retrying to the end
+    assert sup.state.state_of("old") is StageState.PACKED and "deadline" in night.reason
+
+
+def test_low_free_disk_pauses_and_resumes_when_the_drain_frees_space(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    world.free, world.free_on_sync = 5.0, 400.0
+    sup.state.mark("old", StageState.PACKED, kind="dm", frames=FRAMES)
+    night = sup.run_until("07:30", target_hours=1 / 6 + 1 / 3 + 0.01)
+    assert world.events.index("sync") < world.events.index("generate")
+    assert len(world.by_title("disk almost full")) == 1 and night.reason == "target reached"
+
+
+def test_disk_probe_gets_the_failed_demos_and_leftovers_alert_once(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    sup.state.mark("bad", StageState.PENDING, kind="dm")
+    sup.state.mark("bad", StageState.FAILED, "extract blew up", stage="extract")
+    sup.state.demos["bad"]["attempts"] = {"extract": 3}
+    for sub in ("frames", "labels"):
+        path = Path(cfg.paths[sub]) / "bad" / "f.bin"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"x" * 1000)
+    sup.run_until("23:50", target_hours=99)
+    assert world.excluded == ["bad"]
+    (alert,) = world.by_title("failed demos hold disk")
+    assert "bad" in alert["body"] and "cs2wm cleanup --failed" in alert["body"] and alert["priority"] == "high"
+
+
+def test_measure_disk_excludes_failed_demos_leftovers(cfg: DictConfig) -> None:
+    from cs2wm.pipeline.supervisor import measure_disk
+
+    for name, size in [("frames/bad", 5000), ("frames/ok", 1000), ("hdf5/dm/bad.staging", 700), ("raw/bad", 300)]:
+        path = Path(cfg.paths.root) / name / "f.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+    assert measure_disk(cfg)[0] == pytest.approx(7000 / 1e9)
+    assert measure_disk(cfg, exclude=["bad"])[0] == pytest.approx(1000 / 1e9)
+
+
+def _failed_world(cfg: DictConfig) -> PipelineState:
+    state = PipelineState(Path(cfg.paths.state) / "pipeline.json")
+    for demo_id, final in (("bad", StageState.FAILED), ("good", StageState.PACKED)):
+        state.mark(demo_id, StageState.PENDING, kind="dm")
+        if final is StageState.FAILED:
+            state.mark(demo_id, final, "boom", stage="pack")
+        else:
+            state.mark(demo_id, final)
+        for sub in ("frames", "raw", "labels"):
+            path = Path(cfg.paths[sub]) / demo_id / "f.bin"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x" * 100)
+    staging = Path(cfg.paths.hdf5) / "dm" / "bad.staging" / "e.hdf5"
+    staging.parent.mkdir(parents=True)
+    staging.write_bytes(b"x" * 100)
+    for keep in (Path(cfg.paths.demos) / "dm" / "bad.dem", Path(cfg.paths.qa) / "bad.jsonl"):
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        keep.write_text("keep")
+    state.save()
+    return state
+
+
+def test_cleanup_failed_deletes_only_the_failed_demos_working_dirs(cfg: DictConfig) -> None:
+    from cs2wm.pipeline.supervisor import cleanup_failed
+
+    state = _failed_world(cfg)
+    dry = cleanup_failed(cfg, state, dry_run=True)
+    assert len(dry) == 4 and Path(cfg.paths.frames, "bad").exists()  # nothing deleted
+    done = cleanup_failed(cfg, state)
+    assert {d for d, _, _ in done} == {"bad"} and sum(size for *_, size in done) == 400
+    for sub in ("frames", "raw", "labels"):
+        assert not Path(cfg.paths[sub], "bad").exists() and Path(cfg.paths[sub], "good", "f.bin").exists()
+    assert not (Path(cfg.paths.hdf5) / "dm" / "bad.staging").exists()
+    assert (Path(cfg.paths.demos) / "dm" / "bad.dem").exists() and (Path(cfg.paths.qa) / "bad.jsonl").exists()
+    assert state.state_of("bad") is StageState.FAILED
+
+
+def test_cli_cleanup(capsys: pytest.CaptureFixture[str]) -> None:
+    cfg = load_config()
+    _failed_world(cfg)
+    assert cli.main(["cleanup", "--failed", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "would delete" in out and "4 dir(s)" in out and Path(cfg.paths.frames, "bad").exists()
+    assert cli.main(["cleanup", "--failed"]) == 0
+    assert not Path(cfg.paths.frames, "bad").exists() and Path(cfg.paths.frames, "good").exists()
+    with pytest.raises(SystemExit, match="--failed"):
+        cli.main(["cleanup"])
+
+
+def test_smoke_test_ignores_demos_that_failed_to_render(tmp_path: Path, monkeypatch) -> None:
+    cfg = render_cfg(tmp_path, f"paths.cs2_dir={tmp_path / 'cs2'}", "supervisor.smoke_s=0.25")
+    state = PipelineState(Path(cfg.paths.state) / "pipeline.json")
+    for demo_id, final in (("dm-0001", StageState.EXTRACTED), ("dm-0002", StageState.FAILED)):
+        _write_plan(cfg, _plan(cfg, demo_id=demo_id))
+        (Path(cfg.paths.demos) / "dm").mkdir(parents=True, exist_ok=True)
+        (Path(cfg.paths.demos) / "dm" / f"{demo_id}.dem").touch()
+        state.mark(demo_id, StageState.PENDING, kind="dm")
+        if final is StageState.FAILED:
+            state.mark(demo_id, final, "timeout", stage="render")
+        else:
+            state.mark(demo_id, final)
+    used: list[Path] = []
+
+    def fake_run(demo_path: Path, smoke_cfg: DictConfig) -> render.RenderResult:
+        used.append(demo_path)
+        return render.RenderResult(demo_path.stem, ok=True)
+
+    monkeypatch.setattr(render, "run", fake_run)
+    sup = Supervisor(cfg, state)
+    assert sup.render_smoke_test() is None and [p.stem for p in used] == ["dm-0001"]  # the newer one failed to render
+    state.mark("dm-0001", StageState.FAILED, "x", stage="render")
+    used.clear()
+    assert sup.render_smoke_test() is None and used == []  # nothing known-good: unverified, not a false alarm
+
+
+def test_no_stage_starts_after_the_deadline_between_a_demos_stages(cfg: DictConfig) -> None:
+    world = World(cfg, per_block=1)
+    world.cost = {**World.cost, "render": 1800}  # the block ends 23:20, the render ends 23:50:10
+    sup, world = make(cfg, world)
+    sup.run_until("23:50", target_hours=99)
+    assert world.stage_events("render d001") and world.stage_events("extract d001") == []
+    assert sup.state.state_of("d001") is StageState.RENDERED  # left for the next night
+
+
+def test_only_the_profiles_kind_counts_toward_the_target(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    sup.state.mark("h1", StageState.SYNCED, kind="human", frames=FRAMES * 100)
+    night = sup.run_until("07:30", target_hours=0.3)
+    assert world.generate_hours and night.reason == "target reached"
+    assert sup.synced_hours("dm") >= 0.3 and sup.synced_hours() > 10
+
+
+def test_a_heartbeat_is_sent_right_after_a_long_generate_block(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    sup.run_until("07:30", target_hours=0.3)
+    (first, *_) = world.by_title("heartbeat")
+    assert first["at"] == world.events.index("generate") + 1  # the 60 min block outlasted heartbeat_min

@@ -214,7 +214,16 @@ def validate_config(cfg: DictConfig) -> None:
 
 def _validate_supervisor(sup: DictConfig, problems: list[str]) -> None:
     """Append problems with the ``supervisor`` section."""
-    for key in ("generate_block_min", "drain_min", "max_working_gb", "min_free_gb", "heartbeat_min", "smoke_s"):
+    for key in (
+        "generate_block_min",
+        "drain_min",
+        "max_working_gb",
+        "min_free_gb",
+        "heartbeat_min",
+        "smoke_s",
+        "max_demo_wall_min",
+        "stall_backoff_min",
+    ):
         value = sup.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             problems.append(f"supervisor.{key} must be a number > 0, got {value!r}")

@@ -6,7 +6,8 @@ Registers the dcs2-supervisor scheduled task (#20, used by #24).
 Registers a daily task that runs run_supervisor.ps1 in the logged-on user's session ("run only when user is logged
 on"), because CS2 and HLAE need the interactive desktop. It does not run as SYSTEM and does not ask for elevated
 rights. The task's execution time limit is the time from -Start to -Until plus 45 minutes, so a hung run is stopped
-by Windows shortly after the deadline. Run it from a normal PowerShell as the user who stays logged in overnight.
+by Windows shortly after the deadline. There is deliberately no "start when available": if the PC was off at -Start,
+that night is skipped instead of starting hours late and running into the morning. Run it from a normal PowerShell as the user who stays logged in overnight.
 
 .PARAMETER Start
 Daily start time, HH:mm (default 23:00).
@@ -62,7 +63,7 @@ if ($Remove) {
 }
 
 if ($existing -and -not $Force) {
-    Write-Error "Scheduled task $TaskName is already registered. Use -Force to replace it, or -Remove to delete it."
+    [Console]::Error.WriteLine("Scheduled task $TaskName is already registered. Use -Force to replace it, or -Remove to delete it.")
     exit 1
 }
 
@@ -81,7 +82,7 @@ $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
 $trigger = New-ScheduledTaskTrigger -Daily -At $startTime
 $user = "$env:USERDOMAIN\$env:USERNAME"
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit $limit -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit $limit -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
 if ($existing) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
