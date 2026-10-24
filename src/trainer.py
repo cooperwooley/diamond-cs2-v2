@@ -86,13 +86,16 @@ class Trainer(StateDictMixin):
 
         # CS2 dataset setup
         assert cfg.env.train.id == "cs2", "This trainer is configured for CS2"
-        # TODO(#5): relax this assert: path_data_full_res may be None (denoiser-only training, no CS2Hdf5Dataset).
-        assert cfg.env.path_data_low_res is not None and cfg.env.path_data_full_res is not None, \
-            "Set path_data_low_res and path_data_full_res in config/env/cs2.yaml"
+        # Full-res data is only needed to train the upsampler; denoiser-only training sets path_data_full_res to null.
+        assert cfg.env.path_data_low_res is not None, "Set path_data_low_res in config/env/cs2.yaml"
+        assert cfg.agent.upsampler is None or cfg.env.path_data_full_res is not None, \
+            "Set path_data_full_res in config/env/cs2.yaml, or use agent=cs2_denoiser_only"
         assert self._is_static_dataset
 
         num_actions = cfg.env.num_actions
-        dataset_full_res = CS2Hdf5Dataset(Path(cfg.env.path_data_full_res))
+        # Only the upsampler trains on full-res frames; a denoiser-only agent ignores path_data_full_res.
+        use_full_res = cfg.agent.upsampler is not None and cfg.env.path_data_full_res is not None
+        dataset_full_res = CS2Hdf5Dataset(Path(cfg.env.path_data_full_res)) if use_full_res else None
 
         num_workers = cfg.training.num_workers_data_loaders
         use_manager = cfg.training.cache_in_ram and (num_workers > 0)

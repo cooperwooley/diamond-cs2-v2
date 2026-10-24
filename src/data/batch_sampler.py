@@ -20,7 +20,7 @@ class BatchSampler(torch.utils.data.Sampler):
         sample_weights: Optional[List[float]] = None,
         can_sample_beyond_end: bool = False,
     ) -> None:
-        super().__init__(dataset)
+        super().__init__()  # torch >= 2.2 deprecates (and 2.14 rejects) the data_source arg
         assert isinstance(dataset, (Dataset, CS2Hdf5Dataset))
         self.dataset = dataset
         self.rank = rank
