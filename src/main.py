@@ -40,6 +40,10 @@ def main_ddp(rank: int, world_size: int, cfg: DictConfig, root_dir: Path) -> Non
 
 @skip_if_run_is_over
 def run(cfg: DictConfig, root_dir: Path) -> None:
+    # Training already finished (e.g. a chained job that started after its predecessor completed): nothing to do.
+    if cfg.common.resume is not False and (Path("checkpoints") / "DONE").is_file():
+        print("checkpoints/DONE exists: training is complete, exiting with code 0.")
+        return
     trainer = Trainer(cfg, root_dir)
     trainer.run()
 
