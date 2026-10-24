@@ -1,1 +1,36 @@
-% TODO(#37): intro
+\section{Introduction}
+\label{sec:intro}
+A world model that is meant to be played must do more than produce plausible frames: its next frame has to depend on what the player does.
+Recent diffusion world models achieve this for Doom~\cite{valevski2025gamengen}, Minecraft~\cite{oasis2024,guo2025mineworld} and
+Counter-Strike: Global Offensive~\cite{alonso2024diamond}, each by training on recordings in which frames come with the actions that produced them.
+Large collections of such paired data exist only for a few games, and for a new game they must be created.
+
+\paragraph{From v1 to v2.}
+The project began as v1, an adaptation of DIAMOND~\cite{alonso2024diamond} to Counter-Strike~2 (CS2) that was trained on about 5.7 hours of footage from YouTube.
+Gameplay videos do not come with inputs.
+In v1, every action label was therefore the zero vector, and a model conditioned on a constant carries no information about the player's intent.
+The v1 model produced plausible CS2 frames, but it could not be steered.
+The fix is not a better model but better data: frames and actions that are \emph{paired}.
+
+\paragraph{Our approach.}
+v2 manufactures the pairs.
+CS2 can record a deathmatch between bots offline as a demo file, which stores the full game state at every tick.
+We replay each demo in first person through HLAE at a fixed 16\,fps, with no HUD, and derive the 51-dimensional action of each frame from the spectated player's position, view angles and game events.
+The action layout and mouse bins are those of Pearce and Zhu's Counter-Strike behavioural-cloning work~\cite{pearce2021counterstrike} and of DIAMOND's CS:GO model.
+We then retrain DIAMOND's denoiser on these pairs.
+The upsampler never sees actions, so we reuse the v1 upsampler as is.
+
+\paragraph{Hypotheses.}
+We state two hypotheses before looking at any results.
+\textbf{H1 (controllability).} When a mouse turn is commanded, the generated frames rotate by about the commanded angle, and they do so far more than for a model that is not conditioned on real actions.
+We compare v2 with the v1 zero-action model and with a control that has the v2 architecture and data but shuffled action sequences.
+\textbf{H2 (volumetric smoke).} Smoke in CS2 is a volumetric, semi-transparent effect, so we expect generation error inside smoke to be larger than on static geometry.
+
+\paragraph{Contributions.}
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item A self-generating pipeline from bot demos to paired 16\,fps frames and 51-dimensional actions, with a single frame--tick convention, per-episode QA, and a hand-checked label accuracy (\cref{sec:data}).
+  \item State-derived action labels, with rules and thresholds that are shared between data extraction and live play so that the two cannot drift (\cref{sec:data}).
+  \item An action-conditioned DIAMOND denoiser for CS2 that reuses the v1 upsampler, plus a shuffled-action control (\cref{sec:method}).
+  \item A controllability test that needs no ground truth for generated frames, and a smoke-specific evaluation (\cref{sec:experiments}).
+  \item A fix to a v1 data bug: a silent uint8 wrap in the low-resolution recipe (\cref{sec:data}).
+\end{itemize}
