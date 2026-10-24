@@ -3,7 +3,7 @@ defaults:
   - env: cs2
   - agent: cs2
   - world_model_env: fast
-  - hw: rtx3060  # TODO(#6): hw profile supplies batch_size/grad_acc_steps/precision
+  - hw: rtx3060  # config/hw/<name>.yaml: batch_size, grad_acc_steps, precision, tf32, num_workers, compile; select with hw=h100
 
 hydra:
   job:
@@ -25,7 +25,7 @@ initialization:
 common:
   devices: 0  # int, list of int, cpu, or all
   seed: null
-  resume: False
+  resume: False  # True | False | auto (resume iff <run_dir>/checkpoints/state.pt exists, else start fresh)
 
 checkpointing:
   save_agent_every: 5
@@ -58,6 +58,8 @@ training:
   num_workers_data_loaders: 4
   model_free: False
   compile_wm: False
+  precision: fp32  # bf16 | fp16 | fp32 (autocast dtype; fp16 adds a GradScaler); overridden by the hw profile
+  tf32: False  # allow TF32 matmuls/convs; overridden by the hw profile
 
 evaluation:
   should: True

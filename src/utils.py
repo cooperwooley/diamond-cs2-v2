@@ -5,6 +5,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 import json
+import os
 from pathlib import Path
 import random
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -64,6 +65,21 @@ class CommonTools(StateDictMixin):
 
     def set(self, name: str, value: Any):
         return setattr(self, name, value)
+
+
+def append_jsonl(obj: Dict[str, Any], path: Path) -> None:
+    """Append one JSON line and fsync, so a hard kill never loses a line that was reported as written."""
+    with path.open("a") as f:
+        f.write(json.dumps(obj) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def autocast(precision: str, device_type: str) -> torch.autocast:
+    """Autocast context for a training.precision value (bf16 | fp16 | fp32); fp32 is a no-op on every device."""
+    dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    assert precision in dtypes, f"Unknown precision '{precision}', expected one of {list(dtypes)}"
+    return torch.autocast(device_type, dtype=dtypes[precision], enabled=precision != "fp32")
 
 
 def broadcast_if_needed(*args):
@@ -208,11 +224,13 @@ def save_info_for_import_script(epoch: int, run_name: str, path_ckpt_dir: Path) 
 
 
 def save_with_backup(obj: Any, path: Path):
-    bk = path.with_suffix(".bk")
-    if path.is_file():
-        path.rename(bk)
-    torch.save(obj, path)
-    bk.unlink(missing_ok=True)
+    # Atomic: write a temp file next to `path`, then rename over it, so a kill mid-save leaves the previous file intact.
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("wb") as f:
+        torch.save(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def set_seed(seed: int) -> None:

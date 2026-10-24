@@ -1,5 +1,5 @@
 # @package _global_
-# Hardware profile: v100. TODO(#6)/(#8): values are final after the #8 benchmark.
+# Hardware profile: v100. Values are final after the #8 benchmark.
 # Effective denoiser batch stays 128 (v1 parity): 32 x 4 = 128.
 denoiser:
   training:
@@ -13,5 +13,6 @@ upsampler:
 
 training:
   num_workers_data_loaders: 8
+  tf32: false
   precision: fp16  # bf16 | fp16 | fp32
   compile_wm: false

@@ -2,52 +2,14 @@
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from cs2wm.config import load_config
-from cs2wm.pipeline.pack import to_low_res, write_episode
-from data import Dataset, Episode
 from trainer import Trainer
 
-N_EPISODES = {"train": 3, "test": 1}
 STEPS = {"batch_size": 2, "grad_acc_steps": 1, "steps_first_epoch": 2, "steps_per_epoch": 2, "lr_warmup_steps": 1}
-N_FRAMES = 12  # longer than the denoiser (4 + 1 + 1) and upsampler (1 + 1 + 1) sequence lengths
-
-
-@pytest.fixture(scope="module")
-def data(tmp_path_factory):
-    """Low-res DIAMOND .pt datasets (train/test) plus the HDF5 full-res twins written by cs2wm.pipeline.pack."""
-    root = tmp_path_factory.mktemp("data")
-    cfg = load_config(overrides=["pack.fullres_mod=1"])
-    rng = np.random.default_rng(0)
-    full_dir = root / "full_res"
-    for split, n_episodes in N_EPISODES.items():
-        ds = Dataset(root / "low_res" / split, None)
-        for i in range(n_episodes):
-            episode_id = f"{split}{i}"
-            frames = rng.integers(0, 256, size=(N_FRAMES, 150, 280, 3), dtype=np.uint8)
-            acts = (rng.uniform(size=(N_FRAMES, 51)) < 0.1).astype(np.float32)
-            meta = {
-                "episode_id": episode_id,
-                "demo_id": "demo0",
-                "kind": "dm",
-                "player": None,
-                "start_tick": 0,
-                "cs2_build": "1",
-                "demoparser2_version": "0.42.0",
-                "cs2wm_git_sha": "abc1234",
-            }
-            result = write_episode(frames, acts, meta, root / "hdf5", cfg, fullres_dir=full_dir)
-            obs = torch.from_numpy(to_low_res(frames)).flip(3).permute(0, 3, 1, 2).float().div(255).mul(2).sub(1)
-            info = {"original_file_id": f"{result.fullres_path.parent.name}/{result.fullres_path.name}"}
-            zeros = torch.zeros(N_FRAMES, dtype=torch.uint8)
-            ds.add_episode(Episode(obs, torch.from_numpy(acts), torch.zeros(N_FRAMES), zeros, zeros.clone(), info))
-        ds.save_to_default_path()
-    return root
 
 
 def compose_cfg(repo_root: Path, data: Path, modes: str, tiny_model_dotlist) -> OmegaConf:
