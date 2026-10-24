@@ -80,3 +80,20 @@ def kill_tree(proc: Any, run: Callable[..., Any], windows: bool, wait_s: float =
         proc.wait(timeout=wait_s)
     except subprocess.TimeoutExpired:
         log.warning("process (pid %s) did not exit after kill", proc.pid)
+
+
+def kill_by_name(run: Callable[..., Any], windows: bool, names: Sequence[str]) -> None:
+    """Kill every process with one of the image ``names`` and their children (``taskkill /IM /T /F``; no-op off Windows).
+
+    The stages kill the process trees they started (``kill_tree``). The supervisor calls this after a failed stage
+    as well, so that no stray CS2 or HLAE window is left behind to block the next launch (only one CS2 can run).
+
+    Args:
+        run: ``subprocess.run``-like, used for ``taskkill``.
+        windows: Whether this is Windows.
+        names: Image names, e.g. ``["cs2.exe", "HLAE.exe"]``.
+    """
+    if not windows:
+        return
+    for name in names:
+        run(["taskkill", "/T", "/F", "/IM", name], capture_output=True, check=False, timeout=30)
