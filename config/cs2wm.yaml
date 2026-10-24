@@ -93,7 +93,24 @@ generate:
   chunk_min: 10
   hang_timeout_min: 5
   expected_build: null              # CS2 buildid from appmanifest_730.acf; set after #14
-  launch_options: [-insecure, -novid, -console, -sw, -w, "1280", -h, "720"]   # -insecure is mandatory
+  # Launch: plain cs2.exe (NOT HLAE; HLAE is for render only) started directly rather than via `steam -applaunch 730`,
+  # because steam.exe returns at once, which would leave nothing to watch, kill or restart.
+  # -steam makes a directly started cs2.exe attach to the running Steam client.   CONFIRM(#14)
+  # -insecure is mandatory: the launcher and the config validator both refuse to run without it.
+  launch_options: [-insecure, -steam, -novid, -console, -sw, -w, "1280", -h, "720"]
+  cs2_exe: game/bin/win64/cs2.exe   # relative to paths.cs2_dir
+  # Chunking: netcon = send `stop; record <name>` over -netconport every chunk_min (works for client demos);
+  # gotv = tv_enable/tv_autorecord with mp_timelimit=chunk_min, one demo per map cycle.
+  # CONFIRM(#14): #14 picks one (GOTV only if it records every bot).
+  chunking: netcon
+  netconport: 2121                  # used only when chunking = netcon
+  netcon_connect_timeout_s: 180     # CS2 takes a while to open the port.   CONFIRM(#14)
+  map_load_wait_s: 45               # wait after the netcon port opens, before the first `record`.   CONFIRM(#14)
+  poll_s: 5                         # watchdog polling interval
+  close_stable_s: 5                 # a demo is closed once its size has not changed for this long.   CONFIRM(#14)
+  close_timeout_s: 60               # give up waiting for a demo to close after this long
+  min_chunk_s: 30                   # a truncated chunk shorter than this is kept but is not progress for max_failures
+  max_failures: 3                   # give up after this many sessions (or publishes) in a row without a usable chunk
 
 render:
   tick_offset: 0                    # measured in #14
