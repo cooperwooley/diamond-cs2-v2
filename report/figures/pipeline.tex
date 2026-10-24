@@ -1,0 +1,23 @@
+% Data-pipeline figure, included from sections/data.tex inside a figure* environment.
+\begin{tikzpicture}[
+    font=\footnotesize,
+    stage/.style={draw, rounded corners=2pt, minimum height=7mm, minimum width=21mm, align=center, fill=black!4},
+    note/.style={align=center, text width=29mm, font=\scriptsize, text=black!75},
+    arr/.style={-{Stealth[length=2mm]}, thick},
+    node distance=7mm]
+  \node[stage] (gen) {generate};
+  \node[stage, right=of gen] (seg) {segment};
+  \node[stage, right=of seg] (ren) {render};
+  \node[stage, right=of ren] (pak) {pack};
+  \node[stage, right=of pak, fill=black!12] (trn) {assemble\\+ train};
+  \node[stage, below=9mm of ren] (ext) {extract\\actions + QA};
+  \foreach \a/\b in {gen/seg, seg/ren, ren/pak, pak/trn} \draw[arr] (\a) -- (\b);
+  \draw[arr] (seg.south) |- (ext.west);
+  \draw[arr] (ext.east) -| (pak.south);
+  \node[note, above=1mm of gen] {offline CS2 bot deathmatch (\texttt{-insecure}), demo files};
+  \node[note, above=1mm of seg] {lives, in-eye target, episodes $\le$1000 frames};
+  \node[note, above=1mm of ren] {HLAE, 16\,fps, no HUD, 150$\times$280};
+  \node[note, above=1mm of pak] {HDF5 30$\times$56 + 10\% JPEG subset};
+  \node[note, above=1mm of trn] {split by demo; shuffled-action control};
+  \node[note, below=1mm of ext] {51-dim labels from player state};
+\end{tikzpicture}

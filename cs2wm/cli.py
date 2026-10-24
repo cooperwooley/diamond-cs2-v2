@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -40,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("segment", help="plan lives, spectate schedule and episodes (#10)")
     _add_demo_args(p)
     p.add_argument("--policy", choices=["longest_remaining", "fixed_player"], default=None)
-    p.add_argument("--player", default=None, help="player name for --policy fixed_player")
+    p.add_argument("--player", default=None, help="player name (or numeric user_id) for --policy fixed_player")
 
     p = sub.add_parser("render", help="render a demo with HLAE (#15)")
     _add_demo_args(p)
@@ -71,12 +72,21 @@ def build_parser() -> argparse.ArgumentParser:
     lc = p.add_subparsers(dest="label_cmd", required=True, metavar="<action>")
     q = lc.add_parser("render", help="render the overlay clip and review sheet")
     q.add_argument("--episode", required=True, type=Path, help="packed episode HDF5")
-    q.add_argument("--full-res-frames", required=True, type=Path, help="directory of full-res rendered frames")
+    q.add_argument(
+        "--full-res-frames",
+        required=True,
+        type=Path,
+        help="directory of full-res frames (file i = episode frame i; a trailing extra frame is ignored) "
+        "or a full-res episode HDF5",
+    )
     q.add_argument("--start", type=int, default=0)
-    q.add_argument("--frames", type=int, default=1920)
-    q.add_argument("--out", required=True, type=Path, help="output clip.mp4")
-    q = lc.add_parser("score", help="score a filled-in review sheet")
-    q.add_argument("sheet", type=Path, help="clip_labels.csv")
+    q.add_argument("--frames", type=int, default=None, help="clip length (default: to the end of the episode)")
+    q.add_argument(
+        "--out", required=True, type=Path, help="output clip.mp4 (the sheet is written as <stem>_labels.csv)"
+    )
+    q.epilog = "Judge each row by the change from this frame to the next (frame i shows the action taken after it)."
+    q = lc.add_parser("score", help="score filled-in review sheets (several are pooled)")
+    q.add_argument("sheet", nargs="+", type=Path, help="clip_labels.csv, one per reviewed episode")
     q.add_argument("--out", required=True, type=Path, help="e.g. results/label_accuracy.json")
 
     p = sub.add_parser("play", help="play the world model interactively (#28)")
@@ -113,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_demo(arg: str, cfg: DictConfig) -> Path:
+    """Return the ``.dem`` file for a path or a demo id (searched as ``paths.demos/<kind>/<id>.dem``)."""
+    path = Path(arg)
+    if path.is_file():
+        return path
+    matches = sorted(Path(cfg.paths.demos).glob(f"*/{arg}.dem"))
+    if not matches:
+        raise SystemExit(f"demo not found: {arg} (not a file, and no {cfg.paths.demos}/*/{arg}.dem)")
+    return matches[0]
+
+
 def _cfg(args: argparse.Namespace) -> DictConfig:
     from cs2wm.config import load_config
 
@@ -129,8 +150,13 @@ def _dispatch(args: argparse.Namespace) -> None:
     elif cmd == "segment":
         from cs2wm.pipeline import segment
 
-        # TODO(#10): resolve --all-pending and demo ids through the supervisor state.
-        segment.run(Path(args.demo or ""), _cfg(args), args.policy, args.player)
+        cfg = _cfg(args)
+        if args.all_pending:
+            # TODO(#20): resolve --all-pending through the supervisor's persistent pipeline state.
+            raise NotImplementedError("TODO(#20): segment --all-pending")
+        if not args.demo:
+            raise SystemExit("segment: give a demo id or a path to a .dem file")
+        print(segment.run(_resolve_demo(args.demo, cfg), cfg, args.policy, args.player))
     elif cmd == "render":
         from cs2wm.pipeline import render
 
@@ -146,7 +172,15 @@ def _dispatch(args: argparse.Namespace) -> None:
     elif cmd == "sync":
         from cs2wm.pipeline import sync
 
-        sync.run(_cfg(args))
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        try:
+            ok = sync.run(_cfg(args)).ok
+        except sync.SyncError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if not ok:
+            print("error: sync finished with errors, see the log above", file=sys.stderr)
+            raise SystemExit(1)
     elif cmd == "supervise":
         from cs2wm.pipeline.supervisor import PipelineState, Supervisor
 
@@ -176,7 +210,7 @@ def _dispatch(args: argparse.Namespace) -> None:
                 args.episode, args.full_res_frames, args.start, args.frames, args.out, _cfg(args)
             )
             label_accuracy.make_review_sheet(
-                args.episode, args.start, args.frames, args.out.with_name(args.out.stem + "_labels.csv")
+                args.episode, args.start, args.frames, args.out.with_name(args.out.stem + "_labels.csv"), cfg=_cfg(args)
             )
         else:
             label_accuracy.score_review_sheet(args.sheet, args.out)

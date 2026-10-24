@@ -1,1 +1,27 @@
-% TODO(#37): limitations
+\section{Limitations}
+\label{sec:limits}
+\textbf{Data.}
+All frames come from \emph{one map}, \texttt{de\_dust2}, so the test split measures neither generalisation to new maps nor to new bots.
+The actions come from the bot AI at a fixed difficulty, in routes and fire patterns that differ from human play.
+The \texttt{human} kind adds real input only for the sessions we recorded.
+For bots there are no keys: the labels are the keys that would reproduce the observed motion, and the mouse is the bot's view-angle change, whose speed and smoothness differ from a human hand.
+The mouse histograms therefore describe bot aim.
+
+\textbf{Labels.}
+The 51-dimensional space has no slot-4 key, so the knife and all grenades share one key and the model cannot be told to equip smoke rather than a knife.
+WASD is inferred from displacement, so a release is seen only after the speed has decayed and a press only once the player moves; we measure a lag of about \TBDwasdlag\ frames.
+Pressing into a wall yields no label.
+Weapon-switch labels also fire for switches that no key caused (after a grenade throw, a pickup or a spawn), and LMB doubles as the grenade throw.
+Hold-fill assumes the trigger was held between shots at most 0.2\,s apart.
+The accuracy in \cref{tab:labelacc} comes from one short clip with a single reviewer.
+
+\textbf{Visual domain.}
+Frames have no HUD, so the model cannot see ammunition or health, and reload or damage are not predictable from the image.
+The v1 upsampler was trained with a HUD on YouTube frames, and v2 does not retrain it; its compatibility is checked but not guaranteed.
+The $30{\times}56$ frames are very small, and the aspect ratio of the stored frames differs from the capture by about 5\,\%, which enters the field-of-view conversion of H1.
+
+\textbf{Evaluation.}
+The H1 estimator measures global image shift, so it tracks camera rotation but is confused by moving players, and it says nothing about translation except through the sign of flow divergence for W and S.
+The smoke masks are geometric: a sphere projected to the image, ignoring occlusion of the smoke by walls, so they contain false positives near corners.
+The test split comes from the same distribution as the training split, apart from the held-out smoke demos.
+Each model is trained once, so we report no variation across training seeds.

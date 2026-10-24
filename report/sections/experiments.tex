@@ -1,1 +1,127 @@
-% TODO(#37): experiments
+\section{Experiments}
+\label{sec:experiments}
+Three denoisers are compared: \textbf{v2}, the \textbf{v1} zero-action model, and the \textbf{shuffled} control (\cref{sec:method}).
+v2 and the control use the v1 upsampler.
+All evaluations run on held-out demos.
+
+\subsection{H1: controllability}
+\label{sec:h1}
+\textbf{Protocol.}
+A model is controllable if commanded camera motion appears in its output.
+We measure this without ground truth for the generated frames.
+From each of $N=50$ held-out contexts (4 real frames with their actions) we roll out 32 frames while holding one scripted action:
+yaw at $\pm\{2,4,10,20,30,60\}$ bins, pitch at $\pm\{2,4,10,20\}$ bins, each of W, S, A, D, and a no-op.
+The v1 model, which was trained only on zero actions, receives the same action inputs; the sampling noise is shared across models.
+We use a single denoising step.
+The first four generated frames are excluded from all statistics, because the model's history there still contains real actions.
+
+\textbf{Estimating ego-rotation.}
+For each pair of consecutive generated frames, after the upsampler, we compute the image shift by phase correlation on Hann-windowed grayscale images, with Farneback optical-flow medians as an alternative estimator.
+Pixels convert to degrees through the horizontal field of view, theoretically $\approx106^\circ$ for a 16:9 frame at CS2's fixed $90^\circ$ field of view.
+Instead of relying on the theory we \emph{calibrate on ground truth}: on pairs of consecutive real test frames, whose label-implied rotation is known, the estimator's output must correlate with the label at $r\ge0.8$; we obtain $r=\TBDestimatorR$ for yaw.
+The calibration regresses the measured shift on the exact label, $\mathrm{px}=a+b\cdot\mathrm{label}$, and converts with $1/b$ degrees per pixel (\TBDdegperpx\ for yaw).
+The direction matters.
+The label is exact and the shift is noisy (moving players and estimation error), so regressing the label on the shift would shrink the slope by about $r^2$, a regression dilution.
+Rotation is estimated at $150{\times}280$ because $30{\times}56$ gives under one pixel per small bin; we repeat the analysis at $30{\times}56$ as a robustness check.
+
+\textbf{Metrics.}
+Per model and axis we report Pearson $r$ and the regression slope of estimated against commanded rotation (a slope of 1 is perfect), the sign accuracy over non-zero commands, per-bin means with 95\,\% bootstrap intervals (resampled over contexts, since frames in a rollout are correlated), and the drift under the no-op script.
+
+\textbf{Results.}
+\Cref{tab:h1} contains the main result.
+For yaw, v2 reaches $r=\TBDhOneRvTwo$ and a sign accuracy of \TBDhOneSignVtwo, against $r=\TBDhOneRvOne$ for the v1 model and $r=\TBDhOneRshuf$ for the shuffled control.
+\Cref{fig:h1} shows the commanded--estimated relation per frame and the per-bin curves.
+
+\begin{table}[t]
+  \centering\small
+  \resulttable{h1}{\#32}{Pearson r, slope and sign accuracy of estimated vs.\ commanded yaw and pitch, for v2, v1 and shuffled; no-op drift.}
+  \caption{H1 controllability. Estimated vs.\ commanded rotation under scripted inputs, 50 held-out contexts.}
+  \label{tab:h1}
+\end{table}
+
+\begin{figure*}[t]
+  \centering
+  \begin{minipage}[t]{0.49\textwidth}\centering
+    \resultfigure{h1_scatter}{\linewidth}{\#32}{Commanded vs.\ estimated rotation per frame, per model.}
+  \end{minipage}\hfill
+  \begin{minipage}[t]{0.49\textwidth}\centering
+    \resultfigure{h1_per_bin}{\linewidth}{\#32}{Per-bin mean estimated rotation with 95\% bootstrap CI.}
+  \end{minipage}
+  \caption{H1. Left: commanded vs.\ estimated rotation for every generated frame pair. Right: mean estimate per commanded bin with 95\,\% bootstrap intervals.}
+  \label{fig:h1}
+\end{figure*}
+
+\subsection{H2: volumetric smoke}
+\label{sec:h2}
+On held-out smoke episodes we compare generated and real frames inside smoke and on static geometry, for v2 and v1.
+A smoke mask is built for every frame from the smoke events (detonation to expiry, with position) and the spectated player's eye position, angles and field of view.
+The smoke volume is a sphere of radius 144 units that is projected to an image ellipse and dilated by 2 pixels.
+The static mask is the complement of all smoke masks, minus a box around the viewmodel, restricted to frames in which no enemy is in the view frustum.
+We compute LPIPS (AlexNet) and SSIM within each mask for teacher-forced single-step predictions and for 16-step autoregressive rollouts, with bootstrap intervals.
+\Cref{tab:h2} gives the result; for v2, the \TBDhTwoCondition LPIPS is \TBDhTwoSmoke\ inside smoke and \TBDhTwoStatic\ on static geometry.
+Examples are in \cref{fig:h2}.
+
+\begin{table}[t]
+  \centering\small
+  \resulttable{h2}{\#33}{LPIPS and SSIM inside smoke vs.\ on static geometry, single-step and 16-step rollouts, v2 and v1.}
+  \caption{H2. LPIPS (lower is better) and SSIM (higher is better) within smoke and static masks.}
+  \label{tab:h2}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \resultfigure{h2_triptych}{\linewidth}{\#33}{Ground truth, generated frame and smoke mask.}
+  \caption{H2 examples: ground truth, generated frame, and projected smoke mask.}
+  \label{fig:h2}
+\end{figure}
+
+\subsection{Carried-over v1 metrics}
+\label{sec:carried}
+For comparability with v1 we repeat its evaluations.
+\Cref{fig:loss} shows the test loss of both models per epoch on the same axes, which is possible because the epoch definition is shared.
+\Cref{fig:rollouts} shows single-step predictions and 64-frame autoregressive rollouts from the same held-out contexts, using three denoising steps as v1 did.
+\Cref{tab:carried} reports FID at $30{\times}56$ over 2048 generated and real frames with the default Inception features.
+FID is \TBDfidVone\ for v1 on its own test set and \TBDfidVtwo\ for v2 on the v2 test set.
+The third row, v1 on the v2 test set, is a domain-shift reference (\TBDfidShift): the two test sets differ in source (YouTube vs.\ rendered bot play), so numbers across datasets are not directly comparable.
+
+\begin{table}[t]
+  \centering\small
+  \resulttable{carried}{\#34}{FID at 30x56: v1 on v1 test, v2 on v2 test, v1 on v2 test.}
+  \caption{FID at $30{\times}56$ (2048 frames).}
+  \label{tab:carried}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \resultfigure{loss_curves}{\linewidth}{\#34}{Test loss per epoch, v1 and v2.}
+  \caption{Test loss against epoch for v1 and v2.}
+  \label{fig:loss}
+\end{figure}
+
+\begin{figure*}[t]
+  \centering
+  \resultfigure{rollout_strip}{\textwidth}{\#34}{Rollout strips from held-out contexts.}
+  \caption{Autoregressive rollouts of 64 frames from held-out contexts: ground truth and generated frames.}
+  \label{fig:rollouts}
+\end{figure*}
+
+\textbf{Upsampler compatibility.}
+v2 low-resolution frames are produced by a different path from v1's (HLAE without HUD instead of YouTube video with HUD, and with the clamp fix).
+We therefore compare the v1 upsampler with bicubic interpolation on the full-resolution subset of v2 and on v1's own test frames.
+On v2 frames the upsampler's LPIPS is \TBDupsVtwo\ against \TBDupsBicubic\ for bicubic, and on v1 frames it is \TBDupsVone.
+We accept reuse if the v2 LPIPS is within 15\,\% of the v1 LPIPS and better than bicubic; otherwise play and evaluation fall back to bicubic.
+
+\subsection{Interactive play}
+\label{sec:play}
+The play loop turns keyboard and mouse input into the same 51-dimensional action using the shared configuration.
+Mouse motion is accumulated over each frame and converted to degrees by $0.022\times$ sensitivity before binning.
+(DIAMOND's loop keeps only the last motion event of a frame, which undercounts fast turns.)
+It starts from four real frames and actions of a held-out episode.
+\Cref{tab:fps} reports frames per second on an \TBDfpsgpu for one and three denoising steps, fp32 and bf16, with and without the upsampler; the headline configuration runs at \TBDfps\,fps.
+
+\begin{table}[t]
+  \centering\small
+  \resulttable{play_fps}{\#28}{FPS on an RTX 3060 for 1 vs.\ 3 denoising steps, fp32 vs.\ bf16, with and without the upsampler.}
+  \caption{Play frame rate on an RTX 3060.}
+  \label{tab:fps}
+\end{table}

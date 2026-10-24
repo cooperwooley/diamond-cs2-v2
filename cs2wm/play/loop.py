@@ -41,7 +41,7 @@ class PlaySession:
 
     def run(self) -> None:
         """Run until the window is closed (``F1`` toggles the overlay)."""
-        # TODO(#28): build_play_agent (#5), pygame loop, overlay; TODO(#35): record with overlay.
+        # TODO(#28): cs2wm.play.agent.build_play_agent (#5), pygame loop, overlay; TODO(#35): record with overlay.
         raise NotImplementedError("TODO(#28): PlaySession.run")
 
 

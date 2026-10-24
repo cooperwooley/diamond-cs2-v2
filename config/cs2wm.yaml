@@ -78,6 +78,9 @@ qa:
 segment:
   policy: longest_remaining         # bots; human sessions use fixed_player
   settle_ticks: 32                  # dropped after spawn and before death (camera transitions); tuned in #14
+                                    # also the gap between two segments (camera switch)
+  seed: 0                           # plan RNG seed (ties in the spectate policy); mixed with the demo id
+  event_player_props: [user_id]     # player props requested with spawn/death events; add entity_id once #14 confirms it
 
 pack:
   schema_version: 1
@@ -99,8 +102,11 @@ render:
 
 sync:
   host: mill                        # ~/.ssh/config alias from #3
-  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill
-  delete_local_hdf5: true
+  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill (only [A-Za-z0-9_./-] and $USER allowed)
+  rsync_timeout_s: 3600             # kill one rsync (a whole tree) after this long; rsync also has a 300 s I/O timeout
+  ssh_timeout_s: 120                # kill the preflight / mkdir / remote-root ssh calls after this long
+  verify_timeout_s: 900             # kill one per-demo remote sha256sum -c after this long
+  delete_local_hdf5: true           # free local hdf5/ + hdf5_fullres/ files whose remote sha256 verified; demos stay
 
 supervisor:
   max_working_gb: 8

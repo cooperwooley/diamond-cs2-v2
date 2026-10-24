@@ -1,1 +1,13 @@
-% TODO(#37): conclusion
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+v1 failed because its training data had no actions.
+v2 shows one way to get them: let the game generate the data, and read the labels from the game's own state.
+The pipeline from bot demos to aligned frames and 51-dimensional actions is automatic and checkable, and it supports a controllability test (H1) and a smoke-specific test (H2) that the v1 data could not.
+The results are in \cref{sec:experiments}.
+
+Several extensions follow directly from the limitations.
+\textbf{More visual diversity without losing control:} the v1 YouTube frames could be mixed back in under a dedicated null-action token, which would add maps and players while telling the model that no action is known.
+\textbf{More maps}, such as Mirage and Inferno, to measure generalisation across maps.
+\textbf{A retrained upsampler} on HUD-free v2 frames.
+\textbf{Learned inverse-dynamics labels}, to compare against the rule-based ones and to label footage that has no game state.
+\textbf{A higher-resolution denoiser or a longer history}, which the current $30{\times}56$ and four-frame design limits.
