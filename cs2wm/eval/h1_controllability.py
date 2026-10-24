@@ -55,8 +55,12 @@ Sign convention: positive d-yaw = turn right, positive d-pitch = look down (``cs
     the source is ``fitted`` or ``theory``; ``est_yaw = yaw_deg_per_px * -dx``, ``est_pitch = pitch_deg_per_px * -dy``.
 ``results``: model -> ``{"fullres"|"lowres": {estimator, yaw|pitch: {n, pearson_r, slope, intercept, sign_accuracy,
     n_nonzero}, per_bin: [{script, kind, commanded_yaw_deg, commanded_pitch_deg, n_contexts, yaw|pitch: {mean,
-    ci_lo, ci_hi}}], noop_drift: {mean_abs_dyaw_deg|mean_abs_dpitch_deg: {mean, ci_lo, ci_hi}}}, ws_divergence:
+    ci_lo, ci_hi}}], noop_drift: {mean_abs_dyaw_deg|mean_abs_dpitch_deg: {mean, ci_lo, ci_hi}}, scatter: {unit,
+    points: [{script, context, commanded_yaw_deg, commanded_pitch_deg, est_yaw_deg, est_pitch_deg, n_pairs}]}},
+    ws_divergence:
     {w|s: {mean, ci_lo, ci_hi, sign_accuracy}}}``. ``slope`` is 1 for a perfectly calibrated model; NaN becomes null.
+    ``scatter.points`` has one point per (script, context), sorted by script order then context: the mean estimate over
+    the pairs that count toward the stats (``skip_initial_steps`` applied), so the report needs no frames CSV.
 ``warnings``; ``versions``; ``files``.
 
 Other outputs in ``out_dir``: ``<model>_frames.csv`` (one row per generated frame pair: context, episode, start, script,
@@ -727,6 +731,48 @@ def model_metrics(
     return out
 
 
+SCATTER_UNIT = "per (context, script) mean over the in-stats frame pairs"
+
+
+def scatter_points(rec: dict[str, np.ndarray], est: dict[str, np.ndarray], scripts: Sequence[Script]) -> dict[str, Any]:
+    """Compact scatter data: one point per (script, context), the mean estimate over its pairs.
+
+    Args:
+        rec: Output of ``rollout_shifts`` restricted to the pairs that count toward the stats.
+        est: ``{"yaw", "pitch"}`` estimated rotation in degrees per row of ``rec``.
+        scripts: The scripted suite.
+
+    Returns:
+        ``{"unit", "points"}``; points are sorted by script order, then context. An estimate is None (null in the
+        JSON) if it has no finite value in the group.
+    """
+    stride = int(rec["context"].max()) + 1 if len(rec["context"]) else 1
+    keys, inverse = np.unique(rec["script"] * stride + rec["context"], return_inverse=True)
+    counts = np.bincount(inverse, minlength=len(keys))
+    means = {}
+    for axis in ("yaw", "pitch"):
+        finite = np.isfinite(est[axis])
+        total = np.bincount(inverse, weights=np.where(finite, est[axis], 0.0), minlength=len(keys))
+        n_finite = np.bincount(inverse, weights=finite.astype(float), minlength=len(keys))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            means[axis] = np.where(n_finite > 0, total / n_finite, np.nan)
+    points = []
+    for g, key in enumerate(keys):
+        script = scripts[int(key // stride)]
+        points.append(
+            {
+                "script": script.name,
+                "context": int(key % stride),
+                "commanded_yaw_deg": script.commanded_yaw_deg,
+                "commanded_pitch_deg": script.commanded_pitch_deg,
+                "est_yaw_deg": float(means["yaw"][g]),
+                "est_pitch_deg": float(means["pitch"][g]),
+                "n_pairs": int(counts[g]),
+            }
+        )
+    return {"unit": SCATTER_UNIT, "points": points}
+
+
 def _per_context_mean(context: np.ndarray, values: np.ndarray, n_contexts: int) -> np.ndarray:
     """Mean of ``values`` per context index (NaN for contexts without rows)."""
     sums = np.bincount(context, weights=values, minlength=n_contexts)
@@ -1142,6 +1188,8 @@ def run_h1(
             key: {"estimator": str(h.estimator), **model_metrics(rec_u, est_u[key], scripts, len(ctxs), n_boot, seed)}
             for key in RESOLUTIONS
         }
+        for key in RESOLUTIONS:
+            res[key]["scatter"] = scatter_points(rec_u, est_u[key], scripts)
         res["ws_divergence"] = divergence_metrics(rec_u, scripts, len(ctxs), n_boot, seed)
         summary["results"][name] = res
         write_frames_csv(out_dir / f"{name}_frames.csv", rec, est, scripts, ctxs, skip)
