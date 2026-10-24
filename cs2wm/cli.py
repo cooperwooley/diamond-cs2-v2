@@ -62,11 +62,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("sync", help="push to the Mill, verify, free local disk (#16)")
 
     p = sub.add_parser("supervise", help="run the pipeline unattended (#20)")
-    p.add_argument("--until", default="07:30", help="deadline, HH:MM local time")
-    p.add_argument("--target-hours", type=float, default=20.0)
+    p.add_argument(
+        "--until",
+        default="07:30",
+        help="deadline, HH:MM local time (the next such time, so 07:30 at 23:00 is tomorrow)",
+    )
+    p.add_argument("--target-hours", type=float, default=20.0, help="stop once this many QA-passing hours are synced")
     p.add_argument("--profile", choices=["dm", "smoke"], default="dm")
 
     sub.add_parser("status", help="print the pipeline state table (#20)")
+
+    p = sub.add_parser("cleanup", help="free working-set disk (#20); do not run while `supervise` is running")
+    p.add_argument("--failed", action="store_true", help="delete frames/raw/labels (and pack .staging) of failed demos")
+    p.add_argument("--dry-run", action="store_true", help="only list what would be deleted")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="also clean failed demos that would still be retried (e.g. failures from manual runs)",
+    )
 
     p = sub.add_parser("qa-summary", help="summarise extract QA (#19)")
     p.add_argument("--kind", choices=["dm", "human", "smoke"], default=None)
@@ -268,7 +281,24 @@ def _dispatch(args: argparse.Namespace) -> int:
             raise SystemExit(1)
     elif cmd == "supervise":
         cfg = _cfg(args)
-        _supervisor(cfg).run_until(args.until, args.target_hours, args.profile)
+        _setup_logging(cfg)
+        try:
+            return _supervisor(cfg).run_until(args.until, args.target_hours, args.profile).exit_code
+        except ValueError as exc:
+            raise SystemExit(f"supervise: {exc}") from exc
+    elif cmd == "cleanup":
+        from cs2wm.pipeline.supervisor import cleanup_failed
+
+        if not args.failed:
+            raise SystemExit("cleanup: say what to clean; the only choice is --failed")
+        cfg = _cfg(args)
+        found = cleanup_failed(cfg, _supervisor(cfg).state, args.dry_run, args.force)
+        for demo_id, path, size in found:
+            print(f"{'would delete' if args.dry_run else 'deleted'} {path} ({size / 1e6:.1f} MB) [{demo_id}]")
+        total = sum(size for _, _, size in found)
+        print(
+            f"{len(found)} dir(s), {total / 1e9:.2f} GB{' (dry run)' if args.dry_run else ''}; demos and QA untouched"
+        )
     elif cmd == "status":
         cfg = _cfg(args)
         sup = _supervisor(cfg)
@@ -356,7 +386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Argument list (defaults to ``sys.argv[1:]``).
 
     Returns:
-        Process exit code: 0 on success, 1 if a stage failed for any demo, 2 when the command is not implemented yet.
+        Process exit code: 0 on success, 1 if a stage failed for any demo, 2 when the command is not implemented yet,
+        3 when `supervise` ended on a guard trip or an alert.
     """
     args = build_parser().parse_args(argv)
     try:
