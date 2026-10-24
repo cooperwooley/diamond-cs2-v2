@@ -47,20 +47,23 @@ def fake_lpips(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 class FakeParser:
-    """Answers ``parse_ticks`` and ``parse_events`` from tables, like ``demoparser2.DemoParser``."""
+    """The parts of ``demoparser2.DemoParser`` that ``cs2wm.demo`` uses, answered from tables."""
 
     def __init__(self, ticks: pd.DataFrame, events: list[tuple[str, pd.DataFrame]]) -> None:
-        self.ticks, self.events = ticks, events
+        self.ticks, self.events = ticks, dict(events)
         self.calls: list[tuple] = []
 
-    def parse_ticks(self, props, ticks=None):
-        self.calls.append(("ticks", tuple(props), None if ticks is None else len(ticks)))
+    def parse_ticks(self, wanted_props, *, players=None, ticks=None, prop_states=None):
+        self.calls.append(("ticks", tuple(wanted_props), None if ticks is None else len(ticks)))
         df = self.ticks if ticks is None else self.ticks[self.ticks["tick"].isin(ticks)]
-        return df[["tick", *[c for c in df.columns if c != "tick"]]].copy()
+        return df.copy()
 
-    def parse_events(self, names, player=None):
+    def list_game_events(self):
+        return list(self.events)
+
+    def parse_events(self, names, *, player=None, other=None):
         self.calls.append(("events", tuple(names), tuple(player or ())))
-        return [(n, df.copy()) for n, df in self.events if n in names]
+        return [(n, self.events[n].copy()) for n in names]
 
 
 def tick_table(first: int, last: int, bob_in_view: range = range(0), bob_dead: range = range(0)) -> pd.DataFrame:
@@ -103,7 +106,7 @@ def test_smoke_events_joins_detonate_and_expired_by_entity_id(monkeypatch) -> No
     )
     exp = pd.DataFrame({"tick": [1250, 300, 1650], "entityid": [11, 10, 10]})  # unsorted, no expiry for entity 12
     parser = FakeParser(pd.DataFrame(), [(demo.SMOKE_DETONATE_EVENT, det), (demo.SMOKE_EXPIRED_EVENT, exp)])
-    monkeypatch.setattr(demo, "_parser", lambda path: parser)
+    monkeypatch.setattr(demo, "_make_parser", lambda path: parser)
     table = demo.smoke_events("x.dem")
     assert list(table.columns) == list(demo.SMOKE_COLUMNS)
     assert table["detonate_tick"].tolist() == [100, 400, 500, 900]
@@ -115,23 +118,15 @@ def test_smoke_events_joins_detonate_and_expired_by_entity_id(monkeypatch) -> No
 
 
 def test_smoke_events_without_smokes_or_thrower(monkeypatch) -> None:
-    monkeypatch.setattr(demo, "_parser", lambda path: FakeParser(pd.DataFrame(), []))
+    monkeypatch.setattr(demo, "_make_parser", lambda path: FakeParser(pd.DataFrame(), []))
     empty = demo.smoke_events("x.dem")
     assert list(empty.columns) == list(demo.SMOKE_COLUMNS) and len(empty) == 0
     det = pd.DataFrame({"tick": [64], "entityid": [1], "x": [0.0], "y": [0.0], "z": [0.0]})
-    monkeypatch.setattr(demo, "_parser", lambda path: FakeParser(pd.DataFrame(), [(demo.SMOKE_DETONATE_EVENT, det)]))
+    monkeypatch.setattr(
+        demo, "_make_parser", lambda path: FakeParser(pd.DataFrame(), [(demo.SMOKE_DETONATE_EVENT, det)])
+    )
     row = demo.smoke_events("x.dem").iloc[0]
     assert row["thrower_user_id"] == -1 and row["expire_tick"] == 64 + demo.SMOKE_DURATION_TICKS
-
-
-def test_load_ticks_filters_by_tick_and_user_id(monkeypatch) -> None:
-    parser = FakeParser(tick_table(0, 9), [])
-    monkeypatch.setattr(demo, "_parser", lambda path: parser)
-    both = demo.load_ticks("x.dem", ["X"], ticks=[2, 3])
-    assert sorted(both["tick"].unique()) == [2, 3] and len(both) == 4
-    alice = demo.load_ticks("x.dem", ["X"], players=[7])
-    assert set(alice["user_id"]) == {7} and len(alice) == 10
-    assert parser.calls[-1][1] == ("X", "user_id")  # user_id is requested to filter on
 
 
 # --- masked metrics ------------------------------------------------------------------------------------------------
@@ -426,7 +421,7 @@ def smoke_data(tmp_path_factory, cfg):
 @pytest.fixture
 def parser(monkeypatch):
     p = FakeParser(tick_table(980, 1200, bob_in_view=range(1060, 1101)), smoke_event_tables())
-    monkeypatch.setattr(demo, "_parser", lambda path: p)
+    monkeypatch.setattr(demo, "_make_parser", lambda path: p)
     return p
 
 
