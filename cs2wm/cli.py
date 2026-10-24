@@ -75,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cleanup", help="free working-set disk (#20); do not run while `supervise` is running")
     p.add_argument("--failed", action="store_true", help="delete frames/raw/labels (and pack .staging) of failed demos")
     p.add_argument("--dry-run", action="store_true", help="only list what would be deleted")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="also clean failed demos that would still be retried (e.g. failures from manual runs)",
+    )
 
     p = sub.add_parser("qa-summary", help="summarise extract QA (#19)")
     p.add_argument("--kind", choices=["dm", "human", "smoke"], default=None)
@@ -287,7 +292,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         if not args.failed:
             raise SystemExit("cleanup: say what to clean; the only choice is --failed")
         cfg = _cfg(args)
-        found = cleanup_failed(cfg, _supervisor(cfg).state, args.dry_run)
+        found = cleanup_failed(cfg, _supervisor(cfg).state, args.dry_run, args.force)
         for demo_id, path, size in found:
             print(f"{'would delete' if args.dry_run else 'deleted'} {path} ({size / 1e6:.1f} MB) [{demo_id}]")
         total = sum(size for _, _, size in found)

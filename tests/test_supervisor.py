@@ -1125,6 +1125,16 @@ def test_cleanup_skips_failed_demos_that_still_have_attempts_left(cfg: DictConfi
     assert cleanup_failed(cfg, state) and not Path(cfg.paths.frames, "bad").exists()
 
 
+def test_cleanup_force_cleans_failures_from_manual_runs(cfg: DictConfig) -> None:
+    from cs2wm.pipeline.supervisor import cleanup_failed
+
+    state = _failed_world(cfg)
+    state.demos["bad"].pop("attempts", None)  # failed in a manual `cs2wm pack`: no attempts recorded
+    assert cleanup_failed(cfg, state) == [] and Path(cfg.paths.frames, "bad", "f.bin").exists()
+    assert {d for d, _, _ in cleanup_failed(cfg, state, force=True)} == {"bad"}
+    assert not Path(cfg.paths.frames, "bad").exists() and Path(cfg.paths.frames, "good", "f.bin").exists()
+
+
 def test_a_demo_parked_by_the_wall_time_cap_does_not_count_as_progress_possible(cfg: DictConfig) -> None:
     sup, world = make(cfg)
     sup.state.mark("p", StageState.SEGMENTED, kind="dm")

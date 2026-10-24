@@ -334,7 +334,9 @@ def failed_leftovers(cfg: DictConfig, demo_ids: Iterable[str]) -> list[tuple[str
     return [(d, path, _dir_bytes(path)) for d in sorted(demo_ids) for path in demo_leftovers(cfg, d)]
 
 
-def cleanup_failed(cfg: DictConfig, state: PipelineState, dry_run: bool = False) -> list[tuple[str, Path, int]]:
+def cleanup_failed(
+    cfg: DictConfig, state: PipelineState, dry_run: bool = False, force: bool = False
+) -> list[tuple[str, Path, int]]:
     """Delete the working-set directories of ``failed`` demos (``cs2wm cleanup --failed``).
 
     Demos, plans, QA files and the state are never touched. A failed demo that is re-run later must be re-rendered.
@@ -343,6 +345,8 @@ def cleanup_failed(cfg: DictConfig, state: PipelineState, dry_run: bool = False)
         cfg: A validated cs2wm config.
         state: The pipeline state.
         dry_run: Only report what would be deleted.
+        force: Also clean failed demos that a supervised night would still retry (e.g. a demo that failed in a
+            manual run and so has no recorded attempts). Never use it while ``supervise`` is running.
 
     Returns:
         What was (or would be) deleted, as from ``failed_leftovers``.
@@ -350,7 +354,8 @@ def cleanup_failed(cfg: DictConfig, state: PipelineState, dry_run: bool = False)
     failed = [
         d
         for d, rec in state.demos.items()
-        if rec["state"] == StageState.FAILED.value and not retry_pending(cfg, rec)  # a retry still needs its files
+        if rec["state"] == StageState.FAILED.value
+        and (force or not retry_pending(cfg, rec))  # a pending retry still needs its files
     ]
     found = failed_leftovers(cfg, failed)
     if not dry_run:
