@@ -27,7 +27,9 @@ LOW_H, LOW_W = 30, 56
 
 @pytest.fixture(scope="module")
 def cfg():
-    return load_config(overrides=["pack.fullres_mod=1", "eval.h1.gt_pairs=60", "eval.h1.bootstrap=100"])
+    return load_config(
+        overrides=["pack.fullres_mod=1", "eval.h1.gt_pairs=60", "eval.h1.bootstrap=100", "eval.h1.skip_initial_steps=0"]
+    )
 
 
 @pytest.fixture(scope="module")
@@ -642,7 +644,9 @@ def test_cli_h1_passes_options(monkeypatch, tmp_path) -> None:
         4,
         3,
     )
-    cli.main(["eval", "h1", "--models", "v2=a.pt", "--data", "d"])
+    assert seen["v1_name"] == "v1"
+    cli.main(["eval", "h1", "--models", "v2=a.pt", "--data", "d", "--v1-name", "base"])
+    assert seen["v1_name"] == "base"
     assert seen["out"] == Path("results/h1") and seen["contexts"] == 50 and seen["batch_size"] == 16
     assert seen["denoising_steps"] == 1
 
@@ -650,3 +654,213 @@ def test_cli_h1_passes_options(monkeypatch, tmp_path) -> None:
 def test_cli_h1_requires_data() -> None:
     with pytest.raises(SystemExit):
         cli.main(["eval", "h1", "--models", "v2=a.pt"])
+
+
+# --- calibration: regression dilution ------------------------------------------------------------------------------
+
+
+def test_calibration_is_not_attenuated_by_noise_in_the_pixel_shift() -> None:
+    """Noise on px (r about 0.8) leaves px-on-label calibrated; label-on-px would be about r^2 = 0.64 low."""
+    rng = np.random.default_rng(0)
+    true_px_per_deg = 2.0
+    label = rng.choice(np.array([-3.3, -1.65, -0.55, -0.22, 0.0, 0.0, 0.22, 0.55, 1.65, 3.3]), size=40000)
+    clean = true_px_per_deg * label
+    px = clean + rng.normal(0, 0.75 * clean.std(), label.shape)
+    fit = h1.fit_axis(label, px, max_abs_deg=5.0)
+    assert fit["r"] == pytest.approx(0.8, abs=0.02)
+    assert fit["slope_deg_per_px"] == pytest.approx(1 / true_px_per_deg, rel=0.03)
+    assert fit["slope_px_per_deg"] == pytest.approx(true_px_per_deg, rel=0.03)
+    assert fit["slope_deg_per_px_ols_label_on_px"] == pytest.approx(0.64 / true_px_per_deg, rel=0.06)  # diluted
+    assert fit["slope_deg_per_px_ols_label_on_px"] < 0.7 * fit["slope_deg_per_px"]
+    # Truncating on |label| selects on the regressor and leaves the calibration alone.
+    cut = h1.fit_axis(label, px, max_abs_deg=1.0)
+    assert cut["n"] < len(label) and cut["slope_deg_per_px"] == pytest.approx(1 / true_px_per_deg, rel=0.05)
+
+
+def test_rollout_slope_regresses_estimated_on_commanded() -> None:
+    """The commanded value is exact, so the slope must not be diluted by noise on the estimate."""
+    rng = np.random.default_rng(1)
+    cmd = rng.choice(np.array([-3.3, -0.55, 0.0, 0.55, 3.3]), size=40000)
+    est = cmd + rng.normal(0, 1.0, cmd.shape)
+    assert h1.axis_metrics(cmd, est)["slope"] == pytest.approx(1.0, rel=0.03)  # the reverse regression would give ~0.8
+
+
+# --- stub worlds through the whole estimation path -----------------------------------------------------------------
+
+
+class StubWorld:
+    """A world model whose generated frames translate by an amount set by the action.
+
+    The action held at step ``t`` moves the content between generated frames ``t - 1`` and ``t`` (a right turn moves it
+    left) by ``commanded degrees / deg_per_px``; steps before ``move_from`` do not move at all.
+    """
+
+    def __init__(self, spec, deg_per_px, move_from: int = 0, seed: int = 0):
+        self.spec, self.deg_per_px, self.move_from = spec, deg_per_px, move_from
+        self.tex = periodic_texture(seed)
+
+    def rollout(self, frames, ctx_actions, actions, generators):
+        lows, fulls = [], []
+        for stream in actions:
+            pos, bgr = np.zeros(2), []
+            for t, act in enumerate(stream.numpy()):
+                d = decode(act, self.spec)
+                if t >= self.move_from and t > 0:
+                    pos += (-d.mouse_x_deg / self.deg_per_px[0], -d.mouse_y_deg / self.deg_per_px[1])
+                bgr.append(shifted(self.tex, *pos))
+            full = h1.frames_to_tensor(np.stack(bgr))
+            fulls.append(full)
+            lows.append(torch.nn.functional.interpolate(full, size=(LOW_H, LOW_W), mode="area"))
+        return torch.stack(lows), torch.stack(fulls)
+
+
+def stub_contexts(n: int) -> list:
+    return [
+        h1.Context(i, f"ep{i}", 0, torch.zeros(4, 3, LOW_H, LOW_W), np.zeros((4, ACTION_DIM), np.float32))
+        for i in range(n)
+    ]
+
+
+def stub_run(world, spec, suite, n_ctx: int = 2):
+    scripts = suite.scripts(spec)
+    rec = h1.rollout_shifts(world, stub_contexts(n_ctx), scripts, suite.rollout_frames, 0, 4, h1.phasecorr_estimator)
+    return scripts, rec
+
+
+def theory_conversion(cfg):
+    th = rotation.theoretical_slopes(W, H, float(cfg.eval.h1.hfov_deg), tuple(cfg.resolution.capture))
+    lo = rotation.theoretical_slopes(LOW_W, LOW_H, float(cfg.eval.h1.hfov_deg), tuple(cfg.resolution.capture))
+    return th, {
+        "fullres": {"yaw_deg_per_px": th[0], "pitch_deg_per_px": th[1]},
+        "lowres": {"yaw_deg_per_px": lo[0], "pitch_deg_per_px": lo[1]},
+    }
+
+
+def test_a_perfectly_controllable_stub_is_positive_and_has_slope_one(cfg, spec) -> None:
+    """Right turn -> content moves left -> positive d-yaw: sign, alignment and calibration end to end."""
+    th, conversion = theory_conversion(cfg)
+    suite = h1.ScriptedSuite(yaw_units=(4, 10, 60), pitch_units=(4, 10), keys=(), rollout_frames=6)
+    scripts, rec = stub_run(StubWorld(spec, th), spec, suite)
+    est = h1._estimated_degrees(rec, conversion)["fullres"]
+    yaw, pitch = (
+        h1.axis_metrics(_cmd(rec, scripts, "yaw"), est["yaw"]),
+        h1.axis_metrics(_cmd(rec, scripts, "pitch"), est["pitch"]),
+    )
+    for m in (yaw, pitch):
+        assert m["pearson_r"] > 0.99 and m["sign_accuracy"] == 1.0
+        assert m["slope"] == pytest.approx(1.0, abs=0.08)
+    assert yaw["slope"] > 0 and yaw["n_nonzero"] == 6 * 2 * 5
+    right = rec["script"] == [s.name for s in scripts].index("yaw+10")
+    assert (rec["dx"][right] < -0.8).all() and (est["yaw"][right] > 0).all()  # a right turn is content moving left
+    down = rec["script"] == [s.name for s in scripts].index("pitch+10")
+    assert (rec["dy"][down] < -0.3).all() and (est["pitch"][down] > 0).all()  # looking down moves it up
+
+
+def _cmd(rec, scripts, axis):
+    return np.array([getattr(s, f"commanded_{axis}_deg") for s in scripts])[rec["script"]]
+
+
+def test_a_stub_that_starts_moving_at_step_t_pins_the_pair_to_the_action(cfg, spec) -> None:
+    """Pair ``frame = t`` is generated frames t-1 -> t, driven by the action at step t."""
+    th, _ = theory_conversion(cfg)
+    suite = h1.ScriptedSuite(yaw_units=(60,), pitch_units=(), keys=(), rollout_frames=7, noop=False)
+    _, rec = stub_run(StubWorld(spec, th, move_from=3), spec, suite, n_ctx=1)
+    right = rec["script"] == 0
+    still, moving = right & (rec["frame"] < 3), right & (rec["frame"] >= 3)
+    assert still.sum() == 2 and moving.sum() == 4
+    assert (np.abs(rec["dx"][still]) < 0.2).all()
+    assert (rec["dx"][moving] < -4).all()  # 60 units = 3.3 deg = about 6 px per step
+    left = rec["script"] == 1
+    assert (rec["dx"][left & (rec["frame"] >= 3)] > 4).all() and (
+        np.abs(rec["dx"][left & (rec["frame"] < 3)]) < 0.2
+    ).all()
+
+
+# --- skip_initial_steps, held_out, v1 name, GT sampling ------------------------------------------------------------
+
+
+def test_skip_initial_steps_excludes_early_pairs_from_the_metrics_only(ckpts, gt_root, tmp_path, agent_cfg) -> None:
+    cfg = load_config(
+        overrides=["pack.fullres_mod=1", "eval.h1.gt_pairs=30", "eval.h1.bootstrap=20", "eval.h1.skip_initial_steps=2"]
+    )
+    suite = h1.ScriptedSuite(yaw_units=(4,), pitch_units=(), keys=(), rollout_frames=4)
+    s = run(ckpts, gt_root, tmp_path, cfg, agent_cfg, suite)
+    assert s["config"]["skip_initial_steps"] == 2
+    assert s["results"]["v2"]["fullres"]["yaw"]["n"] == 2 * 3 * 2  # contexts x scripts x frames 2..3
+    lines = [row.split(",") for row in (tmp_path / "v2_frames.csv").read_text().splitlines()]
+    header, rows = lines[0], lines[1:]
+    assert len(rows) == 2 * 3 * 3  # every pair stays in the CSV
+    assert {int(r[header.index("frame")]): int(r[header.index("in_stats")]) for r in rows} == {1: 0, 2: 1, 3: 1}
+    too_much = load_config(overrides=["eval.h1.skip_initial_steps=4"])
+    with pytest.raises(ValueError, match="skip_initial_steps"):
+        run(ckpts, gt_root, tmp_path / "x", too_much, agent_cfg, suite)
+
+
+def test_default_skip_is_the_conditioning_length() -> None:
+    assert load_config().eval.h1.skip_initial_steps == 4
+
+
+def test_missing_split_json_is_flagged_not_held_out(
+    ckpts, gt_root, tmp_path, cfg, agent_cfg, tiny_suite, capsys
+) -> None:
+    s = run(ckpts, gt_root, tmp_path / "a", cfg, agent_cfg, tiny_suite)
+    assert s["data"]["held_out"] is False and any("NOT HELD OUT" in w for w in s["warnings"])
+    assert "NOT HELD OUT" in capsys.readouterr().err
+    split = tmp_path / "split.json"
+    split.write_text(json.dumps({"demo0": "test", "demo1": "test"}))
+    s = run(ckpts, gt_root, tmp_path / "b", cfg, agent_cfg, tiny_suite, split_json=split)
+    assert s["data"]["held_out"] is True and not any("NOT HELD OUT" in w for w in s["warnings"])
+    assert json.loads((tmp_path / "b" / "summary.json").read_text())["data"]["held_out"] is True
+
+
+def test_v1_name_selects_the_own_upsampler_model_and_is_printed(
+    ckpts, gt_root, tmp_path, cfg, agent_cfg, tiny_suite, capsys
+) -> None:
+    models = {"base": ckpts["v1"], "v2": ckpts["v2"]}
+    calls = []
+
+    def factory(name, ckpt):
+        calls.append(name)
+        return build_play_agent(ckpt, ckpts["v1"], agent_cfg=agent_cfg)
+
+    s = h1.run_h1(models, cfg, tmp_path, 1, 0, data_dir=gt_root / "low", suite=tiny_suite, agent_factory=factory,
+                  device="cpu", v1_name="base")  # fmt: skip
+    assert s["models"]["base"]["upsampler"]["path"] == str(ckpts["v1"]) == s["models"]["v2"]["upsampler"]["path"]
+    out = capsys.readouterr().out
+    assert f"base: denoiser {ckpts['v1']}, upsampler {ckpts['v1']} (its own checkpoint)" in out
+    assert f"v2: denoiser {ckpts['v2']}, upsampler {ckpts['v1']}" in out
+    # Without a model of that name and without --upsampler-ckpt there is no upsampler for v2: fail before any work.
+    with pytest.raises(ValueError, match="upsampler"):
+        h1.run_h1(
+            {"v2": ckpts["v2"]}, cfg, tmp_path / "e", 1, 0, data_dir=gt_root / "low", suite=tiny_suite, device="cpu"
+        )
+    assert calls == ["base", "v2"]
+    seen = []
+    monkeypatched = h1.build_play_agent
+    try:
+        h1.build_play_agent = lambda ckpt, up, device: seen.append((ckpt, up)) or "agent"
+        h1.make_agent_factory(Path("u.pt"), torch.device("cpu"), v1_name="base")("base", Path("b.pt"))
+        h1.make_agent_factory(Path("u.pt"), torch.device("cpu"), v1_name="base")("v1", Path("x.pt"))
+    finally:
+        h1.build_play_agent = monkeypatched
+    assert seen == [(Path("b.pt"), Path("b.pt")), (Path("x.pt"), Path("u.pt"))]
+
+
+def test_allocate_pairs_is_an_equal_share_capped_by_capacity() -> None:
+    rng = np.random.default_rng(0)
+    assert h1.allocate_pairs([10, 10, 10, 10], 12, rng).tolist() == [3, 3, 3, 3]
+    assert h1.allocate_pairs([2, 50, 50], 30, rng).tolist() == [2, 14, 14]
+    assert h1.allocate_pairs([3, 3], 100, rng).tolist() == [3, 3]
+    assert h1.allocate_pairs([0, 5], 3, rng).tolist() == [0, 3]
+    uneven = np.array([h1.allocate_pairs([9, 9, 9], 7, np.random.default_rng(s)) for s in range(30)])
+    assert (uneven.sum(1) == 7).all() and uneven.min() == 2 and uneven.max() == 3
+    assert (uneven[:, 0] == 3).any() and (uneven[:, 2] == 3).any()  # the remainder is not given to the first files
+
+
+def test_collect_gt_shifts_takes_an_equal_share_from_every_episode(gt_root, cfg, spec) -> None:
+    files = h1.list_episodes(gt_root / "low")
+    gt = h1.collect_gt_shifts(files, 30, 0, spec)
+    assert np.bincount(gt["episode"]).tolist() == [10, 10, 10]  # not 29 + 1 + 0 from the first files in order
+    again = h1.collect_gt_shifts(files, 30, 0, spec)
+    np.testing.assert_array_equal(gt["label_yaw"], again["label_yaw"])
+    assert len(h1.collect_gt_shifts(files, 1000, 0, spec)["label_yaw"]) == 3 * 29

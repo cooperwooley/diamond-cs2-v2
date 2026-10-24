@@ -7,11 +7,14 @@ Method
 ------
 1. **Estimator validation on ground truth.** For pairs of consecutive ground-truth frames ``(k, k + 1)`` of held-out
    episodes the image shift is estimated and correlated with the label-implied rotation (the decoded mouse bin centre,
-   in degrees, of action ``k``, which covers ``k -> k + 1``). Pearson r and the slope (degrees per pixel, fitted on
-   ``-dx`` for yaw and ``-dy`` for pitch) are reported per estimator (phase correlation, Farneback), axis and
-   resolution (150x280 needs ``--fullres-data``; 30x56 comes from ``--data``). Yaw r below ``eval.h1.r_threshold`` (0.8)
-   is flagged in ``warnings`` and on stderr. The fitted slope is the conversion used for the model rollouts
-   (the theoretical pinhole slope, ``rotation.theoretical_slopes``, is reported next to it, and used if no fit exists).
+   in degrees, of action ``k``, which covers ``k -> k + 1``). Pearson r and the calibration are reported per estimator
+   (phase correlation, Farneback), axis and resolution (150x280 needs ``--fullres-data``; 30x56 comes from ``--data``).
+   Yaw r below ``eval.h1.r_threshold`` (0.8) is flagged in ``warnings`` and on stderr. The calibration regresses the
+   noisy pixel shift (``-dx`` for yaw, ``-dy`` for pitch) on the exact label, ``px = a + b * label``, and converts with
+   ``deg_per_px = 1 / b``; the opposite regression (label on shift) would be attenuated by about r^2 (regression
+   dilution) and is reported only as ``slope_deg_per_px_ols_label_on_px``. The intercept is not used. The calibrated
+   slope is the conversion for the model rollouts (the theoretical pinhole slope, ``rotation.theoretical_slopes``, is
+   reported next to it, and used if no fit exists).
 2. **Contexts.** ``--contexts`` windows of 4 ground-truth frames and actions are drawn deterministically (``--seed``)
    from the held-out episodes of ``--data``.
 3. **Scripted suites** (``ScriptedSuite``): yaw at +-{2, 4, 10, 20, 30, 60} bins, pitch at +-{2, 4, 10, 20}, W, S, A, D
@@ -23,8 +26,12 @@ Method
    own. The shift is estimated between consecutive *generated* frames (``T - 1`` pairs per rollout; the context
    frame is not used because the first generated frame is not an upsampler output of the same kind), after the
    upsampler at 150x280, and at 30x56 on the low-res frames as a robustness check. Frames are quantised to uint8 first.
-5. **Metrics** per model and resolution (all scripted frames pooled): Pearson r and least-squares slope of estimated vs
-   commanded d-yaw and d-pitch, sign accuracy over non-zero commands, per-script mean +- 95% bootstrap CI (percentile
+   Pairs whose later frame index is below ``eval.h1.skip_initial_steps`` (default 4, the conditioning length) are left
+   out of every metric, because the denoiser's context still holds ground-truth actions there; they stay in the CSV
+   (``in_stats`` = 0). Without ``--split-json`` the data are not known to be held out: ``data.held_out`` is false and a
+   warning is printed.
+5. **Metrics** per model and resolution (all scripted frames pooled): Pearson r and least-squares slope of estimated
+   (y) on commanded (x, exact) d-yaw and d-pitch, sign accuracy over non-zero commands, per-script mean +- 95% bootstrap CI (percentile
    bootstrap over *contexts* of the per-context mean, since frames of one rollout are correlated), and the drift under
    no-op (mean absolute estimated d-yaw/d-pitch per frame). For W/S the sign of the Farneback flow divergence.
 
@@ -32,17 +39,18 @@ Sign convention: positive d-yaw = turn right, positive d-pitch = look down (``cs
 
 ``summary.json`` (``schema_version`` 1)
 ---------------------------------------
-``config``: ``hfov_deg``, ``capture_hw``, ``frame_hw``, ``low_res_hw``, ``rollout_frames``, ``estimator``,
+``config``: ``hfov_deg``, ``capture_hw``, ``frame_hw``, ``low_res_hw``, ``rollout_frames``, ``skip_initial_steps``,
+    ``estimator``,
     ``denoising_steps``, ``contexts``, ``bootstrap``, ``r_threshold``, ``gt_max_abs_deg``, ``gt_pairs``,
     ``batch_size``, ``device``, ``deg_per_unit``.
-``seed``; ``data``: ``dir``, ``split_json``, ``fullres_dir``, ``n_episodes``, ``contexts`` (list of
+``seed``; ``data``: ``dir``, ``split_json``, ``held_out``, ``fullres_dir``, ``n_episodes``, ``contexts`` (list of
     ``{index, episode, start}``).
 ``models``: name -> ``{checkpoint: {path, sha256_16}, upsampler: {path, sha256_16}}``.
 ``scripts``: list of ``{name, kind, commanded_yaw_deg, commanded_pitch_deg}``; ``kind`` is ``yaw|pitch|key|noop``.
 ``estimator_validation``: ``threshold_r``, ``max_abs_deg``, ``passed`` (selected estimator, yaw, every resolution
     that has ground truth; null if none has), ``resolutions``: ``"150x280"|"30x56"`` -> ``{available, source,
-    n_pairs, estimators: {phasecorr|flow: {yaw|pitch: {n, r, slope_deg_per_px, intercept_deg, n_all, r_all,
-    theoretical_slope_deg_per_px, passed}}}}``; ``available`` false (with ``reason``) if there is no ground truth.
+    n_pairs, estimators: {phasecorr|flow: {yaw|pitch: {n, n_all, r, r_all, slope_px_per_deg, intercept_px,
+    slope_deg_per_px, slope_deg_per_px_ols_label_on_px, theoretical_slope_deg_per_px, passed}}}}``; ``available`` false (with ``reason``) if there is no ground truth.
 ``conversion``: ``"fullres"|"lowres"`` -> ``{yaw_deg_per_px, pitch_deg_per_px, yaw_source, pitch_source}`` where
     the source is ``fitted`` or ``theory``; ``est_yaw = yaw_deg_per_px * -dx``, ``est_pitch = pitch_deg_per_px * -dy``.
 ``results``: model -> ``{"fullres"|"lowres": {estimator, yaw|pitch: {n, pearson_r, slope, intercept, sign_accuracy,
@@ -52,7 +60,7 @@ Sign convention: positive d-yaw = turn right, positive d-pitch = look down (``cs
 ``warnings``; ``versions``; ``files``.
 
 Other outputs in ``out_dir``: ``<model>_frames.csv`` (one row per generated frame pair: context, episode, start, script,
-kind, frame, commanded and estimated values at both resolutions, divergence), ``<model>_scatter.{pdf,png}`` and
+kind, frame, commanded and estimated values at both resolutions, divergence, in_stats), ``<model>_scatter.{pdf,png}`` and
 ``per_bin_curves.{pdf,png}``.
 """
 
@@ -313,11 +321,41 @@ def flow_estimator(prev: np.ndarray, curr: np.ndarray) -> tuple[float, float]:
 ESTIMATORS: dict[str, Estimator] = {"phasecorr": phasecorr_estimator, "flow": flow_estimator}
 
 
+def allocate_pairs(capacity: Sequence[int], total: int, rng: np.random.Generator) -> np.ndarray:
+    """Split ``total`` pairs over episodes as evenly as their capacities allow.
+
+    Every episode with spare capacity gets the same share; the remainder of an uneven split goes to episodes picked
+    at random (seeded), and an episode that is too short for its share gives the rest back to the others.
+
+    Args:
+        capacity: Pairs available per episode.
+        total: Pairs wanted.
+        rng: Source of the random tie-breaking.
+
+    Returns:
+        ``int[len(capacity)]`` quotas with ``quota <= capacity`` and ``sum == min(total, sum(capacity))``.
+    """
+    cap = np.asarray(capacity, dtype=np.int64)
+    quota = np.zeros_like(cap)
+    remaining = min(total, int(cap.sum()))
+    while remaining > 0:
+        active = np.flatnonzero(quota < cap)
+        share = remaining // len(active)
+        if share == 0:
+            quota[rng.choice(active, size=remaining, replace=False)] += 1
+            break
+        give = np.minimum(share, cap[active] - quota[active])
+        quota[active] += give
+        remaining -= int(give.sum())
+    return quota
+
+
 def collect_gt_shifts(files: Sequence[Path], n_pairs: int, seed: int, spec: ActionSpec) -> dict[str, Any]:
     """Estimate the shift of consecutive ground-truth frames and pair it with the label.
 
-    Pairs ``(k, k + 1)`` are drawn at random, an equal share from every episode; the label is the decoded bin centre
-    of action ``k`` (action ``k`` covers frames ``k -> k + 1``).
+    Pairs ``(k, k + 1)`` are drawn uniformly at random within each episode, with an equal share per episode
+    (``allocate_pairs``); the label is the decoded bin centre of action ``k`` (action ``k`` covers frames
+    ``k -> k + 1``).
 
     Args:
         files: Packed episodes (any frame resolution).
@@ -326,59 +364,86 @@ def collect_gt_shifts(files: Sequence[Path], n_pairs: int, seed: int, spec: Acti
         spec: Action layout, to decode the labels.
 
     Returns:
-        ``{"label_yaw", "label_pitch", "shifts": {estimator: (dx, dy)}, "hw"}`` with float64 arrays of length ``n``.
+        ``{"label_yaw", "label_pitch", "shifts": {estimator: (dx, dy)}, "hw", "episode"}`` with float64 arrays of
+        length ``n`` (``episode`` holds the index into ``files`` of each pair).
 
     Raises:
         ValueError: If there is no episode with two frames.
     """
     rng = np.random.default_rng(seed)
-    per_file = -(-n_pairs // max(len(files), 1))
-    label_yaw, label_pitch = [], []
-    shifts: dict[str, list[tuple[float, float]]] = {name: [] for name in ESTIMATORS}
-    hw: tuple[int, int] | None = None
+    lengths = []
     for path in files:
-        frames, actions, _ = read_episode(path)
-        if len(frames) < 2 or len(label_yaw) >= n_pairs:
+        with h5py.File(path, "r") as f:
+            lengths.append(int(f.attrs["n_frames"]))
+    if not any(m >= 2 for m in lengths):
+        raise ValueError("no episode has at least two frames")
+    quota = allocate_pairs([max(m - 1, 0) for m in lengths], n_pairs, rng)
+    label_yaw, label_pitch, episode = [], [], []
+    shifts: dict[str, list[tuple[float, float]]] = {name: [] for name in ESTIMATORS}
+    hw: tuple[int, int] = (0, 0)
+    for i, (path, q) in enumerate(zip(files, quota)):
+        if q == 0:
             continue
+        frames, actions, _ = read_episode(path)
         hw = frames.shape[1:3]
-        ks = rng.choice(len(frames) - 1, size=min(per_file, len(frames) - 1, n_pairs - len(label_yaw)), replace=False)
-        for k in sorted(int(k) for k in ks):
+        for k in sorted(int(k) for k in rng.choice(len(frames) - 1, size=int(q), replace=False)):
             d = decode(actions[k], spec)
             label_yaw.append(d.mouse_x_deg)
             label_pitch.append(d.mouse_y_deg)
+            episode.append(i)
             for name, fn in ESTIMATORS.items():
                 shifts[name].append(fn(frames[k], frames[k + 1]))
-    if hw is None:
-        raise ValueError("no episode has at least two frames")
     return {
         "label_yaw": np.array(label_yaw),
         "label_pitch": np.array(label_pitch),
+        "episode": np.array(episode),
         "shifts": {name: np.array(v).reshape(-1, 2).T for name, v in shifts.items()},
         "hw": (int(hw[0]), int(hw[1])),
     }
 
 
 def fit_axis(label_deg: np.ndarray, px: np.ndarray, max_abs_deg: float) -> dict[str, Any]:
-    """Pearson r and least-squares slope of the label (degrees) on the rotation-signed pixel shift.
+    """Pearson r and the px-to-degree calibration of one axis against the exact labels.
+
+    The label is the exact regressor and the measured pixel shift carries the noise (translation, moving players,
+    estimator error). Regressing the label on the noisy shift would be attenuated by about ``r**2`` (regression
+    dilution), so the calibration regresses the shift on the label, ``px = a + b * label``, and uses
+    ``deg_per_px = 1 / b``. Selecting pairs on ``|label|`` selects on the regressor and does not bias that fit. The
+    intercept is not used in the conversion.
 
     Args:
         label_deg: Label-implied rotation per frame in degrees.
         px: Pixel shift signed so that a positive rotation is positive (``-dx`` for yaw, ``-dy`` for pitch).
-        max_abs_deg: ``n``, ``r``, ``slope_deg_per_px`` and ``intercept_deg`` use pairs with ``|label| <= max_abs_deg``
-            (the range the scripts cover); ``n_all`` and ``r_all`` use all pairs.
+        max_abs_deg: The fit and ``r`` use pairs with ``|label| <= max_abs_deg`` (the range the scripts cover);
+            ``n_all`` and ``r_all`` use all pairs.
 
     Returns:
-        ``{n, r, slope_deg_per_px, intercept_deg, n_all, r_all}``; NaN where undefined (constant input).
+        ``{n, n_all, r, r_all, slope_px_per_deg, intercept_px, slope_deg_per_px, slope_deg_per_px_ols_label_on_px}``.
+        ``slope_deg_per_px`` is the one used for the rollouts (``1 / slope_px_per_deg``); the last entry is the
+        attenuated label-on-px OLS slope, kept to show the difference. NaN where undefined (constant input).
     """
     keep = np.abs(label_deg) <= max_abs_deg
     out: dict[str, Any] = {"n": int(keep.sum()), "n_all": len(label_deg)}
     nan = float("nan")
-    x, y = px[keep], label_deg[keep]
+    x, y = label_deg[keep], px[keep]
     if len(x) >= 3 and np.ptp(x) > 0 and np.ptp(y) > 0:
-        fit = stats.linregress(x, y)
-        out.update(r=float(fit.rvalue), slope_deg_per_px=float(fit.slope), intercept_deg=float(fit.intercept))
+        fit = stats.linregress(x, y)  # px on label
+        inverse = stats.linregress(y, x)  # label on px: the diluted slope
+        out.update(
+            r=float(fit.rvalue),
+            slope_px_per_deg=float(fit.slope),
+            intercept_px=float(fit.intercept),
+            slope_deg_per_px=float(1 / fit.slope) if fit.slope != 0 else nan,
+            slope_deg_per_px_ols_label_on_px=float(inverse.slope),
+        )
     else:
-        out.update(r=nan, slope_deg_per_px=nan, intercept_deg=nan)
+        out.update(
+            r=nan,
+            slope_px_per_deg=nan,
+            intercept_px=nan,
+            slope_deg_per_px=nan,
+            slope_deg_per_px_ols_label_on_px=nan,
+        )
     constant = len(px) < 3 or np.ptp(px) == 0 or np.ptp(label_deg) == 0
     out["r_all"] = nan if constant else float(stats.pearsonr(px, label_deg)[0])
     return out
@@ -714,12 +779,14 @@ def write_frames_csv(
     est: dict[str, dict[str, np.ndarray]],
     scripts: Sequence[Script],
     contexts: Sequence[Context],
+    skip: int = 0,
 ) -> None:
     """Write one row per generated frame pair.
 
     Columns: ``context, episode, start, script, kind, frame, cmd_yaw_deg, cmd_pitch_deg, dx_px, dy_px, est_yaw_deg,
-    est_pitch_deg, dx_px_lowres, dy_px_lowres, est_yaw_deg_lowres, est_pitch_deg_lowres, divergence`` (``frame`` is
-    the later frame of the pair; empty cells are not computed).
+    est_pitch_deg, dx_px_lowres, dy_px_lowres, est_yaw_deg_lowres, est_pitch_deg_lowres, divergence, in_stats`` (``frame``
+    is the later frame of the pair; empty cells are not computed; ``in_stats`` is 1 if ``frame >= skip``, i.e. the
+    row enters the metrics).
     """
 
     def num(x: float) -> str:
@@ -739,7 +806,7 @@ def write_frames_csv(
         "est_pitch_deg_lowres": ("lowres", "pitch"),
     }
     header = ["context", "episode", "start", "script", "kind", "frame", "cmd_yaw_deg", "cmd_pitch_deg"]
-    header += [*pixel_cols, *est_cols]
+    header += [*pixel_cols, *est_cols, "in_stats"]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
@@ -757,6 +824,7 @@ def write_frames_csv(
             ]
             row += [num(rec[k][i]) for k in pixel_cols.values()]
             row += [num(est[res][axis][i]) for res, axis in est_cols.values()]
+            row.append(int(rec["frame"][i] >= skip))
             w.writerow(row)
 
 
@@ -816,13 +884,16 @@ def plot_per_bin(results: dict[str, Any], out_dir: Path) -> list[str]:
             # Scripts of this axis plus no-op (commanded 0), sorted by commanded value.
             rows = [b for b in res["fullres"]["per_bin"] if b["kind"] in (axis, "noop") and b[axis]["mean"] is not None]
             rows.sort(key=lambda b: b[f"commanded_{axis}_deg"])
+            if not rows:
+                continue
             x = np.array([b[f"commanded_{axis}_deg"] for b in rows])
             y = np.array([b[axis]["mean"] for b in rows])
             lo = np.array([b[axis]["ci_lo"] for b in rows])
             hi = np.array([b[axis]["ci_hi"] for b in rows])
-            ax.errorbar(x, y, yerr=[y - lo, hi - y], marker="o", ms=3, lw=1, capsize=2, color=color, label=model)
-            if len(x):
-                lim[axis] = max(lim[axis], float(np.abs(x).max()), float(np.abs(np.r_[lo, hi]).max()))
+            ax.errorbar(
+                x, y, yerr=np.vstack([y - lo, hi - y]), marker="o", ms=3, lw=1, capsize=2, color=color, label=model
+            )
+            lim[axis] = max(lim[axis], float(np.abs(x).max()), float(np.abs(np.r_[lo, hi]).max()))
         lim[axis] *= 1.1
         ax.plot([-lim[axis], lim[axis]], [-lim[axis], lim[axis]], color="0.4", lw=1, ls="--", label="ideal")
         ax.axhline(0, color="0.8", lw=0.8)
@@ -870,21 +941,22 @@ def _versions() -> dict[str, Any]:
     }
 
 
-def make_agent_factory(upsampler_ckpt: Path | None, device: torch.device) -> AgentFactory:
+def make_agent_factory(upsampler_ckpt: Path | None, device: torch.device, v1_name: str = V1_MODEL_NAME) -> AgentFactory:
     """The agent loader for the real run: ``build_play_agent`` with the right upsampler.
 
-    The model named ``v1`` uses its own checkpoint for the upsampler; every other model uses ``upsampler_ckpt``.
+    The model named ``v1_name`` uses its own checkpoint for the upsampler; every other model uses ``upsampler_ckpt``.
 
     Args:
         upsampler_ckpt: The v1 checkpoint providing the upsampler for v2 and shuffled.
         device: Device for the agents.
+        v1_name: Name of the v1 (zero-action) model.
 
     Returns:
         ``factory(name, ckpt) -> Agent``.
     """
 
     def factory(name: str, ckpt: Path) -> Any:
-        up = ckpt if name == V1_MODEL_NAME else upsampler_ckpt
+        up = ckpt if name == v1_name else upsampler_ckpt
         if up is None:
             raise ValueError(f"model {name!r} needs --upsampler-ckpt (the v1 checkpoint)")
         return build_play_agent(ckpt, up, device)
@@ -916,6 +988,7 @@ def run_h1(
     denoising_steps: int = 1,
     suite: ScriptedSuite | None = None,
     agent_factory: AgentFactory | None = None,
+    v1_name: str = V1_MODEL_NAME,
 ) -> dict:
     """Roll out every scripted input for every model and compute the controllability metrics.
 
@@ -929,18 +1002,21 @@ def run_h1(
         split_json: Optional ``split.json`` keeping only test demos.
         fullres_dir: Optional directory of 150x280 full-res twins (``hdf5_fullres``) for the ground-truth validation
             at full resolution; without it the full-res conversion is the theoretical one.
-        upsampler_ckpt: v1 checkpoint providing the upsampler for non-``v1`` models (default: the ``v1`` model's).
+        upsampler_ckpt: v1 checkpoint providing the upsampler for models other than ``v1_name`` (default: the
+            ``v1_name`` model's checkpoint).
         device: Torch device; defaults to cuda if available.
         batch_size: Rollouts per batched forward pass.
         denoising_steps: Sampler preset, 1 or 3.
         suite: Scripted suite; defaults to ``ScriptedSuite.from_config(cfg)``.
         agent_factory: ``(name, ckpt) -> agent``; defaults to ``make_agent_factory``.
+        v1_name: Name of the model that uses its own upsampler (the v1 zero-action model).
 
     Returns:
         The summary dict that is written to ``summary.json``.
 
     Raises:
-        ValueError: If ``data_dir`` is missing, ``models`` is empty or the suite is invalid.
+        ValueError: If ``data_dir`` is missing, ``models`` is empty, the suite is invalid, a model has no upsampler
+            source, or ``eval.h1.skip_initial_steps`` leaves no frame pairs.
     """
     if data_dir is None:
         raise ValueError("data_dir (--data) is required")
@@ -957,9 +1033,18 @@ def run_h1(
         raise ValueError("rollout_frames must be at least 2 (one frame pair)")
     n_boot = int(h.bootstrap)
     estimator = ESTIMATORS[str(h.estimator)]
-    if upsampler_ckpt is None and V1_MODEL_NAME in models:
-        upsampler_ckpt = models[V1_MODEL_NAME]
-    factory = agent_factory or make_agent_factory(upsampler_ckpt, dev)
+    skip = int(h.skip_initial_steps)
+    if skip >= suite.rollout_frames:
+        raise ValueError(f"skip_initial_steps ({skip}) leaves no frame pair in {suite.rollout_frames} frames")
+    if upsampler_ckpt is None and v1_name in models:
+        upsampler_ckpt = models[v1_name]
+    upsamplers = {name: Path(ckpt) if name == v1_name else upsampler_ckpt for name, ckpt in models.items()}
+    if agent_factory is None and any(up is None for up in upsamplers.values()):
+        raise ValueError(f"models without an upsampler: pass --upsampler-ckpt or a model named {v1_name!r}")
+    for name, up in upsamplers.items():
+        source = "its own checkpoint" if name == v1_name else "--upsampler-ckpt / the v1 model"
+        print(f"[h1] {name}: denoiser {models[name]}, upsampler {up} ({source})")
+    factory = agent_factory or make_agent_factory(upsampler_ckpt, dev, v1_name)
 
     files = list_episodes(data_dir, split_json)
     full_files = list_episodes(fullres_dir, split_json) if fullres_dir is not None else None
@@ -976,6 +1061,10 @@ def run_h1(
                 f"ESTIMATOR VALIDATION FAILED at {name}: {validation['estimator']} yaw r = {fit['r']:.3f} < "
                 f"{validation['threshold_r']} on ground truth; switch estimator or resolution"
             )
+    if split_json is None:
+        warnings.append(
+            "NOT HELD OUT: no --split-json was given, so the contexts and ground-truth pairs may come from training demos"
+        )
     ctxs = sample_contexts(files, contexts, 4, seed)
 
     summary: dict[str, Any] = {
@@ -987,6 +1076,7 @@ def run_h1(
             "low_res_hw": list(cfg.resolution.low_res),
             "deg_per_unit": spec.deg_per_unit,
             "rollout_frames": suite.rollout_frames,
+            "skip_initial_steps": skip,
             "estimator": str(h.estimator),
             "denoising_steps": denoising_steps,
             "contexts": contexts,
@@ -1001,6 +1091,7 @@ def run_h1(
         "data": {
             "dir": str(data_dir),
             "split_json": str(split_json) if split_json else None,
+            "held_out": split_json is not None,
             "fullres_dir": str(fullres_dir) if fullres_dir else None,
             "n_episodes": len(files),
             "contexts": [{"index": c.index, "episode": c.episode, "start": c.start} for c in ctxs],
@@ -1026,7 +1117,7 @@ def run_h1(
         )
         agent = factory(name, Path(ckpt))
         world = WorldModel(agent, denoising_steps, use_upsampler=True)
-        up = Path(ckpt) if name == V1_MODEL_NAME else upsampler_ckpt
+        up = upsamplers[name]
         summary["models"][name] = {
             "checkpoint": {"path": str(ckpt), "sha256_16": _sha16(Path(ckpt))},
             "upsampler": {"path": str(up), "sha256_16": _sha16(up) if up else None},
@@ -1044,14 +1135,17 @@ def run_h1(
         if dev.type == "cuda":
             torch.cuda.empty_cache()
         est = _estimated_degrees(rec, conversion)
+        used = rec["frame"] >= skip  # the first steps mix ground-truth context actions with the scripted ones
+        rec_u = {k: v[used] for k, v in rec.items()}
+        est_u = {key: {axis: v[used] for axis, v in d.items()} for key, d in est.items()}
         res = {
-            key: {"estimator": str(h.estimator), **model_metrics(rec, est[key], scripts, len(ctxs), n_boot, seed)}
+            key: {"estimator": str(h.estimator), **model_metrics(rec_u, est_u[key], scripts, len(ctxs), n_boot, seed)}
             for key in RESOLUTIONS
         }
-        res["ws_divergence"] = divergence_metrics(rec, scripts, len(ctxs), n_boot, seed)
+        res["ws_divergence"] = divergence_metrics(rec_u, scripts, len(ctxs), n_boot, seed)
         summary["results"][name] = res
-        write_frames_csv(out_dir / f"{name}_frames.csv", rec, est, scripts, ctxs)
-        plots += plot_scatter(name, rec, est, scripts, res["fullres"], out_dir)
+        write_frames_csv(out_dir / f"{name}_frames.csv", rec, est, scripts, ctxs, skip)
+        plots += plot_scatter(name, rec_u, est_u, scripts, res["fullres"], out_dir)
     plots += plot_per_bin(summary["results"], out_dir)
 
     summary["warnings"] = warnings

@@ -120,6 +120,8 @@ eval:
     hfov_deg: 106.26  # 16:9 render at CS2's fixed 90 deg (4:3-based) FOV; refit on GT in #32
     contexts: 50
     rollout_frames: 32     # frames each scripted action is held
+    skip_initial_steps: 4  # pairs whose later frame index is below this are left out of the metrics: the first
+                           # num_steps_conditioning steps still see ground-truth context actions
     yaw_units: [2, 4, 10, 20, 30, 60]   # scripted yaw bins, run as +u and -u (must be mouse_x bin centres)
     pitch_units: [2, 4, 10, 20]         # scripted pitch bins, +u and -u (must be mouse_y bin centres)
     keys: [w, s, a, d]

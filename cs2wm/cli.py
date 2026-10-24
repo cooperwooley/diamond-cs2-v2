@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="v1 checkpoint providing the upsampler for non-v1 models (default: the model named v1)",
     )
+    q.add_argument("--v1-name", default="v1", help="name of the model that uses its own upsampler (default: v1)")
     q.add_argument("--out", type=Path, default=Path("results/h1"))
     q.add_argument("--device", default=None, help="torch device (default: cuda if available)")
     q.add_argument("--batch-size", type=int, default=16, help="rollouts per batched forward pass")
@@ -263,6 +264,7 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
             device=args.device,
             batch_size=args.batch_size,
             denoising_steps=args.denoising_steps,
+            v1_name=args.v1_name,
         )
     elif sub == "h2":
         from cs2wm.eval import h2_smoke
