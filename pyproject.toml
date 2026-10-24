@@ -25,6 +25,8 @@ include = ["cs2wm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Repo root on sys.path: tests import shared fakes as `tests.<module>`, and the checkout's own cs2wm wins over any install.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 120
