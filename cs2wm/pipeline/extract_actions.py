@@ -42,18 +42,27 @@ QA (per episode; thresholds in ``qa.*``):
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
-from collections.abc import Mapping
+import os
+import shutil
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from omegaconf import DictConfig
 
+from cs2wm import demo
 from cs2wm.actions import ActionSpec, encode_batch, slot_for_weapon, wrap180, yaw_pitch_delta_to_mouse_deg
+from cs2wm.pipeline.segment import episodes_from_plan, read_render_plan
 from cs2wm.timeline import EpisodeSpec, tick_to_frame
+
+log = logging.getLogger(__name__)
 
 REQUIRED_TICK_COLUMNS = ("tick", "X", "Y", "Z", "yaw", "pitch", "is_airborne", "duck_amount", "active_weapon_name")
 OPTIONAL_TICK_COLUMNS = (
@@ -159,7 +168,8 @@ def _fire_mask(events: Mapping[str, pd.DataFrame], episode: EpisodeSpec, hold_ga
         frames = tick_to_frame(shots, episode.start_tick, episode.ticks_per_frame)
         for i in np.flatnonzero(np.diff(shots) <= hold_gap_ticks):
             lo, hi = max(int(frames[i]), 0), min(int(frames[i + 1]), n - 1)
-            mask[lo : hi + 1] = True
+            if lo <= hi:  # a pair entirely before the episode would wrap to frame 0 through the negative slice
+                mask[lo : hi + 1] = True
     return mask
 
 
@@ -338,8 +348,87 @@ def extract_episode(
     return actions, EpisodeQA(episode.episode_id, not reasons, reasons, stats)
 
 
+def _user_id_column(df: pd.DataFrame) -> str | None:
+    return next((c for c in demo.EVENT_USER_ID_COLUMNS if c in df.columns), None)
+
+
+def _events_of(events: Mapping[str, pd.DataFrame], user_id: int) -> dict[str, pd.DataFrame]:
+    """Filter every event table to one player by ``user_id`` (bots share steamid 0, so never by steamid)."""
+    out: dict[str, pd.DataFrame] = {}
+    for name, df in events.items():
+        if df.empty:
+            out[name] = df
+            continue
+        column = _user_id_column(df)
+        if column is None:
+            raise KeyError(f"event {name!r} has no user_id column (columns: {list(df.columns)})")
+        out[name] = df[df[column] == user_id]
+    return out
+
+
+def _load_ticks(demo_path: Path) -> pd.DataFrame:
+    """Load the tick table for every player with all props ``extract_episode`` can use."""
+    required = [c for c in REQUIRED_TICK_COLUMNS if c != "tick"]
+    try:
+        return demo.load_ticks(demo_path, [*required, *OPTIONAL_TICK_COLUMNS])
+    except Exception:
+        # CONFIRM(#14): a button prop this demoparser2 build does not know. They only feed the non-gating cross-check.
+        log.warning(
+            "parse_ticks rejected the optional columns; labelling without the button cross-check", exc_info=True
+        )
+        return demo.load_ticks(demo_path, [*required, "is_walking"])
+
+
+def _write_atomic(path: Path, write: Callable[[Any], None], mode: str) -> None:
+    """Write ``path`` through a temp file in the same directory: fsync, then rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, mode) as f:
+            write(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def qa_path(cfg: DictConfig, demo_id: str) -> Path:
+    """``qa/<demo_id>.jsonl``."""
+    return Path(cfg.paths.qa) / f"{demo_id}.jsonl"
+
+
+def labels_dir(cfg: DictConfig, demo_id: str) -> Path:
+    """``labels/<demo_id>/``."""
+    return Path(cfg.paths.labels) / demo_id
+
+
+def sweep_deleting(cfg: DictConfig, demo_id: str) -> None:
+    """Delete ``frames/<id>.deleting`` and ``labels/<id>.deleting``, left by a pack that died while cleaning up."""
+    for base in (cfg.paths.frames, cfg.paths.labels):
+        shutil.rmtree(Path(base) / f"{demo_id}.deleting", ignore_errors=True)
+
+
+def read_qa(cfg: DictConfig, demo_id: str) -> dict[str, dict[str, Any]]:
+    """Read ``qa/<demo_id>.jsonl`` into ``{episode_id: record}``.
+
+    Raises:
+        FileNotFoundError: If extract has not run for the demo.
+    """
+    with open(qa_path(cfg, demo_id), encoding="utf-8") as f:
+        records = [json.loads(line) for line in f if line.strip()]
+    return {r["episode_id"]: r for r in records}
+
+
 def run(demo_path: Path, cfg: DictConfig) -> list[EpisodeQA]:
     """CLI stage: label every planned episode of a demo and write QA to ``qa/<demo_id>.jsonl``.
+
+    Needs the render plan and ``frames/<demo_id>/render.json`` (with the plan's sha256), so labels are only made for
+    a demo that was rendered from this plan. The tick and event tables are parsed once; each episode gets the rows of
+    its target, picked by ``user_id``. Labels of passing episodes go to ``labels/<demo_id>/<episode_id>.npy``; the QA
+    file is rewritten atomically with one line per episode (``episode_id``, ``demo_id``, ``kind``, ``n_frames``,
+    ``passed``, ``reasons``, ``stats``), so a re-run replaces it instead of appending.
 
     Args:
         demo_path: Path to the ``.dem`` file.
@@ -347,6 +436,41 @@ def run(demo_path: Path, cfg: DictConfig) -> list[EpisodeQA]:
 
     Returns:
         One QA record per episode; failing episodes are not passed to ``pack``.
+
+    Raises:
+        FileNotFoundError: If the plan or ``render.json`` is missing.
+        ValueError: If ``render.json`` was made from a different plan.
     """
-    # TODO(#11): read the render plan, cs2wm.demo.load_ticks/load_events, extract_episode, write labels and QA.
-    raise NotImplementedError("TODO(#11): extract_actions.run")
+    demo_path = Path(demo_path)
+    demo_id = demo_path.stem
+    sweep_deleting(cfg, demo_id)
+    plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
+    plan_sha = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    plan = read_render_plan(plan_path)
+    with open(Path(cfg.paths.frames) / demo_id / "render.json", encoding="utf-8") as f:
+        rendered = json.load(f)
+    if rendered.get("plan_sha256") != plan_sha:
+        raise ValueError(f"{demo_id}: render.json was made from a different plan than {plan_path}; re-run render")
+
+    episodes = episodes_from_plan(plan)
+    out_dir = labels_dir(cfg, demo_id)
+    ticks = _load_ticks(demo_path)
+    events = demo.load_events(demo_path, EVENT_NAMES, list(cfg.segment.event_player_props))
+    ticks_by_user = {int(uid): g for uid, g in ticks.groupby("user_id")}
+    results: list[EpisodeQA] = []
+    lines: list[str] = []
+    for ep in episodes:
+        player_ticks = ticks_by_user.get(ep.user_id, ticks.iloc[0:0])
+        actions, qa = extract_episode(player_ticks, _events_of(events, ep.user_id), ep, cfg)
+        label_file = out_dir / f"{ep.episode_id}.npy"
+        if qa.passed:
+            _write_atomic(label_file, lambda f, a=actions: np.save(f, a), "wb")
+        else:
+            label_file.unlink(missing_ok=True)  # a stale label file of an earlier, passing run
+        record = json.loads(qa.to_json())
+        record.update(demo_id=demo_id, kind=ep.kind, n_frames=ep.n_frames)
+        lines.append(json.dumps(record, sort_keys=True) + "\n")
+        results.append(qa)
+        log.info("%s: %s %s", demo_id, ep.episode_id, "ok" if qa.passed else "FAILED " + "; ".join(qa.reasons))
+    _write_atomic(qa_path(cfg, demo_id), lambda f: f.writelines(lines), "w")
+    return results

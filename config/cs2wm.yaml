@@ -11,6 +11,7 @@ paths:
   plans: ${paths.root}/plans                 # render_plan.json per demo (#10)
   frames: ${paths.root}/frames               # rendered 280x150 frames, deleted after pack
   raw: ${paths.root}/raw                     # HLAE raw captures (1280x720), deleted per segment after downscaling
+  labels: ${paths.root}/labels               # <demo_id>/<episode_id>.npy float32[n,51] from extract, deleted after pack
   hdf5: ${paths.root}/hdf5                   # packed low-res episodes, deleted after sync
   hdf5_fullres: ${paths.root}/hdf5_fullres   # ~10% full-res JPEG subset
   qa: ${paths.root}/qa
@@ -137,8 +138,11 @@ render:
 
 sync:
   host: mill                        # ~/.ssh/config alias from #3
-  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill
-  delete_local_hdf5: true
+  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill (only [A-Za-z0-9_./-] and $USER allowed)
+  rsync_timeout_s: 3600             # kill one rsync (a whole tree) after this long; rsync also has a 300 s I/O timeout
+  ssh_timeout_s: 120                # kill the preflight / mkdir / remote-root ssh calls after this long
+  verify_timeout_s: 900             # kill one per-demo remote sha256sum -c after this long
+  delete_local_hdf5: true           # free local hdf5/ + hdf5_fullres/ files whose remote sha256 verified; demos stay
 
 supervisor:
   max_working_gb: 8

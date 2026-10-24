@@ -654,6 +654,7 @@ def run(
     out_dir = Path(cfg.paths.frames) / demo_id
     result = RenderResult(demo_id=demo_id, ok=False, out_dir=out_dir)
     t0 = hooks.clock()
+    shutil.rmtree(out_dir.with_name(out_dir.name + ".deleting"), ignore_errors=True)  # a pack that died mid-cleanup
 
     plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
     try:
