@@ -394,9 +394,10 @@ def test_cli_segment_single_demo_and_all_pending(
     dem.parent.mkdir(parents=True)
     dem.touch()
     assert cli.main(["segment", "demo9"]) == 0  # resolved by demo id under paths.demos
-    out = Path(capsys.readouterr().out.strip())
-    assert out == tmp_path / "plans" / "demo9" / "render_plan.json" and out.is_file()
-    assert cli.main(["segment", "--all-pending"]) == 2  # needs the supervisor state (#20)
+    assert "segment: 1 done, 0 failed" in capsys.readouterr().out
+    assert (tmp_path / "plans" / "demo9" / "render_plan.json").is_file()
+    assert cli.main(["segment", "--all-pending"]) == 0  # demo9 is already segmented, nothing is pending
+    assert "0 considered" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         cli.main(["segment", "missing"])
 

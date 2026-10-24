@@ -11,6 +11,7 @@ paths:
   plans: ${paths.root}/plans                 # render_plan.json per demo (#10)
   frames: ${paths.root}/frames               # rendered 280x150 frames, deleted after pack
   raw: ${paths.root}/raw                     # HLAE raw captures (1280x720), deleted per segment after downscaling
+  labels: ${paths.root}/labels               # <demo_id>/<episode_id>.npy float32[n,51] from extract, deleted after pack
   hdf5: ${paths.root}/hdf5                   # packed low-res episodes, deleted after sync
   hdf5_fullres: ${paths.root}/hdf5_fullres   # ~10% full-res JPEG subset
   qa: ${paths.root}/qa

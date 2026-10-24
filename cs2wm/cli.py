@@ -14,6 +14,9 @@ from omegaconf import DictConfig
 def _add_demo_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("demo", nargs="?", help="demo id or path to a .dem file")
     p.add_argument("--all-pending", action="store_true", help="process every demo that has not passed this stage")
+    p.add_argument(
+        "--retry-failed", action="store_true", help="with --all-pending: also retry demos that failed in this stage"
+    )
 
 
 def _parse_models(items: Sequence[str] | None) -> dict[str, Path]:
@@ -208,31 +211,106 @@ def _cfg(args: argparse.Namespace) -> DictConfig:
     return load_config(args.config)
 
 
-def _dispatch(args: argparse.Namespace) -> None:
-    """Call the stub behind the parsed subcommand."""
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def _setup_logging(cfg: DictConfig) -> None:
+    """Log the ``cs2wm`` loggers to stderr and to ``paths.logs/cs2wm.log``; safe to call again."""
+    log = logging.getLogger("cs2wm")
+    for handler in [h for h in log.handlers if getattr(h, "_cs2wm_cli", False)]:
+        log.removeHandler(handler)
+        handler.close()
+    Path(cfg.paths.logs).mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [
+        logging.StreamHandler(),
+        logging.FileHandler(Path(cfg.paths.logs) / "cs2wm.log", encoding="utf-8"),
+    ]
+    for handler in handlers:
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+        handler._cs2wm_cli = True  # type: ignore[attr-defined]
+        log.addHandler(handler)
+    log.setLevel(logging.INFO)
+
+
+def _supervisor(cfg: DictConfig):
+    """A supervisor over ``state/pipeline.json``."""
+    from cs2wm.pipeline.supervisor import PipelineState, StateError, Supervisor
+
+    try:
+        return Supervisor(cfg, PipelineState.load(Path(cfg.paths.state) / "pipeline.json"))
+    except StateError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+
+def _refuse_if_past(sup, stage: str, demo_id: str) -> None:
+    """Refuse an explicit re-run of a stage the demo is already past when the stage's inputs are gone.
+
+    Running it would fail and overwrite a good state (``synced``, ``packed``, ...) with ``failed``.
+    """
+    from cs2wm.pipeline.supervisor import _OUTPUT_STATE, STAGES
+
+    order = [s.value for s in dict.fromkeys([*_OUTPUT_STATE.values()])]
+    rec = sup.state.demos.get(demo_id)
+    if rec is None or rec["state"] not in order:
+        return
+    if order.index(rec["state"]) >= order.index(_OUTPUT_STATE[stage].value) and not sup.inputs_present(stage, demo_id):
+        raise SystemExit(
+            f"{stage}: {demo_id} is already {rec['state']} and the inputs of {stage} are gone (of {STAGES}); "
+            "refusing to re-run, the state is untouched"
+        )
+
+
+def _run_stage_cmd(stage: str, args: argparse.Namespace, **options: str | None) -> int:
+    """Run a per-demo stage on one demo or on ``--all-pending``, recording every demo in the pipeline state.
+
+    Returns:
+        1 if any demo failed (the others still ran), else 0.
+    """
+    cfg = _cfg(args)
+    _setup_logging(cfg)
+    sup = _supervisor(cfg)
+    if args.all_pending:
+        if args.demo:
+            raise SystemExit(f"{stage}: give a demo or --all-pending, not both")
+        if sup.state.discover(cfg):
+            sup.state.save()
+        ids = sup.state.pending_for(stage, args.retry_failed)
+    elif args.demo:
+        path = _resolve_demo(args.demo, cfg)
+        ids = [path.stem]
+        sup.explicit_paths[path.stem] = path
+        _refuse_if_past(sup, stage, path.stem)
+        if path.stem not in sup.state.demos:
+            sup.state.mark(
+                path.stem, "pending", **({"kind": path.parent.name} if path.parent.name in cfg.episodes.kinds else {})
+            )
+    else:
+        raise SystemExit(f"{stage}: give a demo id or a path to a .dem file, or --all-pending")
+    report = sup.run_stage(stage, ids, **options)
+    for demo_id, output in report.outputs.items():
+        print(f"{stage} {demo_id}: {output}")
+    print(f"{stage}: {len(report.done)} done, {len(report.failed)} failed, {len(ids)} considered")
+    for demo_id, reason in report.failed.items():
+        print(f"  FAILED {demo_id}: {reason}", file=sys.stderr)
+    return 1 if report.failed else 0
+
+
+def _dispatch(args: argparse.Namespace) -> int:
+    """Run the parsed subcommand and return its exit code."""
     cmd = args.cmd
     if cmd == "generate":
         from cs2wm.pipeline import generate
 
         generate.run(_cfg(args), args.profile, args.hours, args.chunk_min)
     elif cmd == "segment":
-        from cs2wm.pipeline import segment
-
-        cfg = _cfg(args)
-        if args.all_pending:
-            # TODO(#20): resolve --all-pending through the supervisor's persistent pipeline state.
-            raise NotImplementedError("TODO(#20): segment --all-pending")
-        if not args.demo:
-            raise SystemExit("segment: give a demo id or a path to a .dem file")
-        print(segment.run(_resolve_demo(args.demo, cfg), cfg, args.policy, args.player))
+        return _run_stage_cmd("segment", args, policy=args.policy, player=args.player)
     elif cmd == "render":
         from cs2wm.pipeline import render
 
         cfg = _cfg(args)
-        if args.all_pending:
-            # TODO(#20): resolve --all-pending through the supervisor's persistent pipeline state.
-            raise NotImplementedError("TODO(#20): render --all-pending")
         if args.cfg_only:
+            if args.all_pending:
+                raise SystemExit("render: --cfg-only works on one demo or a plan, not --all-pending")
             if args.plan is None and not args.demo:
                 raise SystemExit("render --cfg-only: give a demo id or --plan <render_plan.json>")
             demo = (
@@ -244,27 +322,17 @@ def _dispatch(args: argparse.Namespace) -> None:
             out = render.write_cfg_only(plan_path, cfg, demo)
             print(f"cfg installed: {out.installed}\ncfg copy:      {out.copy}\nHLAE argv:\n  " + "\n  ".join(out.argv))
             print(f"\nPowerShell:\n{out.powershell}")
-            return
-        if not args.demo:
-            raise SystemExit("render: give a demo id or a path to a .dem file")
-        result = render.run(_resolve_demo(args.demo, cfg), cfg)
-        if not result.ok:
-            raise SystemExit(f"render failed: {result.reason}")
-        print(result.out_dir)
-    elif cmd == "extract":
-        from cs2wm.pipeline import extract_actions
-
-        extract_actions.run(Path(args.demo or ""), _cfg(args))
-    elif cmd == "pack":
-        from cs2wm.pipeline import pack
-
-        pack.run(args.demo or "", _cfg(args))
+            return 0
+        return _run_stage_cmd("render", args)
+    elif cmd in ("extract", "pack"):
+        return _run_stage_cmd(cmd, args)
     elif cmd == "sync":
         from cs2wm.pipeline import sync
 
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        cfg = _cfg(args)
+        _setup_logging(cfg)
         try:
-            ok = sync.run(_cfg(args)).ok
+            ok = _supervisor(cfg).run_sync().ok
         except sync.SyncError as exc:
             print(f"error: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc
@@ -272,20 +340,22 @@ def _dispatch(args: argparse.Namespace) -> None:
             print("error: sync finished with errors, see the log above", file=sys.stderr)
             raise SystemExit(1)
     elif cmd == "supervise":
-        from cs2wm.pipeline.supervisor import PipelineState, Supervisor
-
         cfg = _cfg(args)
-        Supervisor(cfg, PipelineState(Path(cfg.paths.state) / "pipeline.json")).run_until(
-            args.until, args.target_hours, args.profile
-        )
+        _supervisor(cfg).run_until(args.until, args.target_hours, args.profile)
     elif cmd == "status":
-        from cs2wm.pipeline.supervisor import PipelineState, Supervisor
+        cfg = _cfg(args)
+        sup = _supervisor(cfg)
+        sup.state.discover(cfg)  # shown as pending, not saved: status never writes
+        print(sup.status_table())
+    elif cmd == "qa-summary":
+        from cs2wm.pipeline import qa_summary
 
         cfg = _cfg(args)
-        print(Supervisor(cfg, PipelineState.load(Path(cfg.paths.state) / "pipeline.json")).status_table())
-    elif cmd == "qa-summary":
-        # TODO(#19): aggregate qa/*.jsonl by kind and age (--kind, --since).
-        raise NotImplementedError("TODO(#19): qa-summary")
+        try:
+            since = qa_summary.parse_since(args.since) if args.since else None
+        except ValueError as exc:
+            raise SystemExit(f"qa-summary: {exc}") from exc
+        print(qa_summary.format_summary(qa_summary.summarize(cfg, args.kind, since), float(cfg.timing.fps)))
     elif cmd == "inspect-demo":
         import json
 
@@ -325,6 +395,8 @@ def _dispatch(args: argparse.Namespace) -> None:
         from cs2wm.report import latex
 
         latex.run(args.results, args.out, args.stats)
+
+    return 0
 
 
 def _dispatch_eval(args: argparse.Namespace) -> None:
@@ -417,15 +489,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Argument list (defaults to ``sys.argv[1:]``).
 
     Returns:
-        Process exit code: 0 on success, 2 when the command is not implemented yet.
+        Process exit code: 0 on success, 1 if a stage failed for any demo, 2 when the command is not implemented yet.
     """
     args = build_parser().parse_args(argv)
     try:
-        _dispatch(args)
+        return _dispatch(args)
     except NotImplementedError as exc:
         print(f"not implemented yet: {exc}", file=sys.stderr)
         return 2
-    return 0
 
 
 if __name__ == "__main__":
