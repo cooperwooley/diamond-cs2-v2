@@ -41,6 +41,67 @@ def load_config(path: str | Path | None = None, overrides: Sequence[str] = ()) -
     return cfg
 
 
+_UNSAFE_OPTIONS = ("-secure", "connect")
+_UNSAFE_PREFIXES = ("+connect", "-connect")
+
+
+def launch_option_problem(options: Sequence[str]) -> str | None:
+    """Check CS2 launch options for the offline-only rules.
+
+    Args:
+        options: Launch tokens.
+
+    Returns:
+        A description of the first violation, or None. ``-insecure`` is required; ``-secure`` and anything that
+        connects to a server (``+connect``, ``-connect``, ``connect``) is refused.
+    """
+    if "-insecure" not in options:
+        return "must contain '-insecure' (CS2 must never run without it)"
+    for opt in options:
+        low = opt.lower()
+        if low in _UNSAFE_OPTIONS or low.startswith(_UNSAFE_PREFIXES):
+            return f"{opt!r} is not allowed (CS2 only ever runs offline)"
+    return None
+
+
+def _check_generate(gen: DictConfig, problems: list[str]) -> None:
+    """Validate the numeric and enum keys of ``generate`` (None or a non-number is a problem, not a TypeError)."""
+    if gen.chunking not in ("gotv", "netcon"):
+        problems.append(f"generate.chunking must be 'gotv' or 'netcon', got {gen.chunking!r}")
+    nums: dict[str, float] = {}
+    for key in (
+        "chunk_min",
+        "hang_timeout_min",
+        "poll_s",
+        "close_stable_s",
+        "close_timeout_s",
+        "max_failures",
+        "min_chunk_s",
+        "map_load_wait_s",
+        "netcon_connect_timeout_s",
+        "netconport",
+    ):
+        value = gen.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            problems.append(f"generate.{key} must be a number, got {value!r}")
+        elif value <= 0:
+            problems.append(f"generate.{key} must be > 0, got {value}")
+        else:
+            nums[key] = value
+    if "netconport" in nums and not 1024 <= nums["netconport"] <= 65535:
+        problems.append(f"generate.netconport must be in [1024, 65535], got {nums['netconport']}")
+    if {"close_stable_s", "close_timeout_s"} <= nums.keys() and nums["close_stable_s"] >= nums["close_timeout_s"]:
+        problems.append("generate.close_stable_s must be < generate.close_timeout_s")
+    netcon_keys = {"netcon_connect_timeout_s", "map_load_wait_s", "hang_timeout_min"}
+    if gen.chunking == "netcon" and netcon_keys <= nums.keys():
+        startup = nums["netcon_connect_timeout_s"] + nums["map_load_wait_s"]
+        if startup >= nums["hang_timeout_min"] * 60:
+            problems.append(
+                "generate.netcon_connect_timeout_s + map_load_wait_s must be < hang_timeout_min * 60 "
+                f"(the watchdog grace period starts at launch), got {startup} s"
+            )
+
+
 def _check_units(name: str, units: list[float], problems: list[str]) -> None:
     """Append problems for one mouse-bin axis (sorted, containing 0, symmetric)."""
     if any(b <= a for a, b in itertools.pairwise(units)):
@@ -99,8 +160,10 @@ def validate_config(cfg: DictConfig) -> None:
     if cfg.actions.mouse.deg_per_unit <= 0:
         problems.append(f"actions.mouse.deg_per_unit must be > 0, got {cfg.actions.mouse.deg_per_unit}")
 
-    if "-insecure" not in list(cfg.generate.launch_options):
-        problems.append("generate.launch_options must contain '-insecure' (CS2 must never run without it)")
+    problem = launch_option_problem([str(o) for o in cfg.generate.launch_options])
+    if problem:
+        problems.append(f"generate.launch_options: {problem}")
+    _check_generate(cfg.generate, problems)
 
     for key, value in cfg.qa.items():
         if (key.endswith("_frac") or key == "min_fire_recall") and not 0 <= value <= 1:
