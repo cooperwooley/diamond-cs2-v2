@@ -95,7 +95,13 @@ def build_parser() -> argparse.ArgumentParser:
     q = ev.add_parser("upsampler", help="v1 upsampler compatibility check (#27)")
     q.add_argument("--ckpt", required=True, type=Path)
     q.add_argument("--fullres", required=True, type=Path, help="v2 hdf5_fullres directory")
-    q.add_argument("--n", type=int, default=256)
+    q.add_argument("--n", type=int, default=256, help="frames per dataset")
+    q.add_argument("--v1-fullres", type=Path, default=None, help="v1 test full-res HDF5 directory (the reference)")
+    q.add_argument("--out", type=Path, default=Path("results"))
+    q.add_argument("--seed", type=int, default=0)
+    q.add_argument("--device", default=None, help="torch device (default: cuda if available)")
+    q.add_argument("--batch-size", type=int, default=16)
+    q.add_argument("--denoising-steps", type=int, choices=[1, 3], default=1)
     q = ev.add_parser("h1", help="controllability (#32)")
     q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=... shuffled=...")
     q.add_argument("--contexts", type=int, default=50)
@@ -211,7 +217,19 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
     if sub == "upsampler":
         from cs2wm.eval import upsampler_check
 
-        upsampler_check.run_upsampler_check(args.ckpt, args.fullres, args.n)
+        report = upsampler_check.run_upsampler_check(
+            args.ckpt,
+            args.fullres,
+            args.n,
+            args.out,
+            v1_fullres_dir=args.v1_fullres,
+            seed=args.seed,
+            device=args.device,
+            batch_size=args.batch_size,
+            denoising_steps=args.denoising_steps,
+        )
+        if report["verdict"]["passed"] is False:
+            sys.exit(1)
     elif sub == "h1":
         from cs2wm.eval import h1_controllability
 
