@@ -21,14 +21,24 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
 3. **render** (#15, `cs2wm.pipeline.render`). Replays the demo in CS2 through HLAE `mirv_streams` at a fixed 16 fps,
    captured before the UI (no HUD), and downscales the frames to 280x150. Verifies per-segment frame counts.
 4. **extract_actions** (#11, `cs2wm.pipeline.extract_actions`). Derives a 51-dim action per frame from player state
-   (not from buttons) and writes per-episode QA to `qa/<demo_id>.jsonl`. Failing episodes do not go on.
+   (not from buttons). Needs the plan and `frames/<demo_id>/render.json` of the same plan. Writes `labels/<demo_id>/<episode_id>.npy`
+   for passing episodes and rewrites `qa/<demo_id>.jsonl` (one line per episode). Failing episodes do not go on.
 5. **pack** (#12, `cs2wm.pipeline.pack`). Writes one HDF5 file per episode in v1's `frame_i_x`/`frame_i_y` schema at
-   30x56 (resized exactly as v1 did), a deterministic ~10% full-res JPEG subset, and a `manifest.jsonl` of sha256s.
+   30x56 (resized exactly as v1 did), a deterministic ~10% full-res JPEG subset, and a `manifest.jsonl` of sha256s
+   (rewritten per run, so re-runs never duplicate lines). Each episode is read back and its actions must equal the
+   labels. `frames/<demo_id>/` and `labels/<demo_id>/` are deleted once every episode is packed.
 6. **sync** (#16, `cs2wm.pipeline.sync`). rsyncs HDF5, demos and QA to the Mill, verifies every checksum there, and
    only then deletes the local HDF5.
 7. **supervise** (#20, `cs2wm.pipeline.supervisor`). A Windows scheduled task that loops over generate and the other
    stages with retries, a disk guard, a CS2 patch guard and ntfy notifications. State is kept in
-   `state/pipeline.json`.
+   `state/pipeline.json` (done in #19: `pending -> segmented -> rendered -> extracted -> packed -> synced | failed`,
+   per-stage wall times; the loop, retries, guards and ntfy are #20).
+
+By hand (the #19 pilot): `cs2wm segment|render|extract|pack --all-pending` runs a stage over every demo that is ready
+for it, in id order; a failing demo is marked `failed` (stage and reason) and the rest still run; the exit code is 1
+if any failed. `--retry-failed` retries the demos that failed in that stage. `cs2wm sync` marks verified demos
+`synced`, `cs2wm status` prints the state table with wall seconds per stage per demo-hour, and `cs2wm qa-summary
+[--kind K] [--since 24h]` aggregates `qa/*.jsonl`. Logs: `logs/cs2wm.log` and stderr.
 
 On the Mill, #17 assembles the synced HDF5 into DIAMOND `.pt` datasets for training (#29, #30).
 

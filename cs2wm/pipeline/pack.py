@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
+import shutil
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,8 +27,14 @@ from omegaconf import DictConfig
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
+from cs2wm import demo
 from cs2wm.actions import ACTION_DIM
 from cs2wm.config import config_sha256
+from cs2wm.pipeline.extract_actions import labels_dir, read_qa
+from cs2wm.pipeline.generate import _git_sha
+from cs2wm.pipeline.segment import episodes_from_plan, read_render_plan
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 _CHUNK = 256
@@ -55,6 +63,10 @@ _RESERVED_ATTRS = frozenset(
         "jpeg_quality",
     }
 )
+
+
+class PackError(RuntimeError):
+    """A packed episode does not hold what was meant to be written."""
 
 
 @dataclass(frozen=True)
@@ -362,15 +374,147 @@ def append_manifest(manifest_path: Path, record: Mapping[str, Any]) -> None:
         os.fsync(f.fileno())
 
 
+def write_manifest(manifest_path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    """Replace ``manifest.jsonl`` with ``records`` atomically (temp file, fsync, rename).
+
+    ``pack.run`` rewrites a demo's manifest from the episodes of that run, so a re-run never leaves duplicates.
+
+    Args:
+        manifest_path: ``hdf5/<kind>/<demo_id>/manifest.jsonl``.
+        records: JSON-serialisable records, one line each.
+    """
+    manifest_path = Path(manifest_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = manifest_path.with_name(manifest_path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(record, sort_keys=True) + "\n" for record in records)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, manifest_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _read_frames(seg_dir: Path, first: int, n: int, size: tuple[int, int]) -> np.ndarray:
+    """Read frames ``first .. first + n - 1`` of a segment; frame ``first + n`` must exist but is not read."""
+    extra = seg_dir / f"{first + n:06d}.png"
+    if not extra.is_file():
+        raise FileNotFoundError(f"{extra} is missing (an episode of n labels needs n + 1 rendered frames)")
+    frames = np.empty((n, *size, 3), dtype=np.uint8)
+    for i in range(n):
+        path = seg_dir / f"{first + i:06d}.png"
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"{path} is missing or not a readable image")
+        if img.shape != (*size, 3):
+            raise ValueError(f"{path} has shape {img.shape}, expected {(*size, 3)}")
+        frames[i] = img
+    return frames
+
+
+def _sidecar(cfg: DictConfig, kind: str, demo_id: str) -> dict[str, Any]:
+    try:
+        with open(Path(cfg.paths.demos) / kind / f"{demo_id}.json", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _check_sliced(result: PackResult, labels: np.ndarray) -> None:
+    """Re-read what was written and require the stored actions to equal the labels frame by frame."""
+    for path in (result.low_res_path, result.fullres_path):
+        if path is None:
+            continue
+        _, actions, attrs = read_episode(path)
+        if int(attrs["n_frames"]) != len(labels) or not np.array_equal(actions, labels):
+            raise PackError(f"{path.name}: stored actions differ from the labels (frame/label misalignment)")
+
+
 def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
-    """CLI stage: pack every QA-passing episode of a demo, then delete its rendered frames.
+    """CLI stage: pack every QA-passing episode of a demo, then delete its rendered frames and labels.
+
+    Reads ``qa/<demo_id>.jsonl`` (written by extract), the render plan and ``frames/<demo_id>/render.json``. Per
+    passing episode the first ``n`` of its ``n + 1`` rendered frames go into the file with the ``n`` labels. After each
+    write the episode is read back and its actions must equal the labels. The demo's ``manifest.jsonl`` is rewritten
+    once, after every episode succeeded; if one fails, the files of this run are removed and nothing is deleted.
 
     Args:
         demo_id: Demo id.
         cfg: A validated cs2wm config.
 
     Returns:
-        One result per packed episode.
+        One result per packed episode (empty when no episode passed QA).
+
+    Raises:
+        FileNotFoundError: If the plan, ``render.json``, the QA file, a frame or a label file is missing.
+        ValueError: If ``render.json`` was made from a different plan, or an episode is missing from the QA file or
+            from ``render.json``.
+        PackError: If the read-back actions differ from the labels.
     """
-    # TODO(#12): read frames + labels, write_episode, append_manifest, delete frames after success.
-    raise NotImplementedError("TODO(#12): pack.run")
+    plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
+    plan_sha = sha256_file(plan_path)
+    plan = read_render_plan(plan_path)
+    frames_root = Path(cfg.paths.frames) / demo_id
+    with open(frames_root / "render.json", encoding="utf-8") as f:
+        rendered = json.load(f)
+    if rendered.get("plan_sha256") != plan_sha:
+        raise ValueError(f"{demo_id}: render.json was made from a different plan than {plan_path}; re-run render")
+    qa = read_qa(cfg, demo_id)
+    where = {e["episode_id"]: (seg["dir"], e["first_frame"]) for seg in rendered["segments"] for e in seg["episodes"]}
+    size = (int(cfg.resolution.render[0]), int(cfg.resolution.render[1]))
+    episodes = episodes_from_plan(plan)
+    sidecar = _sidecar(cfg, episodes[0].kind, demo_id) if episodes else {}
+    provenance = {
+        "cs2_build": plan.get("cs2_build") or sidecar.get("cs2_build"),
+        "demoparser2_version": plan.get("parser_version") or demo.parser_version(),
+        "cs2wm_git_sha": sidecar.get("cs2wm_git_sha") or _git_sha(),
+    }
+
+    results: list[PackResult] = []
+    records: dict[str, list[dict[str, Any]]] = {}  # kind -> manifest records
+    written: list[Path] = []
+    try:
+        for ep in episodes:
+            if ep.episode_id not in qa:
+                raise ValueError(f"{demo_id}: {ep.episode_id} is not in the QA file; re-run extract")
+            if not qa[ep.episode_id]["passed"]:
+                log.info("%s: %s failed QA, not packed", demo_id, ep.episode_id)
+                continue
+            if ep.episode_id not in where:
+                raise ValueError(f"{demo_id}: {ep.episode_id} is not in render.json")
+            seg_dir, first = where[ep.episode_id]
+            labels = np.load(labels_dir(cfg, demo_id) / f"{ep.episode_id}.npy")
+            frames = _read_frames(frames_root / seg_dir, int(first), ep.n_frames, size)
+            meta = {
+                "episode_id": ep.episode_id,
+                "demo_id": demo_id,
+                "kind": ep.kind,
+                "player": ep.player_name,
+                "start_tick": ep.start_tick,
+                **provenance,
+            }
+            out = Path(cfg.paths.hdf5) / ep.kind / demo_id
+            full = Path(cfg.paths.hdf5_fullres) / ep.kind / demo_id
+            result = write_episode(frames, labels, meta, out, cfg, fullres_dir=full)
+            written += [p for p in (result.low_res_path, result.fullres_path) if p is not None]
+            _check_sliced(result, labels)
+            results.append(result)
+            for name, sha in result.sha256.items():
+                records.setdefault(ep.kind, []).append({"file": name, "frames": result.n_frames, "sha256": sha})
+    except BaseException:
+        for path in written:
+            path.unlink(missing_ok=True)
+        raise
+
+    for kind in {ep.kind for ep in episodes}:
+        manifest = Path(cfg.paths.hdf5) / kind / demo_id / "manifest.jsonl"
+        if kind in records:
+            write_manifest(manifest, records[kind])
+        else:
+            manifest.unlink(missing_ok=True)  # nothing passes QA now; do not leave an earlier run's records behind
+    shutil.rmtree(frames_root)
+    shutil.rmtree(labels_dir(cfg, demo_id), ignore_errors=True)
+    log.info("%s: packed %d episode(s), %d frames", demo_id, len(results), sum(r.n_frames for r in results))
+    return results
