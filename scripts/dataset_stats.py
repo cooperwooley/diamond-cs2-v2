@@ -159,6 +159,41 @@ def format_stats(stats: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def write_figure(stats: dict[str, Any], path: Path) -> None:
+    """Plot the train/test label rates and mouse-bin histograms (#26).
+
+    Args:
+        stats: ``compute_stats`` output.
+        path: Image file to write (format from the suffix).
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), constrained_layout=True)
+    names = list(stats["train"]["label_rates"])
+    pos = np.arange(len(names))
+    for i, split in enumerate(SPLITS):
+        axes[0].bar(pos + (i - 0.5) * 0.4, list(stats[split]["label_rates"].values()), 0.4, label=split)
+    axes[0].set_xticks(pos, names)
+    axes[0].set_ylabel("fraction of frames")
+    axes[0].set_title("Label rates")
+    axes[0].legend()
+    for ax, axis in zip(axes[1:], ("x", "y")):
+        hist = stats["train"][f"mouse_{axis}_hist"]
+        bins = np.arange(len(hist))
+        for i, split in enumerate(SPLITS):
+            counts = np.array(list(stats[split][f"mouse_{axis}_hist"].values()), dtype=np.float64)
+            ax.bar(bins + (i - 0.5) * 0.4, counts / max(counts.sum(), 1), 0.4, label=split)
+        ax.set_xticks(bins, list(hist), rotation=60)
+        ax.set_ylabel("fraction of frames")
+        ax.set_yscale("log")
+        ax.set_title(f"Mouse {axis} bins (centre, degrees)")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -191,6 +226,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_stats(stats))
     if args.json:
         Path(args.json).write_text(json.dumps(stats, indent=2) + "\n")
+    if args.figure:
+        write_figure(stats, Path(args.figure))
     return 0
 
 
