@@ -119,7 +119,15 @@ eval:
   h1:
     hfov_deg: 106.26  # 16:9 render at CS2's fixed 90 deg (4:3-based) FOV; refit on GT in #32
     contexts: 50
-    rollout_frames: 32
+    rollout_frames: 32     # frames each scripted action is held
+    yaw_units: [2, 4, 10, 20, 30, 60]   # scripted yaw bins, run as +u and -u (must be mouse_x bin centres)
+    pitch_units: [2, 4, 10, 20]         # scripted pitch bins, +u and -u (must be mouse_y bin centres)
+    keys: [w, s, a, d]
+    estimator: phasecorr   # phasecorr | flow: the shift estimator used on the rollouts
+    gt_pairs: 2000         # ground-truth frame pairs for the estimator validation, per resolution
+    gt_max_abs_deg: 5.0    # validation r/slope use pairs with |label| <= this (scripted bins reach 3.3 deg yaw)
+    r_threshold: 0.8       # estimator validation must reach this Pearson r on yaw
+    bootstrap: 1000        # resamples for the 95% CIs
   h2:
     smoke_radius_units: 144
     mask_dilate_px: 2

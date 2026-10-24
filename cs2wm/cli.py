@@ -109,6 +109,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=... shuffled=...")
     q.add_argument("--contexts", type=int, default=50)
     q.add_argument("--seed", type=int, default=0)
+    q.add_argument("--data", required=True, type=Path, help="directory of held-out packed (30x56) HDF5 episodes")
+    q.add_argument("--split-json", type=Path, default=None, help="split.json (demo -> split); keep only test demos")
+    q.add_argument("--fullres-data", type=Path, default=None, help="hdf5_fullres directory (150x280 GT validation)")
+    q.add_argument(
+        "--upsampler-ckpt",
+        type=Path,
+        default=None,
+        help="v1 checkpoint providing the upsampler for non-v1 models (default: the model named v1)",
+    )
+    q.add_argument("--out", type=Path, default=Path("results/h1"))
+    q.add_argument("--device", default=None, help="torch device (default: cuda if available)")
+    q.add_argument("--batch-size", type=int, default=16, help="rollouts per batched forward pass")
+    q.add_argument("--denoising-steps", type=int, choices=[1, 3], default=1)
     q = ev.add_parser("h2", help="volumetric smoke (#33)")
     q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=...")
     q.add_argument("--seed", type=int, default=0)
@@ -237,7 +250,20 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
     elif sub == "h1":
         from cs2wm.eval import h1_controllability
 
-        h1_controllability.run_h1(_parse_models(args.models), _cfg(args), Path("results/h1"), args.contexts, args.seed)
+        h1_controllability.run_h1(
+            _parse_models(args.models),
+            _cfg(args),
+            args.out,
+            args.contexts,
+            args.seed,
+            data_dir=args.data,
+            split_json=args.split_json,
+            fullres_dir=args.fullres_data,
+            upsampler_ckpt=args.upsampler_ckpt,
+            device=args.device,
+            batch_size=args.batch_size,
+            denoising_steps=args.denoising_steps,
+        )
     elif sub == "h2":
         from cs2wm.eval import h2_smoke
 
