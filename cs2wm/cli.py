@@ -181,6 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("report-assets", help="regenerate report tables and figures (#36)")
     p.add_argument("--results", type=Path, default=Path("results"))
     p.add_argument("--out", type=Path, default=Path("report"))
+    p.add_argument(
+        "--stats", type=Path, default=None, help="dataset statistics JSON (default: <results>/dataset_stats.json)"
+    )
     return parser
 
 
@@ -295,7 +298,7 @@ def _dispatch(args: argparse.Namespace) -> None:
     elif cmd == "report-assets":
         from cs2wm.report import latex
 
-        latex.run(args.results, args.out)
+        latex.run(args.results, args.out, args.stats)
 
 
 def _dispatch_eval(args: argparse.Namespace) -> None:
