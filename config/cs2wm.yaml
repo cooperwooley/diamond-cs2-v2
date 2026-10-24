@@ -109,7 +109,8 @@ generate:
   poll_s: 5                         # watchdog polling interval
   close_stable_s: 5                 # a demo is closed once its size has not changed for this long.   CONFIRM(#14)
   close_timeout_s: 60               # give up waiting for a demo to close after this long
-  max_failures: 3                   # stop after this many sessions in a row that kept no chunk
+  min_chunk_s: 30                   # a truncated chunk shorter than this is kept but is not progress for max_failures
+  max_failures: 3                   # give up after this many sessions (or publishes) in a row without a usable chunk
 
 render:
   tick_offset: 0                    # measured in #14

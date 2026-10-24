@@ -425,6 +425,14 @@ class Hooks:
     copy: Callable[[Path, Path], Any] = shutil.copyfile
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _write_json_atomic(path: Path, payload: dict) -> None:
     tmp = path.with_name(path.name + ".part")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -471,18 +479,20 @@ class Generator:
         self.out_dir = Path(cfg.paths.demos) / profile
         self.rejected_dir = Path(cfg.paths.demos) / REJECTED_DIR
         self.kept: list[Path] = []
-        self.generated_s = 0.0  # demo time of kept chunks (plus intact chunks that could not be published yet)
+        self.generated_s = 0.0  # demo time of kept chunks
         self.cfg_sha = ""
         self.git_sha = ""
         self.started = self.h.wall()
         self._index = 0  # chunk counter, continues across CS2 restarts
-        self._progress = 0  # chunks kept or closed normally in the current session; rejected ones do not count
+        self._progress = 0  # chunks published in the current session (truncated ones only if >= generate.min_chunk_s)
+        self._publish_failures = 0  # publishes that failed since the last success
         self._ignore: set[Path] = set()  # gotv: demos that were present before the run or are published/rejected
         self._stranded: set[Path] = set()  # gotv: demos whose publishing failed; retried in the next session
-        self._pending_unlink: list[Path] = []  # copied sources CS2 still holds open; deleted again at the end
-        self._notified: set[Path] = set()
-        kinds = "|".join(re.escape(str(k)) for k in cfg.episodes.kinds)
-        self._ours = re.compile(rf"^(?:{kinds})_\d{{8}}-\d{{6}}_\d{{3}}\.dem$")
+        self._pending_unlink: list[Path] = []  # published sources CS2 still holds open; deleted again later
+        self._published_sources: set[Path] = set()  # every source published or rejected in this run (never re-adopted)
+        self._unpublished: set[Path] = set()  # sources whose publishing failed and that are still waiting
+        self._notified: set[tuple[str, str]] = set()  # (step, error type) already notified in this run
+        self._ours = re.compile(rf"^{re.escape(profile)}_\d{{8}}-\d{{6}}_\d{{3}}\.dem$")
 
     # -- patch guard ------------------------------------------------------------------------------------------------
 
@@ -535,57 +545,88 @@ class Generator:
             self.h.sleep(min(1.0, self.g.close_stable_s))
 
     def _sidecar(
-        self, demo_id: str, started: datetime, duration_s: float, truncated: bool, nbytes: int, extra: dict
+        self,
+        demo_id: str,
+        started: datetime | None,
+        duration_s: float,
+        truncated: bool,
+        src: Path,
+        nbytes: int,
+        sha256: str,
+        extra: dict,
     ) -> dict:
         return {
             "demo_id": demo_id,
             "kind": self.profile,
             "profile": self.profile,
-            "start_time": started.isoformat(timespec="seconds"),
+            "start_time": started.isoformat(timespec="seconds") if started else None,
             "chunk_min": self.chunk_min,
             "duration_s": round(duration_s, 1),
             "chunking": str(self.g.chunking),
             "truncated": truncated,
             "bytes": nbytes,
+            "sha256": sha256,
+            "source_name": src.name,
             "cs2_build": self._build(),
             "cfg_sha256": self.cfg_sha,
             "cs2wm_git_sha": self.git_sha,
             **extra,
         }
 
-    def _copy(self, src: Path, dest: Path) -> bool:
-        """Copy ``src`` to ``dest``, retrying with backoff for up to ``close_timeout_s``.
+    def _retry(self, op: Callable[[], Any], what: str) -> OSError | None:
+        """Run ``op``, retrying ``OSError`` with backoff for up to ``close_timeout_s``.
 
         CS2 can hold a demo open for a while after its size stopped changing; on Windows copying then raises
         ``PermissionError``.
+
+        Returns:
+            None on success, else the last error.
         """
         start, delay = self.h.clock(), 0.5
         while True:
             try:
-                self.h.copy(src, dest)
-                return True
+                op()
+                return None
             except OSError as exc:
                 if self.h.clock() - start >= self.g.close_timeout_s:
-                    log.error("giving up copying %s: %s", src, exc)
-                    dest.unlink(missing_ok=True)
-                    return False
-                log.debug("copy of %s failed (%s), retry in %.1f s", src, exc, delay)
+                    log.error("giving up %s: %s", what, exc)
+                    return exc
+                log.debug("%s failed (%s), retry in %.1f s", what, exc, delay)
                 self.h.sleep(delay)
                 delay = min(delay * 2, 10.0)
 
+    @staticmethod
+    def _unlink_quiet(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not delete %s: %s", path, exc)
+
+    def _copy(self, src: Path, dest: Path) -> OSError | None:
+        err = self._retry(lambda: self.h.copy(src, dest), f"copying {src.name}")
+        if err is not None:
+            self._unlink_quiet(dest)
+        return err
+
     def _remove_source(self, src: Path) -> None:
+        """Delete a published source; if CS2 still holds it, remember it (it is never adopted again)."""
+        self._published_sources.add(src)
+        self._unpublished.discard(src)
         try:
             src.unlink()
         except OSError as exc:
-            log.warning("could not delete %s after copying (retried at the end of the run): %s", src, exc)
+            log.warning("could not delete %s after copying (retried later): %s", src, exc)
             self._pending_unlink.append(src)
 
-    def _unpublished(self, src: Path, what: str) -> bool:
-        """Log and notify (once per file) that ``src`` could not be moved; the source stays where it is."""
-        msg = f"{what} failed for {src.name}; the file is kept in {src.parent} and retried later"
-        log.error(msg)
-        if src not in self._notified:
-            self._notified.add(src)
+    def _unpublished_failure(self, src: Path, what: str, exc: OSError | None) -> bool:
+        """Log that ``src`` could not be moved (the file stays where it is) and notify once per error type."""
+        self._publish_failures += 1
+        self._unpublished.add(src)
+        err = type(exc).__name__ if exc else "error"
+        log.error("%s failed for %s (%s); the file stays in %s", what, src.name, err, src.parent)
+        if (what, err) not in self._notified:
+            self._notified.add((what, err))
+            msg = f"{what} failed ({err}: {exc}); demos stay in {src.parent} and are retried"
             self.h.notify(msg, title="dcs2: generate publish failed", priority="high", tags=["warning"])
         return False
 
@@ -602,14 +643,15 @@ class Generator:
         self,
         src: Path,
         demo_id: str,
-        started: datetime,
+        started: datetime | None,
         duration_s: float,
         truncated: bool,
         extra: dict | None = None,
     ) -> bool:
         """Keep a closed chunk, or reject a truncated one that does not parse.
 
-        A failure to copy (file locks) is logged and notified but never raised; ``src`` stays in place.
+        A failure to copy or rename (file locks, full disk) is logged and notified but never raised; ``src`` stays in
+        place and the chunk does not count toward ``--hours``.
 
         Returns:
             True if the chunk was kept or rejected (``src`` is dealt with), False if publishing failed.
@@ -618,41 +660,62 @@ class Generator:
             error = self.h.parse_error(src)
             if error is not None:
                 return self._reject(src, demo_id, f"truncated chunk does not parse: {error}")
-        self._progress += 1
         demo_id = self._unique_id(demo_id)
         dest = self.out_dir / f"{demo_id}.dem"
         part = dest.with_name(dest.name + ".part")
         sidecar = self.out_dir / f"{demo_id}.json"
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        nbytes = self.h.file_size(src) or 0
-        if not self._copy(src, part):
-            if not truncated:  # an intact chunk waits in the csgo dir and still counts against the time budget
-                self.generated_s += duration_s
-            return self._unpublished(src, "copying")
         try:
-            # sidecar first, then the .dem: a .dem is never visible without its sidecar
-            _write_json_atomic(sidecar, self._sidecar(demo_id, started, duration_s, truncated, nbytes, extra or {}))
-            os.replace(part, dest)
+            self.out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            sidecar.unlink(missing_ok=True)
-            part.unlink(missing_ok=True)
-            log.error("renaming %s into place failed: %s", demo_id, exc)
-            return self._unpublished(src, "renaming")
+            return self._unpublished_failure(src, "creating the demos dir", exc)
+        nbytes = self.h.file_size(src) or 0
+        err = self._copy(src, part)
+        if err is not None:
+            return self._unpublished_failure(src, "copying", err)
+        try:
+            sha256 = _sha256(part)
+            # sidecar first, then the .dem: a .dem is never visible without its sidecar
+            side = self._sidecar(demo_id, started, duration_s, truncated, src, nbytes, sha256, extra or {})
+            _write_json_atomic(sidecar, side)
+        except OSError as exc:
+            self._unlink_quiet(part)
+            self._unlink_quiet(sidecar)
+            return self._unpublished_failure(src, "writing the sidecar", exc)
+        err = self._retry(lambda: os.replace(part, dest), f"renaming {demo_id}")
+        if err is not None:
+            self._unlink_quiet(sidecar)
+            self._unlink_quiet(part)
+            return self._unpublished_failure(src, "renaming", err)
+        self._publish_failures = 0
         self._remove_source(src)
         self.kept.append(dest)
         self.generated_s += duration_s
+        if not truncated or duration_s >= self.g.min_chunk_s:  # a crash right after `record` is not progress
+            self._progress += 1
         log.info("kept %s (%.0f s, %d bytes%s)", dest, duration_s, nbytes, ", truncated" if truncated else "")
         return True
 
     def _reject(self, src: Path, demo_id: str, reason: str) -> bool:
         demo_id = self._unique_id(demo_id)
-        self.rejected_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.rejected_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return self._unpublished_failure(src, "creating the rejected dir", exc)
         dest = self.rejected_dir / f"{demo_id}.dem"
         part = dest.with_name(dest.name + ".part")
-        if not self._copy(src, part):
-            return self._unpublished(src, "copying a rejected chunk")
-        os.replace(part, dest)
-        (self.rejected_dir / f"{demo_id}.reason.txt").write_text(reason + "\n", encoding="utf-8")
+        err = self._copy(src, part)
+        if err is not None:
+            return self._unpublished_failure(src, "copying a rejected chunk", err)
+        err = self._retry(lambda: os.replace(part, dest), f"renaming rejected {demo_id}")
+        if err is None:
+            try:
+                (self.rejected_dir / f"{demo_id}.reason.txt").write_text(reason + "\n", encoding="utf-8")
+            except OSError as exc:
+                log.warning("could not write the reason file for %s: %s", demo_id, exc)
+        else:
+            self._unlink_quiet(part)
+            return self._unpublished_failure(src, "renaming a rejected chunk", err)
+        self._publish_failures = 0
         self._remove_source(src)
         log.warning("rejected %s: %s", demo_id, reason)
         return True
@@ -664,27 +727,62 @@ class Generator:
         else:
             log.warning("%s: no demo data to salvage (missing, empty or still growing)", demo_id)
 
+    def _already_published(self, path: Path) -> bool:
+        """Whether a sidecar in ``demos/<kind>`` records ``path`` as its source (same name, size and sha256).
+
+        Covers a run that died between the final rename and deleting the source.
+        """
+        try:
+            size = path.stat().st_size
+            sidecars = list(self.out_dir.glob("*.json"))
+        except OSError:
+            return False
+        digest = None
+        for sc in sidecars:
+            try:
+                meta = json.loads(sc.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if meta.get("source_name") == path.name and meta.get("bytes") == size:
+                digest = digest or _sha256(path)
+                if meta.get("sha256") == digest:
+                    return True
+        return False
+
     def _adopt_leftovers(self) -> None:
         """Publish demos this tool recorded earlier but could not move (``<kind>_<stamp>_<nnn>.dem`` in the csgo dir).
 
-        Called while no CS2 of ours is running. Each one is parse-checked like a truncated chunk (kept or rejected)
-        and carries ``"adopted": true`` with ``duration_s`` 0, since its length is unknown; it does not count toward
-        ``--hours``. GOTV's own ``auto*.dem`` names are never adopted: demos of other runs there stay untouched.
+        Called while no CS2 of ours is running, after ``_flush_unlinks``. Only this profile's names are considered.
+        Skipped: sources already published or rejected in this run (including ones whose delete is still pending) and
+        sources a sidecar of an earlier run lists (same name, size and sha256; those are just deleted). The rest is
+        parse-checked like a truncated chunk (kept or rejected) and gets ``"adopted": true``, ``duration_s`` 0 (it does
+        not count toward ``--hours``) and ``start_time`` null with the file's mtime as ``end_time``, since its start is
+        unknown. GOTV's own ``auto*.dem`` names are never adopted.
         """
         for path in sorted(self.csgo_dir.glob("*.dem")):
-            if not self._ours.match(path.name):
+            if not self._ours.match(path.name) or path in self._published_sources or path in self._pending_unlink:
                 continue
-            mtime = datetime.fromtimestamp(path.stat().st_mtime) if path.exists() else self.h.wall()
+            if self._already_published(path):
+                log.info("%s was published by an earlier run; deleting the source", path)
+                self._remove_source(path)
+                continue
+            try:
+                end_time = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+            except OSError:
+                continue
             log.info("adopting leftover demo %s", path)
-            self._publish(path, path.stem, mtime, 0.0, truncated=True, extra={"adopted": True})
+            extra = {"adopted": True, "end_time": end_time}
+            self._publish(path, path.stem, None, 0.0, truncated=True, extra=extra)
 
     def _flush_unlinks(self) -> None:
+        """Retry deleting published sources; those that still fail stay pending (and are never re-adopted)."""
         pending, self._pending_unlink = self._pending_unlink, []
         for path in pending:
             try:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 log.error("%s is a published demo still left in the csgo dir (delete it by hand): %s", path, exc)
+                self._pending_unlink.append(path)
 
     # -- sessions ---------------------------------------------------------------------------------------------------
 
@@ -709,7 +807,7 @@ class Generator:
             client.wait_ready(float(self.g.netcon_connect_timeout_s))
             if self._watch(proc, float(self.g.map_load_wait_s)) != "running":
                 raise ConnectionError("CS2 died while loading")
-            while self.generated_s < self.target_s:
+            while self.generated_s < self.target_s and self._publish_failures < self.g.max_failures:
                 self._guard()
                 demo_id = make_demo_id(self.profile, self.started, self._index)
                 self._index += 1
@@ -770,7 +868,7 @@ class Generator:
                     if self._wait_closed(p):
                         self._finish_gotv(p, seen.pop(p, [0, now, now]), truncated=True)
                 return
-            if self.generated_s >= self.target_s:
+            if self.generated_s >= self.target_s or self._publish_failures >= self.g.max_failures:
                 return
 
     def _finish_gotv(self, path: Path, rec: list[float], truncated: bool) -> None:
@@ -805,8 +903,23 @@ class Generator:
 
     # -- entry point ------------------------------------------------------------------------------------------------
 
+    def _sweep_stale(self) -> None:
+        """Delete leftovers of an interrupted publish: ``*.part`` files and sidecars without a ``.dem``."""
+        for directory in (self.out_dir, self.rejected_dir):
+            if not directory.is_dir():
+                continue
+            for path in [*directory.glob("*.dem.part"), *directory.glob("*.json.part")]:
+                log.warning("removing stale %s", path)
+                self._unlink_quiet(path)
+        if self.out_dir.is_dir():
+            for sidecar in self.out_dir.glob("*.json"):
+                if not sidecar.with_suffix(".dem").exists():
+                    log.warning("removing orphan sidecar %s (no .dem)", sidecar)
+                    self._unlink_quiet(sidecar)
+
     def _fresh_start(self) -> None:
-        """Move ``self.started`` forward until no demo of an earlier run in this second has the same id prefix."""
+        """Sweep stale files, then move ``self.started`` forward until no earlier demo has the same id prefix."""
+        self._sweep_stale()
         while any(
             list(d.glob(f"{self.profile}_{self.started:%Y%m%d-%H%M%S}_*"))
             for d in (self.out_dir, self.rejected_dir, self.csgo_dir)
@@ -822,7 +935,8 @@ class Generator:
 
         Raises:
             PatchGuardError: If CS2 was patched. Demos not yet published are left in the csgo dir and logged.
-            GenerateError: If CS2 failed ``generate.max_failures`` sessions in a row without a kept chunk.
+            GenerateError: If CS2 failed ``generate.max_failures`` sessions in a row without a usable chunk, or demos
+                are still unpublished at the end (one summary ntfy alert with the count is sent first).
         """
         rendered = render_cfg(self.profile, self.cfg, self.cfg_dir)
         _, self.cfg_sha = install_cfg(rendered, self.profile, self.cs2_dir)
@@ -831,12 +945,13 @@ class Generator:
         self._ignore = set(self.csgo_dir.glob("*.dem"))  # demos of other tools and runs are not ours
         failures = 0
         try:
-            while self.generated_s < self.target_s:
+            while self.generated_s < self.target_s and self._publish_failures < self.g.max_failures:
                 self._guard()
+                self._flush_unlinks()
                 self._adopt_leftovers()
                 self._progress = 0
                 self._session()
-                if self.generated_s >= self.target_s:
+                if self.generated_s >= self.target_s or self._publish_failures >= self.g.max_failures:
                     break
                 failures = 0 if self._progress else failures + 1
                 log.warning(
@@ -857,6 +972,11 @@ class Generator:
             self._flush_unlinks()
         self._adopt_leftovers()
         self._flush_unlinks()
+        left = sorted(p for p in self._unpublished if p.exists())
+        if left:
+            msg = f"{len(left)} demo(s) could not be published and remain in {self.csgo_dir} (first: {left[0].name})."
+            self.h.notify(msg, title="dcs2: generate failed", priority="high", tags=["rotating_light"])
+            raise GenerateError(msg)
         return self.kept
 
 

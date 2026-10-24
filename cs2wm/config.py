@@ -76,6 +76,7 @@ def _check_generate(gen: DictConfig, problems: list[str]) -> None:
         "close_stable_s",
         "close_timeout_s",
         "max_failures",
+        "min_chunk_s",
         "map_load_wait_s",
         "netcon_connect_timeout_s",
         "netconport",
@@ -91,7 +92,8 @@ def _check_generate(gen: DictConfig, problems: list[str]) -> None:
         problems.append(f"generate.netconport must be in [1024, 65535], got {nums['netconport']}")
     if {"close_stable_s", "close_timeout_s"} <= nums.keys() and nums["close_stable_s"] >= nums["close_timeout_s"]:
         problems.append("generate.close_stable_s must be < generate.close_timeout_s")
-    if {"netcon_connect_timeout_s", "map_load_wait_s", "hang_timeout_min"} <= nums.keys():
+    netcon_keys = {"netcon_connect_timeout_s", "map_load_wait_s", "hang_timeout_min"}
+    if gen.chunking == "netcon" and netcon_keys <= nums.keys():
         startup = nums["netcon_connect_timeout_s"] + nums["map_load_wait_s"]
         if startup >= nums["hang_timeout_min"] * 60:
             problems.append(

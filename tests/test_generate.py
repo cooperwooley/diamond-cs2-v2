@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 from datetime import datetime, timedelta
@@ -522,20 +523,24 @@ def test_transient_copy_lock_is_retried(tmp_path: Path) -> None:
     assert world.notified == []
 
 
-def test_permanent_copy_lock_does_not_crash_and_keeps_sources(tmp_path: Path) -> None:
+def test_permanent_copy_failure_stops_with_one_summary(tmp_path: Path) -> None:
     cfg, world, gen = _run(tmp_path)
     world.copy_failures = -1
-    assert gen.run() == []  # no exception
+    with pytest.raises(GenerateError, match="3 demo"):
+        gen.run()
     out = Path(cfg.paths.demos) / "dm"
     assert list(out.glob("*.json")) == [] and list(out.glob("*.part")) == []  # no orphan sidecar
     assert len(list(world.csgo.glob("dm_*.dem"))) == 3  # sources are kept for a later run
-    assert len(world.notified) == 3  # once per file
+    assert gen.generated_s == 0 and gen.kept == []
+    assert len(world.launches) == 1 and len(world.notified) == 2  # one per error type, plus the summary
+    assert "could not be published" in world.notified[-1]["message"]
 
 
 def test_leftover_chunks_are_adopted_by_the_next_run(tmp_path: Path) -> None:
     cfg, world, gen = _run(tmp_path)
     world.copy_failures = -1
-    gen.run()
+    with pytest.raises(GenerateError):
+        gen.run()
     leftovers = sorted(world.csgo.glob("dm_*.dem"))
     world.copy_failures = 0
     _, _, gen2 = _run(tmp_path)
@@ -543,8 +548,131 @@ def test_leftover_chunks_are_adopted_by_the_next_run(tmp_path: Path) -> None:
     gen2.run()
     assert all(not p.exists() for p in leftovers)
     out = Path(cfg.paths.demos) / "dm"
-    adopted = [json.loads(p.read_text()) for p in out.glob("*.json") if json.loads(p.read_text()).get("adopted")]
-    assert len(adopted) == 3 and all(a["duration_s"] == 0 for a in adopted)
+    metas = [json.loads(p.read_text()) for p in out.glob("*.json")]
+    adopted = [m for m in metas if m.get("adopted")]
+    assert len(adopted) == 3 and all(
+        a["duration_s"] == 0 and a["start_time"] is None and a["end_time"] for a in adopted
+    )
+    assert all(m["source_name"] and len(m["sha256"]) == 64 for m in metas)
+
+
+def _lock_unlink(monkeypatch: pytest.MonkeyPatch, pattern: str) -> None:
+    real = Path.unlink
+
+    def locked(self: Path, missing_ok: bool = False) -> None:
+        if self.match(pattern):
+            raise PermissionError("locked")
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+
+
+def test_undeletable_source_is_published_exactly_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, world, gen = _run(tmp_path)
+    world.crash_at = [200.0]  # a session restart in between
+    _lock_unlink(monkeypatch, "*/csgo/dm_*_000.dem")
+    gen.run()
+    out = Path(cfg.paths.demos) / "dm"
+    names = sorted(p.name for p in out.glob("*.dem"))
+    assert sum("_000" in n for n in names) == 1 and not any("x1" in n for n in names)
+    assert (world.csgo / "dm_20261023-220000_000.dem").exists()  # still locked, but not republished
+
+
+def test_published_source_left_by_a_dead_run_is_not_adopted_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, world, gen = _run(tmp_path)
+    with monkeypatch.context() as m:
+        _lock_unlink(m, "*/csgo/dm_*.dem")
+        gen.run()  # the run "dies" with every source still in the csgo dir
+    out = Path(cfg.paths.demos) / "dm"
+    first = sorted(p.name for p in out.glob("*.dem"))
+    assert len(first) == 3 and len(list(world.csgo.glob("dm_*.dem"))) == 3
+    _, _, gen2 = _run(tmp_path)
+    gen2.h = world.hooks()
+    gen2.run()
+    assert list(world.csgo.glob("dm_20261023-220000_*.dem")) == []  # the sources were just deleted
+    second = [p.name for p in out.glob("*.dem") if p.name not in first]
+    assert not any(n.startswith("dm_20261023-220000") for n in second)  # no x1 duplicates
+
+
+def test_other_profiles_leftovers_are_not_adopted(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path)
+    other = world.csgo / "smoke_20261023-100000_000.dem"
+    other.write_bytes(b"x")
+    assert not gen._ours.match(other.name) and gen._ours.match("dm_20261023-100000_000.dem")
+    gen.run()
+    assert other.read_bytes() == b"x"
+    assert list((Path(gen.cfg.paths.demos) / "dm").glob("*smoke*")) == []
+
+
+def test_truncated_chunk_that_cannot_be_copied_is_not_progress(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path)
+    src = world.csgo / "dm_a_000.dem"
+    src.write_bytes(b"x" * 10)
+    world.copy_failures = -1
+    assert gen._publish(src, "dm_a_000", T0, 100.0, truncated=True) is False
+    assert gen._progress == 0 and gen.generated_s == 0 and src.exists()
+
+
+def test_tiny_truncated_chunks_are_not_progress(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path)
+    src = world.csgo / "dm_a_000.dem"
+    src.write_bytes(b"x" * 10)
+    assert gen._publish(src, "dm_a_000", T0, 10.0, truncated=True) is True
+    assert gen._progress == 0 and len(gen.kept) == 1  # kept, but too short to count
+    src2 = world.csgo / "dm_a_001.dem"
+    src2.write_bytes(b"x" * 10)
+    assert gen._publish(src2, "dm_a_001", T0, 45.0, truncated=True) is True
+    assert gen._progress == 1
+
+
+def test_crash_loop_of_tiny_parseable_chunks_gives_up(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path)
+    world.crash_after_launch = 20  # 10 s after every `record`
+    with pytest.raises(GenerateError):
+        gen.run()
+    assert len(world.launches) == cfg.generate.max_failures
+    assert len(gen.kept) == cfg.generate.max_failures
+
+
+def test_stale_publish_files_are_swept_at_start(tmp_path: Path) -> None:
+    cfg, _world, gen = _run(tmp_path)
+    out = Path(cfg.paths.demos) / "dm"
+    out.mkdir(parents=True)
+    for name in ("a.dem.part", "b.json.part", "orphan.json"):
+        (out / name).write_text("x")
+    (out / "ok.dem").write_text("x")
+    (out / "ok.json").write_text("{}")
+    gen.run()
+    assert not (out / "a.dem.part").exists() and not (out / "b.json.part").exists()
+    assert not (out / "orphan.json").exists()
+    assert (out / "ok.dem").exists() and (out / "ok.json").exists()
+
+
+def test_reject_failure_is_not_raised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, world, gen = _run(tmp_path)
+    src = world.csgo / "dm_a_000.dem"
+    src.write_bytes(b"x")
+    real = os.replace
+    calls = [0]
+
+    def replace(a, b):
+        if Path(b).parent.name == "_rejected":
+            calls[0] += 1
+            if calls[0] <= 2:  # transient: the retry succeeds
+                raise PermissionError("locked")
+        return real(a, b)
+
+    monkeypatch.setattr(generate.os, "replace", replace)
+    assert gen._reject(src, "dm_a_000", "bad") is True
+    assert (Path(cfg.paths.demos) / "_rejected" / "dm_a_000.reason.txt").read_text() == "bad\n"
+    src2 = world.csgo / "dm_a_001.dem"
+    src2.write_bytes(b"x")
+    calls[0] = -10_000  # always fails
+    assert gen._reject(src2, "dm_a_001", "bad") is False
+    assert src2.exists() and not (Path(cfg.paths.demos) / "_rejected" / "dm_a_001.reason.txt").exists()
+    assert list((Path(cfg.paths.demos) / "_rejected").glob("*.part")) == []
 
 
 def test_wait_closed_is_false_while_the_file_still_grows(tmp_path: Path) -> None:
