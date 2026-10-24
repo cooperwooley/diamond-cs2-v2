@@ -140,8 +140,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--n-fid", type=int, default=2048, help="frames per side for the FID")
     q.add_argument("--frames", type=int, default=64, help="rollout length")
     q.add_argument("--contexts", type=int, default=16, help="contexts for the rollout figures and metrics")
-    q.add_argument("--denoising-steps", type=int, choices=[1, 3], default=3, help="sampler preset (v1 used 3)")
-    q.add_argument("--zero-actions", action="store_true", help="drive the models with zero actions, as v1 did")
+    q.add_argument("--denoising-steps", type=int, choices=[1, 3], default=3, help="sampler preset (v1's scripts: 3)")
+    q.add_argument("--s-cond", type=float, default=None, help="sampler s_cond (default: the preset's 0.005; v1: 0)")
+    q.add_argument("--v1-name", default="v1", help="name of the zero-action v1 model (default: v1)")
+    q.add_argument(
+        "--v1-actions",
+        choices=["zeros", "gt", "both"],
+        default="zeros",
+        help="actions driving the v1 model; both gives two rows (default: zeros, what v1 was trained on)",
+    )
+    q.add_argument("--zero-actions", action="store_true", help="force zero actions for ALL models (v1-style)")
+    q.add_argument("--fid-seeds", type=int, default=1, help="FID seeds (seed, seed+1, ...); mean and std reported")
 
     p = sub.add_parser("report-assets", help="regenerate report tables and figures (#36)")
     p.add_argument("--results", type=Path, default=Path("results"))
@@ -300,6 +309,10 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             denoising_steps=args.denoising_steps,
             zero_actions=args.zero_actions,
+            v1_actions=args.v1_actions,
+            v1_name=args.v1_name,
+            s_cond=args.s_cond,
+            fid_seeds=args.fid_seeds,
         )
 
 

@@ -364,6 +364,7 @@ def run_rollouts(
     out_dir: Path,
     single_step_samples: int = 12,
     strip_contexts: int = 3,
+    action_sources: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Write the single-step grid, the rollout strips and the per-step metrics for already generated rollouts.
 
@@ -374,9 +375,11 @@ def run_rollouts(
         out_dir: Output directory (created).
         single_step_samples: Rows of the single-step grid (v1: 12).
         strip_contexts: Windows shown as rollout strips.
+        action_sources: Name -> ``"gt"`` or ``"zeros"``, recorded as each entry's ``action_source`` (default ``gt``).
 
     Returns:
-        ``{"metrics": {model: {"mse", "psnr", "single_step": {"mse", "psnr"}}, "hold_last_context": ...},
+        ``{"metrics": {name: {"mse", "psnr", "single_step": {"mse", "psnr"}, "action_source"},
+        "hold_last_context": ...},
         "steps_shown", "files", "windows": [{index, episode, start}]}``.
 
     Raises:
@@ -393,6 +396,7 @@ def run_rollouts(
     for name, p in preds.items():
         metrics[name] = step_metrics(p, gt)
         metrics[name]["single_step"] = {k: v[0] for k, v in metrics[name].items()}
+        metrics[name]["action_source"] = (action_sources or {}).get(name, "gt")
     hold = torch.stack([w.frames[n_cond - 1 : n_cond] for w in windows]).expand(-1, horizon, -1, -1, -1)
     metrics["hold_last_context"] = step_metrics(hold, gt)
     metrics["hold_last_context"]["single_step"] = {k: v[0] for k, v in metrics["hold_last_context"].items()}

@@ -89,8 +89,13 @@ def compute_fid(generated: np.ndarray, real: np.ndarray, extractor: FeatureExtra
         The FID.
 
     Raises:
-        ValueError: If a set has fewer than 2 images (no covariance) or the feature sizes differ.
+        ValueError: If a set has fewer than 2 images (no covariance), the two sets differ in image shape or dtype, or
+            the feature sizes differ.
     """
+    if generated.shape[1:] != real.shape[1:] or generated.dtype != real.dtype:
+        raise ValueError(
+            f"generated {generated.shape[1:]} {generated.dtype} and real {real.shape[1:]} {real.dtype} images differ"
+        )
     stats = []
     for images in (generated, real):
         if len(images) < 2:

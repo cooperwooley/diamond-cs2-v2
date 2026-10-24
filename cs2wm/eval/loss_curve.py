@@ -27,6 +27,7 @@ and the train panel is on a log epoch axis to fit both.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,10 @@ V1_TRAIN_FILE = "training_losses.json"
 V1_COLOR = "#D55E00"
 V2_COLOR = "#0072B2"
 FIGURE_STEM = "loss_curve"
+TRAIN_RANGE_NOTE = (
+    "Train panel: v1 covers only its first 0-0.25 epochs, v2 starts at epoch 1. The ranges are disjoint, so the "
+    "curves are not directly comparable."
+)
 
 
 def load_v2_metrics(path: Path) -> dict[str, Any]:
@@ -86,7 +91,8 @@ def load_v2_metrics(path: Path) -> dict[str, Any]:
 
 
 def _opt_float(value: Any) -> float | None:
-    return None if value is None else float(value)
+    """None for a missing, null or non-finite (NaN, inf) value."""
+    return None if value is None or not math.isfinite(float(value)) else float(value)
 
 
 def load_v1_losses(v1_results: Path, steps_per_epoch: int = STEPS_PER_EPOCH) -> dict[str, Any]:
@@ -115,6 +121,7 @@ def load_v1_losses(v1_results: Path, steps_per_epoch: int = STEPS_PER_EPOCH) -> 
     steps = json.loads((v1_results / V1_TRAIN_FILE).read_text())
     if not isinstance(steps, list) or not all(isinstance(x, (int, float)) for x in steps):
         raise ValueError(f"{V1_TRAIN_FILE}: expected a list of per-step losses")
+    epochs_early = [(i + 1) / steps_per_epoch for i in range(len(steps))]
     return {
         "steps_per_epoch": steps_per_epoch,
         "test": {
@@ -123,9 +130,11 @@ def load_v1_losses(v1_results: Path, steps_per_epoch: int = STEPS_PER_EPOCH) -> 
             "upsampler": [_opt_float(test[str(e)].get("upsampler")) for e in epochs],
         },
         "train_early": {
-            "epochs": [(i + 1) / steps_per_epoch for i in range(len(steps))],
+            "epochs": epochs_early,
             "loss": [float(x) for x in steps],
             "n_steps": len(steps),
+            "mean_epoch": sum(epochs_early) / len(steps) if steps else None,
+            "mean_loss": sum(steps) / len(steps) if steps else None,
         },
     }
 
@@ -154,6 +163,11 @@ def plot_loss_curves(v1: dict[str, Any], v2: dict[str, Any] | None, out_dir: Pat
         lw=1,
         label="v1 (first 100 steps, per step)",
     )
+    early = v1["train_early"]
+    if early["n_steps"]:
+        ax_train.plot(
+            early["mean_epoch"], early["mean_loss"], "D", color=V1_COLOR, ms=8, label="v1 early mean (100 steps)"
+        )
     if v2 is not None:
         pairs = [(e, x) for e, x in zip(v2["epochs"], v2["test_loss"]) if x is not None]
         if pairs:
@@ -168,6 +182,7 @@ def plot_loss_curves(v1: dict[str, Any], v2: dict[str, Any] | None, out_dir: Pat
         ax.grid(True, alpha=0.3)
         ax.legend(frameon=False)
     fig.tight_layout()
+    fig.text(0.5, -0.03, TRAIN_RANGE_NOTE, ha="center", fontsize=8)
     out_dir = Path(out_dir)
     names = []
     for ext in ("pdf", "png"):
@@ -201,5 +216,9 @@ def run_loss_curve(v2_metrics: Path | None, v1_results: Path, out_dir: Path) -> 
         "notes": [
             f"v1 per-step training losses are converted to epochs at {STEPS_PER_EPOCH} steps per epoch (#6).",
             "v1 and v2 test losses are on different test splits (see loss_curve.py).",
+            (
+                "train loss: v1 covers epochs 0-0.25 (its first 100 steps) and v2 starts at epoch 1, so the ranges "
+                "are disjoint; the v1 diamond is the mean of its 100 steps, placed at their mean epoch."
+            ),
         ],
     }

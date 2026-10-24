@@ -527,6 +527,232 @@ def test_cli_carried_passes_options(monkeypatch, tmp_path) -> None:
     assert (seen["seed"], seen["device"], seen["batch_size"], seen["n_fid"], seen["n_frames"], seen["contexts"]) == (
         3, "cpu", 4, 100, 8, 5)  # fmt: skip
     assert seen["denoising_steps"] == 1 and seen["zero_actions"] is True
+    assert (seen["v1_actions"], seen["v1_name"], seen["s_cond"], seen["fid_seeds"]) == ("zeros", "v1", None, 1)
+    argv += ["--v1-actions", "both", "--v1-name", "old", "--s-cond", "0", "--fid-seeds", "3"]
+    cli.main(argv)
+    assert (seen["v1_actions"], seen["v1_name"], seen["s_cond"], seen["fid_seeds"]) == ("both", "old", 0.0, 3)
     cli.main(["eval", "carried", "--models", "v2=b.pt", "--data", "d"])
     assert seen["out"] == Path("results/carried") and seen["n_fid"] == 2048 and seen["n_frames"] == 64
     assert seen["contexts"] == 16 and seen["denoising_steps"] == 3 and seen["zero_actions"] is False
+
+
+# --- action source, sampler record, deviations, FID seeds ------------------------------------------------------------
+
+
+def test_action_sources() -> None:
+    assert carried.action_sources("v1", "v1", "zeros", False) == ["zeros"]
+    assert carried.action_sources("v2", "v1", "zeros", False) == ["gt"]
+    assert carried.action_sources("v1", "v1", "gt", False) == ["gt"]
+    assert carried.action_sources("v1", "v1", "both", False) == ["zeros", "gt"]
+    assert carried.action_sources("v2", "v1", "both", False) == ["gt"]
+    assert carried.action_sources("v2", "v1", "gt", True) == ["zeros"]  # --zero-actions forces zeros for all
+    assert carried.action_sources("old", "old", "gt", False) == ["gt"]  # --v1-name
+
+
+def run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path, **kw) -> dict:
+    kw = {"n_frames": HORIZON, "contexts": 2, "n_fid": 6, "device": "cpu", "denoising_steps": 1, **kw}
+    return carried.run_carried(
+        ckpts, v2_root, tmp_path, v1_results=Path(__file__).resolve().parents[1] / "results/v1", v1_data_dir=v1_root,
+        agent_factory=tiny_factory(agent_cfg), extractor=fake_extractor, **kw,
+    )  # fmt: skip
+
+
+def test_default_v1_gets_zero_actions_and_v2_gt(ckpts, agent_cfg, v2_root, v1_root, tmp_path) -> None:
+    s = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path)
+    rows = {(r["label"], r["dataset"]): r for r in s["fid"]["rows"]}
+    assert {k: v["action_source"] for k, v in rows.items()} == {
+        ("v1", "v1_test"): "zeros", ("v1", "v2_test"): "zeros", ("v2", "v2_test"): "gt"}  # fmt: skip
+    m = s["rollouts"]["metrics"]
+    assert (m["v1"]["action_source"], m["v2"]["action_source"]) == ("zeros", "gt")
+    assert "action_source" not in m["hold_last_context"]
+    assert "per row" in s["fid"]["protocol"]["generated"]
+
+
+def test_v1_actions_both_gives_two_labelled_v1_rows(ckpts, agent_cfg, v2_root, v1_root, tmp_path) -> None:
+    s = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path, v1_actions="both")
+    labels = {(r["label"], r["dataset"]): r["action_source"] for r in s["fid"]["rows"]}
+    assert labels == {
+        ("v1 (zero actions)", "v1_test"): "zeros", ("v1 (zero actions)", "v2_test"): "zeros",
+        ("v1 (GT actions)", "v1_test"): "gt", ("v1 (GT actions)", "v2_test"): "gt", ("v2", "v2_test"): "gt"}  # fmt: skip
+    assert set(s["rollouts"]["metrics"]) == {"v1 (zero actions)", "v1 (GT actions)", "v2", "hold_last_context"}
+    assert (tmp_path / "rollout_metrics.png").exists()
+    # The same model with different actions generates different frames.
+    a, b = (s["rollouts"]["metrics"][k]["mse"] for k in ("v1 (zero actions)", "v1 (GT actions)"))
+    assert a != b
+
+
+def test_zero_actions_flag_forces_zeros_for_every_model(ckpts, agent_cfg, v2_root, v1_root, tmp_path) -> None:
+    s = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path, zero_actions=True)
+    assert {r["action_source"] for r in s["fid"]["rows"]} == {"zeros"}
+
+
+def test_v1_name_selects_the_zero_action_model(ckpts, agent_cfg, v2_root, v1_root, tmp_path) -> None:
+    models = {"old": ckpts["v1"], "v2": ckpts["v2"]}
+    s = run_tiny(models, agent_cfg, v2_root, v1_root, tmp_path, v1_name="old")
+    assert {r["label"]: r["action_source"] for r in s["fid"]["rows"]} == {"old": "zeros", "v2": "gt"}
+
+
+def test_sampler_record_s_cond_override_and_deviations(ckpts, agent_cfg, v2_root, v1_root, tmp_path) -> None:
+    s = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path / "a")
+    sampler = s["config"]["sampler"]
+    assert sampler["s_cond"] == 0.005 and sampler["num_steps_denoising"] == 1
+    assert (sampler["sigma_min"], sampler["sigma_max"]) == (2e-3, 5.0)
+    assert s["fid"]["protocol"]["sampler"] == sampler
+    dev = " ".join(s["fid"]["protocol"]["deviations_from_v1"])
+    for needle in ("256 frames", "rounded", "PNG round trip", "s_cond", "action source", "noisy"):
+        assert needle in dev
+    zero = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path / "b", s_cond=0.0)
+    assert zero["config"]["sampler"]["s_cond"] == 0.0 and "is 0.0" in " ".join(
+        zero["fid"]["protocol"]["deviations_from_v1"]
+    )
+    assert zero["rollouts"]["metrics"]["v2"]["mse"] != s["rollouts"]["metrics"]["v2"]["mse"]
+
+
+def test_fid_seeds_report_mean_and_std(ckpts, agent_cfg, v2_root, v1_root, tmp_path) -> None:
+    one = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path / "a", seed=4)
+    assert all(r["fid_std"] is None and r["seeds"] == [4] for r in one["fid"]["rows"])
+    three = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path / "b", seed=4, fid_seeds=3)
+    assert three["config"]["fid_seeds"] == [4, 5, 6]
+    for r in three["fid"]["rows"]:
+        assert r["seeds"] == [4, 5, 6] and len(r["fid_per_seed"]) == 3
+        assert r["fid"] == pytest.approx(np.mean(r["fid_per_seed"])) and r["fid_std"] == pytest.approx(
+            np.std(r["fid_per_seed"], ddof=1)
+        )
+    # The first seed is the same run as a single-seed one, and the rollout figures use it.
+    by = {(r["label"], r["dataset"]): r for r in one["fid"]["rows"]}
+    for r in three["fid"]["rows"]:
+        assert r["fid_per_seed"][0] == pytest.approx(by[(r["label"], r["dataset"])]["fid"])
+    assert one["rollouts"] == three["rollouts"]
+    with pytest.raises(ValueError, match="fid_seeds"):
+        run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path / "c", fid_seeds=0)
+    with pytest.raises(ValueError, match="v1_actions"):
+        run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path / "d", v1_actions="some")
+
+
+def test_n_fid_beyond_the_episodes_cycles_windows(ckpts, agent_cfg, v2_root, v1_root, tmp_path) -> None:
+    # 2 usable episodes, 7 windows of 3 frames: windows revisit episodes, every frame count is still exact.
+    s = run_tiny(ckpts, agent_cfg, v2_root, v1_root, tmp_path, n_fid=20)
+    assert all(r["n_generated"] == r["n_real"] == 20 and r["n_windows"] == 7 for r in s["fid"]["rows"])
+    eps = [w["episode"] for w in s["data"]["v2_test"]["windows"]]
+    assert len(eps) == 7 and set(eps) == {"ep0", "ep1"}
+
+
+# --- readers, alignment, baselines, edge cases ---------------------------------------------------------------------
+
+
+def test_fid_rejects_mismatched_shape_or_dtype() -> None:
+    a = random_images(8, 0)
+    with pytest.raises(ValueError, match="differ"):
+        fid.compute_fid(a, a[:, :, :-1], fake_extractor)
+    with pytest.raises(ValueError, match="differ"):
+        fid.compute_fid(a, a.astype(np.float32), fake_extractor)
+
+
+def test_both_test_set_formats_give_the_same_rgb_tensor(tmp_path) -> None:
+    import h5py
+
+    from data import Dataset
+
+    rng = np.random.default_rng(0)
+    rgb = rng.integers(0, 256, size=(5, LOW_H, LOW_W, 3), dtype=np.uint8)
+    rgb[:, 3, 7] = (255, 0, 0)  # a pure red pixel at row 3, column 7 in every frame
+    # v2 pack format: BGR, raw.
+    (tmp_path / "h5").mkdir()
+    with h5py.File(tmp_path / "h5" / "e.hdf5", "w") as f:
+        f.attrs["n_frames"], f.attrs["encoding"] = 5, "raw"
+        for i in range(5):
+            f[f"frame_{i}_x"] = rgb[i, ..., ::-1]
+            f[f"frame_{i}_y"] = np.zeros(ACTION_DIM, dtype=np.float32)
+    # v1 DIAMOND format: RGB uint8 [n, 3, h, w] as Episode.save writes it.
+    ds = Dataset(tmp_path / "pt", None, "t", save_on_disk=False)
+    ds.add_episode(
+        __import__("data.episode", fromlist=["Episode"]).Episode(
+            torch.zeros(5, 3, LOW_H, LOW_W), torch.zeros(5, ACTION_DIM), torch.zeros(5),
+            torch.zeros(5, dtype=torch.uint8), torch.zeros(5, dtype=torch.uint8), {},
+        )
+    )  # fmt: skip
+    path = ds._get_episode_path(0)
+    path.parent.mkdir(parents=True)
+    torch.save(
+        {"obs": torch.from_numpy(rgb).permute(0, 3, 1, 2).contiguous(), "act": torch.zeros(5, ACTION_DIM),
+         "rew": torch.zeros(5), "end": torch.zeros(5, dtype=torch.uint8), "trunc": torch.zeros(5, dtype=torch.uint8),
+         "info": {}}, path,
+    )  # fmt: skip
+    ds.save_to_default_path()
+    a, _ = rollouts.EpisodeSource(tmp_path / "h5").load(0)
+    b, _ = rollouts.EpisodeSource(tmp_path / "pt").load(0)
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    assert a.shape == (5, 3, LOW_H, LOW_W)
+    assert a[2, :, 3, 7].tolist() == [1.0, -1.0, -1.0]  # red in RGB order, not BGR
+
+
+def test_action_alignment_reaches_the_sampler_as_expected(monkeypatch, worlds) -> None:
+    """Window actions carry a one-hot frame marker; the sampler must see actions t..t+n_cond-1 at step t."""
+    from cs2wm.play import world_model
+
+    length = N_COND + HORIZON
+    windows = []
+    for k in range(2):
+        acts = np.zeros((length, ACTION_DIM), dtype=np.float32)
+        acts[np.arange(length), 10 * k + np.arange(length)] = 1.0  # one-hot marker: window and frame index
+        windows.append(rollouts.Window(k, "x", 0, torch.zeros(length, 3, LOW_H, LOW_W), acts))
+    seen = []
+    real = world_model.sample_from_noise
+
+    def spy(sampler, prev_obs, prev_act, randn):
+        seen.append(prev_act.clone())
+        return real(sampler, prev_obs, prev_act, randn)
+
+    monkeypatch.setattr(world_model, "sample_from_noise", spy)
+    rollouts.generate_rollouts(worlds["v2"], windows, 0, batch_size=2)
+    assert len(seen) == HORIZON
+    for t, got in enumerate(seen):
+        for k in range(2):
+            # Step t: the context actions of frames t..t+n_cond-2 and the action taken at frame t+n_cond-1.
+            assert got[k].argmax(-1).tolist() == [10 * k + i for i in range(t, t + N_COND)]
+            assert (got[k].sum(-1) == 1).all()
+    seen.clear()
+    rollouts.generate_rollouts(worlds["v2"], windows, 0, batch_size=2, zero_actions=True)
+    assert all(not g.any() for g in seen)
+
+
+def test_hold_last_context_metrics_match_a_hand_computed_value(tmp_path) -> None:
+    length = N_COND + 2
+    frames = torch.zeros(length, 3, LOW_H, LOW_W)  # 0.0 in [-1, 1] is 0.5 in [0, 1]
+    frames[N_COND - 1] = -1.0  # last context: 0.0
+    frames[N_COND] = 1.0  # first target: 1.0 -> held frame is off by 1.0
+    frames[N_COND + 1] = 0.0  # second target: 0.5 -> off by 0.5
+    windows = [rollouts.Window(0, "x", 0, frames, np.zeros((length, ACTION_DIM), dtype=np.float32))]
+    res = rollouts.run_rollouts({"m": torch.zeros(1, 2, 3, LOW_H, LOW_W)}, windows, N_COND, tmp_path)
+    hold = res["metrics"]["hold_last_context"]
+    assert hold["mse"] == pytest.approx([1.0, 0.25])
+    assert hold["psnr"] == pytest.approx([0.0, 10 * math.log10(4)], abs=1e-5)
+    assert hold["single_step"] == {"mse": 1.0, "psnr": pytest.approx(0.0, abs=1e-5)}
+    assert res["metrics"]["m"]["mse"] == pytest.approx([0.25, 0.0])  # predicts 0.5 everywhere
+
+
+def test_loss_curve_single_truncated_line_and_non_finite_test_loss(tmp_path, repo_root) -> None:
+    with pytest.raises(ValueError, match="no metrics lines"):
+        loss_curve.load_v2_metrics(write_lines(tmp_path / "a.jsonl", ['{"epoch": 1, "train_lo']))
+    lines = [
+        '{"epoch": 1, "train_loss": 0.9, "test_loss": NaN}',
+        '{"epoch": 2, "train_loss": NaN, "test_loss": null}',
+        '{"epoch": 3, "train_loss": 0.5, "test_loss": Infinity}',
+        metric_line(4, 0.4, 0.3),
+    ]
+    got = loss_curve.load_v2_metrics(write_lines(tmp_path / "b.jsonl", lines))
+    assert got["test_loss"] == [None, None, None, 0.3] and got["train_loss"] == [0.9, None, 0.5, 0.4]
+    res = loss_curve.run_loss_curve(tmp_path / "b.jsonl", repo_root / "results/v1", tmp_path / "o")
+    assert (tmp_path / "o" / "loss_curve.png").stat().st_size > 0
+    json.dumps(res, allow_nan=False)
+    allnull = write_lines(tmp_path / "c.jsonl", ['{"epoch": 1, "train_loss": null, "test_loss": null}'])
+    assert loss_curve.run_loss_curve(allnull, repo_root / "results/v1", tmp_path / "p")["v2"]["epochs"] == [1]
+
+
+def test_loss_curve_train_ranges_are_disjoint_and_noted(repo_root, tmp_path) -> None:
+    v1 = loss_curve.load_v1_losses(repo_root / "results" / "v1")
+    early = v1["train_early"]
+    assert early["mean_epoch"] == pytest.approx(np.mean(early["epochs"])) and early["mean_epoch"] < 0.25
+    assert early["mean_loss"] == pytest.approx(np.mean(early["loss"]))
+    notes = " ".join(loss_curve.run_loss_curve(None, repo_root / "results" / "v1", tmp_path)["notes"])
+    assert "disjoint" in notes
