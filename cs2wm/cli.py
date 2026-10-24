@@ -136,11 +136,47 @@ def build_parser() -> argparse.ArgumentParser:
     q = ev.add_parser("h2", help="volumetric smoke (#33)")
     q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=...")
     q.add_argument("--seed", type=int, default=0)
+    q.add_argument("--data", required=True, type=Path, help="directory of held-out full-res (150x280) smoke episodes")
+    q.add_argument("--split-json", type=Path, default=None, help="split.json (demo -> split); keep only test demos")
+    q.add_argument("--demos", type=Path, default=None, help="directory of .dem files (default: paths.demos)")
+    q.add_argument(
+        "--upsampler-ckpt",
+        type=Path,
+        default=None,
+        help="v1 checkpoint providing the upsampler for non-v1 models (default: the model named v1)",
+    )
+    q.add_argument("--v1-name", default="v1", help="name of the model that uses its own upsampler (default: v1)")
+    q.add_argument("--out", type=Path, default=Path("results/h2"))
+    q.add_argument("--device", default=None, help="torch device (default: cuda if available)")
+    q.add_argument("--batch-size", type=int, default=16, help="rollouts per batched forward pass")
+    q.add_argument("--rollout-steps", type=int, default=16, help="frames per rollout")
+    q.add_argument("--n-validate", type=int, default=20, help="mask overlay PNGs to write")
+    q.add_argument("--contexts", type=int, default=None, help="held-out contexts (default: eval.h2.contexts)")
     q = ev.add_parser("carried", help="carried-over v1 evals: loss curves, rollouts, FID (#34)")
-    q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=...")
-    q.add_argument("--v2-metrics", type=Path, default=None, help="v2 metrics.jsonl")
-    q.add_argument("--data", type=Path, default=None, help="test split directory")
+    q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v1=... v2=...")
+    q.add_argument("--v2-metrics", type=Path, default=None, help="v2 metrics.jsonl (without it: v1 loss curve alone)")
+    q.add_argument("--v1-results", type=Path, default=Path("results/v1"), help="directory with v1's loss JSONs")
+    q.add_argument("--data", required=True, type=Path, help="v2 test set: directory of packed (30x56) HDF5 episodes")
+    q.add_argument("--split-json", type=Path, default=None, help="split.json (demo -> split) for --data")
+    q.add_argument("--v1-data", type=Path, default=None, help="v1 test set (low_res/test dir); enables v1-on-v1 FID")
     q.add_argument("--out", type=Path, default=Path("results/carried"))
+    q.add_argument("--seed", type=int, default=0)
+    q.add_argument("--device", default=None, help="torch device (default: cuda if available)")
+    q.add_argument("--batch-size", type=int, default=16, help="rollouts per batched forward pass")
+    q.add_argument("--n-fid", type=int, default=2048, help="frames per side for the FID")
+    q.add_argument("--frames", type=int, default=64, help="rollout length")
+    q.add_argument("--contexts", type=int, default=16, help="contexts for the rollout figures and metrics")
+    q.add_argument("--denoising-steps", type=int, choices=[1, 3], default=3, help="sampler preset (v1's scripts: 3)")
+    q.add_argument("--s-cond", type=float, default=None, help="sampler s_cond (default: the preset's 0.005; v1: 0)")
+    q.add_argument("--v1-name", default="v1", help="name of the zero-action v1 model (default: v1)")
+    q.add_argument(
+        "--v1-actions",
+        choices=["zeros", "gt", "both"],
+        default="zeros",
+        help="actions driving the v1 model; both gives two rows (default: zeros, what v1 was trained on)",
+    )
+    q.add_argument("--zero-actions", action="store_true", help="force zero actions for ALL models (v1-style)")
+    q.add_argument("--fid-seeds", type=int, default=1, help="FID seeds (seed, seed+1, ...); mean and std reported")
 
     p = sub.add_parser("report-assets", help="regenerate report tables and figures (#36)")
     p.add_argument("--results", type=Path, default=Path("results"))
@@ -303,15 +339,46 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
     elif sub == "h2":
         from cs2wm.eval import h2_smoke
 
-        h2_smoke.run_h2(_parse_models(args.models), _cfg(args), Path("results/h2"), args.seed)
+        h2_smoke.run_h2(
+            _parse_models(args.models),
+            _cfg(args),
+            args.out,
+            args.seed,
+            data_dir=args.data,
+            split_json=args.split_json,
+            demos_dir=args.demos,
+            upsampler_ckpt=args.upsampler_ckpt,
+            device=args.device,
+            batch_size=args.batch_size,
+            rollout_steps=args.rollout_steps,
+            n_validate=args.n_validate,
+            contexts=args.contexts,
+            v1_name=args.v1_name,
+        )
     elif sub == "carried":
-        from cs2wm.eval import fid, loss_curve, rollouts
+        from cs2wm.eval import carried
 
-        models = _parse_models(args.models)
-        # TODO(#34): wire v1/v2 checkpoints and data into the three ported evals.
-        loss_curve.run_loss_curve(args.v2_metrics or Path(), Path("results/v1"), args.out)
-        rollouts.run_rollouts(models["v2"], args.data or Path(), args.out)
-        fid.compute_fid(models["v2"], args.data or Path())
+        carried.run_carried(
+            _parse_models(args.models),
+            args.data,
+            args.out,
+            v2_metrics=args.v2_metrics,
+            v1_results=args.v1_results,
+            v1_data_dir=args.v1_data,
+            split_json=args.split_json,
+            n_frames=args.frames,
+            contexts=args.contexts,
+            n_fid=args.n_fid,
+            seed=args.seed,
+            device=args.device,
+            batch_size=args.batch_size,
+            denoising_steps=args.denoising_steps,
+            zero_actions=args.zero_actions,
+            v1_actions=args.v1_actions,
+            v1_name=args.v1_name,
+            s_cond=args.s_cond,
+            fid_seeds=args.fid_seeds,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
