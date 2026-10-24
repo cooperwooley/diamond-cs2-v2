@@ -37,7 +37,7 @@ def test_subcommand_help(argv: list[str]) -> None:
 
 
 def test_unimplemented_command_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
-    assert cli.main(["supervise"]) == 2
+    assert cli.main(["report-assets"]) == 2
     assert "not implemented yet" in capsys.readouterr().err
 
 

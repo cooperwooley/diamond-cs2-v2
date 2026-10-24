@@ -145,9 +145,16 @@ sync:
   delete_local_hdf5: true           # free local hdf5/ + hdf5_fullres/ files whose remote sha256 verified; demos stay
 
 supervisor:
-  max_working_gb: 8
+  generate_block_min: 60            # one generate block per loop iteration, then everything pending is drained.   TUNE(#19)
+  drain_min: 45                     # stop generating this long before --until, to leave time to drain the pipeline.   TUNE(#19)
+  max_working_gb: 8                 # pause generation above this working set (frames, raw, labels, hdf5, hdf5_fullres)
+  min_free_gb: 15                   # stop generating and alert when the drive has less free space than this
   heartbeat_min: 60
-  max_attempts: 3
+  max_attempts: 3                   # attempts per stage per demo, then the demo is failed and the night goes on
+  backoff_s: 60                     # wait before attempt n+1 is backoff_s * 2^(n-1): 60 s, then 120 s
+  alert_failed_in_row: 3            # alert after this many demos in a row failed, or this many failures in one stage with no success
+  max_generate_failures: 2          # stop generating after this many generate blocks in a row that failed or gave no demo
+  smoke_s: 10                       # length of the render smoke test after a CS2 patch (seconds of footage)
   ntfy_server: https://ntfy.sh
   ntfy_topic: ${oc.env:DCS2_NTFY_TOPIC,null}   # secret; never committed
 

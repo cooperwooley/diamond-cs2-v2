@@ -5,8 +5,27 @@ and exponential backoff per stage, a disk guard (``supervisor.max_working_gb``),
 smoke test when the build id changes), and ntfy start/hourly/alert/morning messages. State is persisted atomically in
 ``state/pipeline.json`` so a reboot resumes where it stopped.
 
-Done so far (#19): the persistent state, ``Supervisor.run_stage`` / ``run_sync`` (what ``cs2wm <stage> --all-pending``
-and ``cs2wm sync`` call) and ``status_table``. The loop, retries, guards and ntfy are still #20.
+The night (``run_until``): repeat "generate one block (``supervisor.generate_block_min``), then advance every pending
+demo through segment -> render -> extract -> pack, then sync" until the deadline or the target. Only one CS2 can run
+at a time, so generation and rendering are interleaved, never parallel. Demos go through the stages one at a time
+(depth first), so frames and raw captures are deleted by pack before the next demo starts.
+
+* Deadline: ``--until HH:MM`` is the next such time (23:00 -> 07:30 means tomorrow). Generation stops
+  ``supervisor.drain_min`` early so the pipeline can drain; no new demo is started after the deadline, but what is
+  packed is synced once more before the summary.
+* Retries: a stage gets ``supervisor.max_attempts`` attempts per demo (counted in the demo's ``attempts``), with
+  ``backoff_s * 2^(n-1)`` between them and CS2/HLAE killed after a failed render. After the last one the demo is
+  ``failed`` and the night goes on.
+* Disk guard: generation pauses while the working set exceeds ``max_working_gb`` and stops (with an alert) when the
+  drive has less than ``min_free_gb`` free. The demo archive is not counted.
+* Patch guard: when the CS2 ``buildid`` differs from the one in ``state.meta``, a ~10 s render smoke test runs before
+  anything else (see ``Supervisor.render_smoke_test``). If it fails, generation and rendering stop. Generate's own
+  ``PatchGuardError`` stops generation too; what is already generated is still drained.
+* ntfy: start, hourly heartbeat, immediate alerts and the morning summary (``ntfy.format_*``).
+
+State is persisted atomically in ``state/pipeline.json`` so a reboot resumes where it stopped. ``Supervisor.run_stage``,
+``run_sync`` and ``status_table`` (#19) are also what ``cs2wm <stage> --all-pending``, ``cs2wm sync`` and
+``cs2wm status`` call.
 """
 
 from __future__ import annotations
@@ -16,18 +35,27 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+
+from cs2wm import demo as demo_utils
+from cs2wm.pipeline import generate, ntfy, proc
 
 log = logging.getLogger(__name__)
 
 STATE_SCHEMA_VERSION = 1
+EXIT_ALERT = 3  # exit code of `cs2wm supervise` when the night ended with a guard trip or an alert
+WORKING_SET_DIRS = ("frames", "raw", "labels", "hdf5", "hdf5_fullres")  # paths.* counted by the disk guard
+BUILD_KEY = "cs2_build_id"  # PipelineState.meta: the last CS2 buildid that rendered fine
 REJECTED_DIR = "_rejected"  # demos/_rejected/ holds demos that generate could not parse (see generate.REJECTED_DIR)
 
 
@@ -52,6 +80,7 @@ _INPUT_STATE = {
     "pack": StageState.EXTRACTED,
     "sync": StageState.PACKED,
 }
+_ADVANCEABLE = ("pending", "segmented", "rendered", "extracted")  # states a demo is advanced from by the loop
 _OUTPUT_STATE = {
     "segment": StageState.SEGMENTED,
     "render": StageState.RENDERED,
@@ -79,15 +108,17 @@ class PipelineState:
 
     Each demo has a record with ``state`` (a ``StageState`` value), ``kind``, ``failed_stage`` and ``reason`` (set
     while ``failed``), ``stages`` (``{stage: {"wall_s": float, "at": ISO time}}`` of the last run of each stage),
-    ``updated`` and whatever ``mark`` was given as ``info`` (``demo_s``, ``frames``, ...).
+    ``attempts`` (``{stage: n}`` failed attempts of the supervisor, cleared when the stage succeeds), ``updated`` and whatever ``mark`` was given as ``info`` (``demo_s``, ``frames``, ...).
 
     Attributes:
         path: ``state/pipeline.json``.
         demos: Record per demo id.
+        meta: Supervisor-wide values (``cs2_build_id``: the last CS2 build that passed the render smoke test).
     """
 
     path: Path
     demos: dict[str, dict[str, Any]] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> PipelineState:
@@ -107,7 +138,7 @@ class PipelineState:
             raise StateError(f"{path} is corrupt or unreadable ({exc}); {hint}") from exc
         if not isinstance(raw, dict) or raw.get("schema_version") != STATE_SCHEMA_VERSION:
             raise StateError(f"{path} has an unsupported pipeline state schema; {hint}")
-        return cls(path, dict(raw.get("demos", {})))
+        return cls(path, dict(raw.get("demos", {})), dict(raw.get("meta", {})))
 
     def save(self) -> None:
         """Write the state atomically (temp file + fsync + rename), keeping the previous file as ``<name>.bak``."""
@@ -115,7 +146,8 @@ class PipelineState:
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"schema_version": STATE_SCHEMA_VERSION, "demos": self.demos}, f, indent=2, sort_keys=True)
+                payload = {"schema_version": STATE_SCHEMA_VERSION, "demos": self.demos, "meta": self.meta}
+                json.dump(payload, f, indent=2, sort_keys=True)
                 f.write("\n")
                 f.flush()
                 os.fsync(f.fileno())
@@ -222,17 +254,210 @@ class StageReport:
     outputs: dict[str, str] = field(default_factory=dict)
 
 
+def resolve_deadline(now: datetime, until: str) -> datetime:
+    """The next local time ``HH:MM`` after ``now``: ``07:30`` started at 23:00 is tomorrow 07:30.
+
+    Args:
+        now: Current local time.
+        until: ``HH:MM``.
+
+    Returns:
+        The deadline, strictly after ``now`` and at most 24 h away.
+
+    Raises:
+        ValueError: If ``until`` is not a valid ``HH:MM``.
+    """
+    try:
+        hour, minute = (int(part) for part in until.split(":"))
+        deadline = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError as exc:
+        raise ValueError(f"--until must be a time as HH:MM (24 h), got {until!r}") from exc
+    return deadline if deadline > now else deadline + timedelta(days=1)
+
+
+def _dir_bytes(path: Path) -> int:
+    """Total size of the files under ``path`` (0 if missing; files that vanish while walking are skipped)."""
+    total = 0
+    for dirpath, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                continue
+    return total
+
+
+def measure_disk(cfg: DictConfig) -> tuple[float, float]:
+    """Measure the disk guard's inputs.
+
+    The working set is ``frames``, ``raw``, ``labels``, ``hdf5`` and ``hdf5_fullres`` (the pack ``.staging`` dirs live
+    inside them) but not the demo archive, which is never deleted. Free space is that of the drive holding ``paths.root``.
+
+    Args:
+        cfg: A validated cs2wm config.
+
+    Returns:
+        ``(working set GB, free GB)``.
+    """
+    working = sum(_dir_bytes(Path(cfg.paths[name])) for name in WORKING_SET_DIRS)
+    probe = Path(cfg.paths.root)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return working / 1e9, shutil.disk_usage(probe).free / 1e9
+
+
+def make_smoke_plan(plan: dict[str, Any], seconds: float) -> dict[str, Any]:
+    """Cut a short render plan out of a real one: its first episode, truncated to ``seconds`` of footage.
+
+    The result is still a valid plan of the same demo (same target, same spectate command, same start tick), so a
+    render of it exercises exactly what a real render does, in a few seconds of footage.
+
+    Args:
+        plan: A parsed ``render_plan.json``.
+        seconds: Footage to render (``timing.fps * seconds`` frames, fewer if the episode is shorter).
+
+    Returns:
+        A new plan dict (the input is not modified).
+
+    Raises:
+        ValueError: If the plan has no episode to cut from.
+    """
+    fps, tpf = plan["timing"]["fps"], plan["timing"]["ticks_per_frame"]
+    segments = sorted((s for s in plan["segments"] if s["episodes"]), key=lambda s: s["segment_idx"])
+    if not segments:
+        raise ValueError(f"{plan['demo_id']}: the plan has no episode")
+    seg = json.loads(json.dumps(segments[0]))
+    episode = seg["episodes"][0]
+    frames = max(1, min(round(seconds * fps), episode["n_frames"]))
+    start = seg["record_start_tick"] + episode["first_frame"] * tpf
+    end = start + frames * tpf
+    offset = plan["tick_offset"]
+    episode.update(first_frame=0, n_frames=frames, rendered_frames=frames + 1, start_tick=start, end_tick=end)
+    seg.update(
+        episodes=[episode],
+        record_start_tick=start,
+        record_end_tick=end,
+        mirv_record_start_tick=start + offset,
+        mirv_record_end_tick=end + offset,
+        labeled_frames=frames,
+        rendered_frames=frames + 1,
+    )
+    seg["mirv_spec_tick"] = min(seg["mirv_spec_tick"], seg["mirv_record_start_tick"])
+    schedule = []
+    for entry in plan["mirv_cmd_schedule"]:
+        if entry["segment_idx"] != seg["segment_idx"]:
+            continue
+        entry = dict(entry)
+        if entry["action"] == "record_start":
+            entry.update(mirv_tick=start + offset, demo_tick=start)
+        elif entry["action"] == "record_end":
+            entry.update(mirv_tick=end + offset, demo_tick=end)
+        schedule.append(entry)
+    schedule.sort(key=lambda e: e["mirv_tick"])
+    totals = {"segments": 1, "episodes": 1, "labeled_frames": frames, "rendered_frames": frames + 1}
+    return {
+        **plan,
+        "demo_end_tick": end,
+        "segments": [seg],
+        "mirv_cmd_schedule": schedule,
+        "totals": totals,
+        "meta": {**plan.get("meta", {}), "smoke_test": True},
+    }
+
+
+@dataclass
+class Hooks:
+    """Everything the loop takes from the outside world, replaced by fakes in tests.
+
+    Attributes:
+        now: Local wall clock.
+        sleep: Sleep, used for the backoff.
+        notify: ``ntfy.notify``-like; default posts to ``supervisor.ntfy_server``/``ntfy_topic``.
+        disk: ``cfg -> (working set GB, free GB)``; default ``measure_disk``.
+        build_id: ``cs2_dir -> CS2 buildid``.
+        generate: ``(cfg, profile, hours) -> demos``; default ``generate.run``.
+        sync: ``() -> summary with .ok``; default ``Supervisor.run_sync``.
+        smoke: ``() -> failure reason, or None if the render smoke test passed``; default
+            ``Supervisor.render_smoke_test``.
+        kill_cs2: Kills stray CS2/HLAE processes; default ``proc.kill_by_name``.
+        backoff: ``failed attempt number -> seconds to wait``; default ``supervisor.backoff_s * 2^(n-1)``.
+        stage_fns: Replacements for the per-demo stage functions (``Supervisor._stage_fn``), keyed by stage.
+    """
+
+    now: Callable[[], datetime] = datetime.now
+    sleep: Callable[[float], None] = time.sleep
+    notify: Callable[..., None] | None = None
+    disk: Callable[[DictConfig], tuple[float, float]] = measure_disk
+    build_id: Callable[[Path], int] = demo_utils.cs2_build_id
+    generate: Callable[[DictConfig, str, float], Any] | None = None
+    sync: Callable[[], Any] | None = None
+    smoke: Callable[[], str | None] | None = None
+    kill_cs2: Callable[[], None] | None = None
+    backoff: Callable[[int], float] | None = None
+    stage_fns: dict[str, Callable[[str], dict[str, Any]]] = field(default_factory=dict)
+
+
+@dataclass
+class Night:
+    """What happened in one ``run_until`` (also the source of the morning summary).
+
+    Attributes:
+        started: Start time.
+        deadline: Resolved deadline.
+        target_hours: Target of synced QA-passing hours.
+        profile: Generation profile.
+        reason: Why the night ended.
+        alerts: Titles of the alerts sent (guard trips and repeated failures).
+        stage_wall_s: Wall seconds per stage (``generate`` and ``smoke`` included).
+        stage_runs: Successful runs per stage.
+        stopped_generation: Why generation stopped before the end (``None`` while it may continue).
+        blocked: Stages that cannot run tonight (``render`` after a failed smoke test).
+    """
+
+    started: datetime
+    deadline: datetime
+    target_hours: float
+    profile: str
+    reason: str = ""
+    alerts: list[str] = field(default_factory=list)
+    stage_wall_s: Counter = field(default_factory=Counter)
+    stage_runs: Counter = field(default_factory=Counter)
+    stopped_generation: str | None = None
+    blocked: set[str] = field(default_factory=set)
+    # bookkeeping for the alerts
+    failed_in_row: int = 0
+    stage_ok: Counter = field(default_factory=Counter)
+    stage_failed: Counter = field(default_factory=Counter)
+    generate_failures: int = 0
+    alerted: set[str] = field(default_factory=set)
+    bad_builds: set[int] = field(default_factory=set)
+
+    @property
+    def exit_code(self) -> int:
+        """0 for a normal end (deadline, target, nothing left); ``EXIT_ALERT`` if a guard tripped or an alert was sent."""
+        return EXIT_ALERT if self.alerts else 0
+
+
 class Supervisor:
     """Drives every pending demo through the stages.
 
     Args:
         cfg: A validated cs2wm config.
         state: Persistent state.
+        hooks: Clock, sleep, notifier, disk probe, generate, ... (default: the real ones; fakes in tests).
     """
 
-    def __init__(self, cfg: DictConfig, state: PipelineState) -> None:
+    def __init__(self, cfg: DictConfig, state: PipelineState, hooks: Hooks | None = None) -> None:
         self.cfg = cfg
         self.state = state
+        self.hooks = hooks or Hooks()
+        self._notify = self.hooks.notify or partial(
+            ntfy.notify, server=cfg.supervisor.ntfy_server, topic=cfg.supervisor.ntfy_topic
+        )
+        self.night: Night | None = None
+        self._current = "idle"  # what the heartbeat reports
+        self._next_heartbeat = datetime.max
+        self._sync_down = False  # sync failed for the rest of this drain
         self.explicit_paths: dict[str, Path] = {}  # demos given by path on the command line
 
     def demo_path(self, demo_id: str) -> Path:
@@ -264,6 +489,8 @@ class Supervisor:
     def _stage_fn(self, stage: str, **options: Any) -> Callable[[str], dict[str, Any]]:
         """The function that runs one stage on one demo id and returns the info to record; raises on failure."""
         cfg = self.cfg
+        if stage in self.hooks.stage_fns:
+            return self.hooks.stage_fns[stage]
 
         def segment(demo_id: str) -> dict[str, Any]:
             from cs2wm.pipeline import segment as seg
@@ -383,16 +610,477 @@ class Supervisor:
         self.state.save()
         return summary
 
-    def run_until(self, until: str, target_hours: float, profile: str = "dm") -> None:
-        """Loop until the deadline or target is reached.
+    # -- the night ----------------------------------------------------------------------------------------------------
+
+    def run_until(self, until: str, target_hours: float, profile: str = "dm") -> Night:
+        """Run the pipeline unattended until the deadline or until ``target_hours`` QA-passing hours are synced.
+
+        Each iteration generates one block (unless a guard says otherwise), then advances every pending demo, then
+        syncs. A start message is sent first and a morning summary last, also when the loop dies with an exception.
 
         Args:
-            until: Deadline as ``HH:MM`` local time.
+            until: Deadline as ``HH:MM`` local time; the next such time, so ``07:30`` at 23:00 is tomorrow.
             target_hours: Stop once this many QA-passing hours are synced.
             profile: Generation profile (``dm`` or ``smoke``).
+
+        Returns:
+            What happened; ``exit_code`` is non-zero if a guard tripped or an alert was sent.
+
+        Raises:
+            ValueError: If ``until`` is not ``HH:MM``.
         """
-        # TODO(#20): default schedule "generate 60 min -> advance everything pending", with guards and ntfy.
-        raise NotImplementedError("TODO(#20): Supervisor.run_until")
+        now = self.hooks.now()
+        night = self.night = Night(now, resolve_deadline(now, until), target_hours, profile)
+        self._current = "starting"
+        self._next_heartbeat = now + timedelta(minutes=float(self.cfg.supervisor.heartbeat_min))
+        log.info("supervise: target %.2f h, until %s, profile %s", target_hours, night.deadline, profile)
+        try:
+            self._recover()
+            working, free = self.hooks.disk(self.cfg)
+            self._send(ntfy.format_start(target_hours, night.deadline, now, self._read_build(), working, free, profile))
+            night.reason = self._loop()
+        except BaseException as exc:
+            night.reason = f"stopped by {type(exc).__name__}"
+            self._alert("supervisor stopped", f"{type(exc).__name__}: {exc}", "crash")
+            raise
+        finally:
+            self._current = "done"
+            self._send(self._summary())
+        return night
+
+    def _loop(self) -> str:
+        """The generate / drain iterations. Returns why the night ended."""
+        night, h = self.night, self.hooks
+        while True:
+            if self._target_reached():
+                return "target reached"
+            if h.now() >= night.deadline:
+                return "deadline reached"
+            self._heartbeat()
+            self._check_patch()
+            generation = self._generate_block()
+            progressed = self._drain()
+            if self._target_reached():
+                return "target reached"
+            if h.now() >= night.deadline:
+                return "deadline reached"
+            if generation == "generated":
+                continue
+            if generation == "paused" and not progressed:
+                self._alert(
+                    "disk guard",
+                    "The working set is over the limit and nothing can be drained (sync failing, or leftovers "
+                    "from failed demos). Generation is paused; the night ends.",
+                    "disk-stall",
+                )
+                return "disk guard: working set stuck above the limit"
+            if generation == "stopped" and not progressed:
+                return night.stopped_generation or "nothing left to do"
+
+    def _recover(self) -> None:
+        """Re-queue failed demos that still have attempts left (a crash between a failure and its retry)."""
+        limit = int(self.cfg.supervisor.max_attempts)
+        for demo_id, rec in self.state.demos.items():
+            stage = rec.get("failed_stage")
+            if rec["state"] == "failed" and rec.get("attempts", {}).get(stage, 0) < limit:
+                log.info("%s: failed in %s with attempts left; retrying", demo_id, stage)
+                self._requeue(demo_id, stage)
+        self.state.save()
+
+    # -- generate and the guards ----------------------------------------------------------------------------------------
+
+    def _generate_block(self) -> str:
+        """Generate one block unless a guard says no. Returns ``generated``, ``paused`` (disk) or ``stopped``."""
+        night, sup = self.night, self.cfg.supervisor
+        if night.stopped_generation:
+            return "stopped"
+        remaining_min = (night.deadline - self.hooks.now()).total_seconds() / 60
+        available_min = remaining_min - float(sup.drain_min)
+        if available_min < float(self.cfg.generate.chunk_min):
+            night.stopped_generation = "deadline close: generation stopped to drain the pipeline"
+            log.info("%s (%.0f min to the deadline)", night.stopped_generation, remaining_min)
+            return "stopped"
+        working, free = self.hooks.disk(self.cfg)
+        if free < float(sup.min_free_gb):
+            night.stopped_generation = f"free disk {free:.1f} GB is below supervisor.min_free_gb"
+            self._alert(
+                "disk almost full", f"Only {free:.1f} GB free (minimum {sup.min_free_gb}). Generation stopped.", "free"
+            )
+            return "stopped"
+        if working > float(sup.max_working_gb):
+            log.info(
+                "disk guard: working set %.1f GB > %s GB; generation paused until the pipeline drains",
+                working,
+                sup.max_working_gb,
+            )
+            return "paused"
+
+        block_min = min(float(sup.generate_block_min), available_min)
+        self._current = "generate"
+        start = self.hooks.now()
+        error: str | None = None
+        try:
+            self._generate(self.cfg, night.profile, block_min / 60)
+        except generate.PatchGuardError as exc:
+            self._kill_cs2()
+            night.stopped_generation = "CS2 patched (generate's patch guard)"
+            self._alert(
+                "CS2 patched",
+                f"{exc} Generation stopped; the demos already generated are still processed.",
+                "patch-guard",
+            )
+            return "stopped"
+        except Exception as exc:  # GenerateError, or anything else a CS2 session can throw
+            self._kill_cs2()
+            error = f"{type(exc).__name__}: {exc}"
+            log.error("generate failed: %s", error, exc_info=not isinstance(exc, generate.GenerateError))
+        finally:
+            night.stage_wall_s["generate"] += (self.hooks.now() - start).total_seconds()
+        added = self.state.discover(self.cfg)  # also what a failed block published before it died
+        self.state.save()
+        if error is None and not added:
+            error = "the block produced no demo"
+            log.warning("generate: %s", error)
+        if error is None:
+            night.generate_failures = 0
+            night.stage_runs["generate"] += 1
+            return "generated"
+        night.generate_failures += 1
+        if night.generate_failures >= int(sup.max_generate_failures):
+            night.stopped_generation = "generate keeps failing"
+            self._alert(
+                "generate failing",
+                f"{night.generate_failures} generate blocks in a row failed (last: {error}). Generation stopped.",
+                "generate",
+            )
+            return "stopped"
+        return "generated"
+
+    def _read_build(self) -> int | None:
+        try:
+            return self.hooks.build_id(Path(self.cfg.paths.cs2_dir))
+        except (FileNotFoundError, ValueError) as exc:
+            log.warning("cannot read the CS2 build id: %s", exc)
+            return None
+
+    def _check_patch(self) -> None:
+        """Run the render smoke test when the CS2 build changed since the last one that rendered fine."""
+        night = self.night
+        build = self._read_build()
+        last = self.state.meta.get(BUILD_KEY)
+        if build is None or build == last or build in night.bad_builds:
+            return
+        if last is None:  # first run on this machine: nothing to compare with
+            self.state.meta[BUILD_KEY] = build
+            self.state.save()
+            return
+        log.warning("CS2 build changed from %s to %s; running the render smoke test", last, build)
+        self._current = "smoke test"
+        start = self.hooks.now()
+        reason = self._smoke()
+        night.stage_wall_s["smoke"] += (self.hooks.now() - start).total_seconds()
+        if reason is None:
+            night.stage_runs["smoke"] += 1
+            self.state.meta[BUILD_KEY] = build
+            self.state.save()
+            self._send(
+                ntfy.Message(
+                    "dcs2: CS2 updated",
+                    f"Build {last} -> {build}. The render smoke test passed.",
+                    "default",
+                    ("white_check_mark",),
+                )
+            )
+            return
+        night.bad_builds.add(build)
+        night.blocked.add("render")
+        night.stopped_generation = "CS2 patched and the render smoke test failed"
+        self._alert(
+            "CS2 patched",
+            f"Build {last} -> {build}: the render smoke test failed ({reason}). Generation and rendering are stopped; "
+            "demos already rendered are still processed.",
+            f"smoke-{build}",
+        )
+
+    def render_smoke_test(self) -> str | None:
+        """Render ~``supervisor.smoke_s`` seconds of a real, known-good plan to check that rendering survived a patch.
+
+        The most recent demo that still has its ``render_plan.json`` and its ``.dem`` is used. ``make_smoke_plan``
+        cuts the first ``smoke_s`` seconds of its first episode into a plan of the same demo, which goes through
+        ``render.run`` (HLAE, spectate, capture, downscale, frame-count check) with ``paths.plans``, ``frames`` and
+        ``raw`` pointed at ``<root>/smoke``, so the demo's real plan, frames and state are untouched. The scratch
+        dir is deleted afterwards. With no such demo (a fresh machine) there is nothing known-good to render: that is
+        logged and the test counts as passed.
+
+        Returns:
+            The failure reason, or None if the render succeeded (or there was nothing to render).
+        """
+        from cs2wm.pipeline import render as rnd
+        from cs2wm.pipeline import segment as seg
+
+        cfg = self.cfg
+        for demo_id in sorted(self.state.demos, reverse=True):
+            plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
+            try:
+                demo_path = self.demo_path(demo_id)
+                plan = make_smoke_plan(seg.read_render_plan(plan_path), float(cfg.supervisor.smoke_s))
+            except (OSError, ValueError, KeyError):
+                continue
+            break
+        else:
+            log.warning("render smoke test: no demo with a plan to render; the new CS2 build is unverified")
+            return None
+
+        scratch = Path(cfg.paths.root) / "smoke"
+        shutil.rmtree(scratch, ignore_errors=True)
+        smoke_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        smoke_cfg.paths.update(plans=str(scratch / "plans"), frames=str(scratch / "frames"), raw=str(scratch / "raw"))
+        smoke_plan = scratch / "plans" / demo_id / "render_plan.json"
+        smoke_plan.parent.mkdir(parents=True)
+        smoke_plan.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+        try:
+            result = rnd.run(demo_path, smoke_cfg)
+        except Exception as exc:  # noqa: BLE001 - any crash of the launcher means the smoke test failed
+            return f"{type(exc).__name__}: {exc}"
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        if result.ok:
+            return None
+        self._kill_cs2()
+        return result.reason or "render failed"
+
+    # -- advancing the demos ----------------------------------------------------------------------------------------
+
+    def _drain(self) -> int:
+        """Advance every pending demo (oldest first) through the stages, then sync. Returns the stage runs that finished."""
+        night, sup = self.night, self.cfg.supervisor
+        if self.state.discover(self.cfg):
+            self.state.save()
+        self._sync_down = False
+        finished = 0
+        for demo_id in sorted(d for d, rec in self.state.demos.items() if rec["state"] in _ADVANCEABLE):
+            if self.hooks.now() >= night.deadline or self._target_reached():
+                break
+            finished += self._advance(demo_id)
+            self._heartbeat()
+            if self.hooks.disk(self.cfg)[0] > float(sup.max_working_gb):
+                finished += self._sync_packed()  # the packed hdf5 is what is left to free
+        return finished + self._sync_packed()
+
+    def _advance(self, demo_id: str) -> int:
+        """Run one demo through segment, render, extract and pack. Returns the stages that finished."""
+        finished = 0
+        while True:
+            state = self.state.state_of(demo_id)
+            stage = next((s for s in STAGES[:-1] if _INPUT_STATE[s] is state), None)
+            if stage is None or stage in self.night.blocked or not self._run_with_retries(stage, demo_id):
+                return finished
+            finished += 1
+
+    def _run_with_retries(self, stage: str, demo_id: str) -> bool:
+        """Run one stage of one demo, up to ``supervisor.max_attempts`` attempts with exponential backoff.
+
+        A failed attempt kills stray CS2/HLAE processes (render), counts in ``attempts[stage]`` and puts the demo
+        back to the stage's input state. The last failed attempt leaves it ``failed`` with the reason.
+
+        Returns:
+            True if the stage finished; False if the demo failed or must wait for the next night.
+        """
+        night, rec = self.night, self.state.demos[demo_id]
+        limit = int(self.cfg.supervisor.max_attempts)
+        while True:
+            self._current = f"{stage} {demo_id}"
+            start = self.hooks.now()
+            report = self.run_stage(stage, [demo_id])
+            night.stage_wall_s[stage] += (self.hooks.now() - start).total_seconds()
+            if demo_id in report.done:
+                night.stage_runs[stage] += 1
+                night.stage_ok[stage] += 1
+                if stage == "pack":
+                    night.failed_in_row = 0
+                if rec.get("attempts", {}).pop(stage, None) is not None or rec.pop("last_error", None):
+                    self.state.save()
+                return True
+            reason = report.failed.get(demo_id, "no result")
+            if stage == "render":
+                self._kill_cs2()
+            attempts = rec.setdefault("attempts", {})
+            attempts[stage] = attempts.get(stage, 0) + 1
+            if attempts[stage] >= limit:
+                self.state.save()
+                self._count_failure(stage, demo_id, reason)
+                return False
+            self._requeue(demo_id, stage)
+            self.state.save()
+            delay = self._backoff(attempts[stage])
+            log.warning(
+                "%s %s: attempt %d/%d failed (%s); retrying in %.0f s",
+                stage,
+                demo_id,
+                attempts[stage],
+                limit,
+                reason,
+                delay,
+            )
+            self.hooks.sleep(delay)
+            if self.hooks.now() >= night.deadline:
+                return False  # stays queued for the next night
+
+    def _requeue(self, demo_id: str, stage: str) -> None:
+        """Put a demo that failed in ``stage`` back to the state the stage starts from, keeping the reason."""
+        rec = self.state.demos[demo_id]
+        rec["state"] = _INPUT_STATE[stage].value
+        rec["last_error"] = rec.pop("reason", None)
+        rec.pop("failed_stage", None)
+
+    def _count_failure(self, stage: str, demo_id: str, reason: str) -> None:
+        """A demo is out of attempts: alert on a streak of failed demos or a stage that fails for every demo."""
+        night, limit = self.night, int(self.cfg.supervisor.alert_failed_in_row)
+        night.failed_in_row += 1
+        night.stage_failed[stage] += 1
+        log.error("%s %s: giving up after %s attempts: %s", stage, demo_id, self.cfg.supervisor.max_attempts, reason)
+        if night.failed_in_row == limit:  # once per streak
+            self._alert(
+                "repeated failures",
+                f"{night.failed_in_row} demos in a row failed. Last: {stage} {demo_id}: {reason}",
+                f"row-{night.alerts.count('repeated failures')}",
+            )
+        if night.stage_failed[stage] >= limit and not night.stage_ok[stage]:
+            self._alert(
+                f"{stage} fails for every demo",
+                f"{night.stage_failed[stage]} demos failed in {stage} and none passed tonight. Last: {demo_id}: {reason}",
+                f"stage-{stage}",
+            )
+
+    def _sync_packed(self) -> int:
+        """Sync everything packed (up to ``max_attempts`` tries with backoff). Returns the demos that reached the Mill."""
+        night, limit = self.night, int(self.cfg.supervisor.max_attempts)
+        if self._sync_down or not any(r["state"] == "packed" for r in self.state.demos.values()):
+            return 0
+        synced_before = self._count("synced")
+        ok = False
+        for attempt in range(1, limit + 1):
+            self._current = "sync"
+            start = self.hooks.now()
+            try:
+                ok = bool((self.hooks.sync or self.run_sync)().ok)
+            except Exception as exc:  # noqa: BLE001 - the Mill being down must not stop the night
+                log.error("sync failed: %s: %s", type(exc).__name__, exc)
+                ok = False
+            night.stage_wall_s["sync"] += (self.hooks.now() - start).total_seconds()
+            if ok or attempt == limit:
+                break
+            self.hooks.sleep(self._backoff(attempt))
+            if self.hooks.now() >= night.deadline:
+                break
+        gained = self._count("synced") - synced_before
+        if gained:
+            night.stage_runs["sync"] += gained
+            night.stage_ok["sync"] += gained
+        if not ok and not gained:
+            self._sync_down = True
+            self._alert(
+                "sync failing",
+                "Nothing could be synced to the Mill. The packed demos stay on disk and are retried.",
+                "sync",
+            )
+        return gained
+
+    # -- bookkeeping --------------------------------------------------------------------------------------------------
+
+    def _count(self, state: str) -> int:
+        return sum(1 for rec in self.state.demos.values() if rec["state"] == state)
+
+    def _hours(self, states: tuple[str, ...], key: str) -> float:
+        """Hours (at ``timing.fps``) of the ``key`` frames of the demos in ``states``."""
+        frames = sum(rec.get(key, 0) for rec in self.state.demos.values() if rec["state"] in states)
+        return frames / float(self.cfg.timing.fps) / 3600
+
+    def synced_hours(self) -> float:
+        """QA-passing hours that reached the Mill."""
+        return self._hours(("synced",), "frames")
+
+    def _target_reached(self) -> bool:
+        return self.synced_hours() >= self.night.target_hours
+
+    def _snapshot(self) -> ntfy.Snapshot:
+        demos = self.state.demos.values()
+        ordered = [s.value for s in StageState]
+        past_segment = [r for r in demos if r["state"] != "pending"]
+        extracted = [r for r in demos if "qa_episodes" in r]
+        qa_total = sum(r["qa_episodes"] for r in extracted)
+        working, free = self.hooks.disk(self.cfg)
+        return ntfy.Snapshot(
+            generated_h=sum(r.get("demo_s", 0.0) for r in past_segment) / 3600,
+            rendered_h=sum(r.get("rendered_frames", 0) for r in demos) / float(self.cfg.timing.fps) / 3600,
+            synced_h=self.synced_hours(),
+            qa_pass_rate=sum(r["qa_passed"] for r in extracted) / qa_total if qa_total else None,
+            working_gb=working,
+            free_gb=free,
+            stage=self._current,
+            counts={s: self._count(s) for s in ordered},
+        )
+
+    def _summary(self) -> ntfy.Message:
+        night = self.night
+        failed = Counter(
+            (rec["failed_stage"], rec["reason"]) for rec in self.state.demos.values() if rec["state"] == "failed"
+        )
+        return ntfy.format_summary(
+            ntfy.NightSummary(
+                snapshot=self._snapshot(),
+                target_hours=night.target_hours,
+                started=night.started,
+                ended=self.hooks.now(),
+                reason=night.reason,
+                failures=[(stage, reason[:120], n) for (stage, reason), n in sorted(failed.items())],
+                stage_wall_s=dict(night.stage_wall_s),
+                stage_runs=dict(night.stage_runs),
+                alerts=night.alerts,
+            )
+        )
+
+    def _heartbeat(self) -> None:
+        now = self.hooks.now()
+        if now >= self._next_heartbeat:
+            self._next_heartbeat = now + timedelta(minutes=float(self.cfg.supervisor.heartbeat_min))
+            self._send(ntfy.format_heartbeat(self._snapshot(), self.night.target_hours, now, self.night.deadline))
+
+    def _alert(self, kind: str, detail: str, key: str) -> None:
+        """Send an alert once per ``key`` per night and remember it (it makes the exit code non-zero)."""
+        if key in self.night.alerted:
+            return
+        self.night.alerted.add(key)
+        self.night.alerts.append(kind)
+        log.error("ALERT %s: %s", kind, detail)
+        self._send(ntfy.format_alert(kind, detail))
+
+    def _send(self, message: ntfy.Message) -> None:
+        """Post a message; a failing notifier never stops the night. Only the title is logged, never the topic."""
+        log.info("ntfy: %s", message.title)
+        try:
+            self._notify(message.body, title=message.title, priority=message.priority, tags=message.tags)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ntfy notification failed (%s)", type(exc).__name__)
+
+    def _backoff(self, attempt: int) -> float:
+        if self.hooks.backoff:
+            return self.hooks.backoff(attempt)
+        return float(self.cfg.supervisor.backoff_s) * 2 ** (attempt - 1)
+
+    def _kill_cs2(self) -> None:
+        if self.hooks.kill_cs2:
+            self.hooks.kill_cs2()
+        else:
+            proc.kill_by_name(subprocess.run, os.name == "nt", ["cs2.exe", str(self.cfg.render.hlae_exe)])
+
+    def _generate(self, cfg: DictConfig, profile: str, hours: float) -> Any:
+        if self.hooks.generate:
+            return self.hooks.generate(cfg, profile, hours)
+        return generate.run(cfg, profile, hours)
+
+    def _smoke(self) -> str | None:
+        return (self.hooks.smoke or self.render_smoke_test)()
 
     def status_table(self) -> str:
         """Return the state table and totals printed by ``cs2wm status``.
