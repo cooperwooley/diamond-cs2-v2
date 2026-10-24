@@ -45,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("render", help="render a demo with HLAE (#15)")
     _add_demo_args(p)
+    p.add_argument(
+        "--cfg-only", action="store_true", help="write the render cfg, print the HLAE command, do not launch"
+    )
+    p.add_argument("--plan", type=Path, default=None, help="render_plan.json to use with --cfg-only (no demo needed)")
 
     p = sub.add_parser("extract", help="derive 51-dim action labels and QA (#11)")
     _add_demo_args(p)
@@ -224,7 +228,29 @@ def _dispatch(args: argparse.Namespace) -> None:
     elif cmd == "render":
         from cs2wm.pipeline import render
 
-        render.run(Path(args.demo or ""), _cfg(args))
+        cfg = _cfg(args)
+        if args.all_pending:
+            # TODO(#20): resolve --all-pending through the supervisor's persistent pipeline state.
+            raise NotImplementedError("TODO(#20): render --all-pending")
+        if args.cfg_only:
+            if args.plan is None and not args.demo:
+                raise SystemExit("render --cfg-only: give a demo id or --plan <render_plan.json>")
+            demo = (
+                _resolve_demo(args.demo, cfg)
+                if args.demo and (args.plan is None or Path(args.demo).is_file())
+                else None
+            )
+            plan_path = args.plan or Path(cfg.paths.plans) / (demo or Path(args.demo)).stem / "render_plan.json"
+            out = render.write_cfg_only(plan_path, cfg, demo)
+            print(f"cfg installed: {out.installed}\ncfg copy:      {out.copy}\nHLAE argv:\n  " + "\n  ".join(out.argv))
+            print(f"\nPowerShell:\n{out.powershell}")
+            return
+        if not args.demo:
+            raise SystemExit("render: give a demo id or a path to a .dem file")
+        result = render.run(_resolve_demo(args.demo, cfg), cfg)
+        if not result.ok:
+            raise SystemExit(f"render failed: {result.reason}")
+        print(result.out_dir)
     elif cmd == "extract":
         from cs2wm.pipeline import extract_actions
 
