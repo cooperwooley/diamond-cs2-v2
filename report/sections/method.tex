@@ -1,1 +1,35 @@
-% TODO(#37): method
+\section{Method}
+\label{sec:method}
+\subsection{Architecture}
+We use DIAMOND's two-stage design~\cite{alonso2024diamond}, which has two diffusion models in the EDM formulation~\cite{karras2022edm}.
+Both are 2D U-Nets whose inputs are scaled by the EDM preconditioners ($c_\mathrm{in}, c_\mathrm{skip}, c_\mathrm{out}, c_\mathrm{noise}$ with $\sigma_\mathrm{data}=0.5$).
+
+\textbf{Denoiser.}
+The denoiser predicts the next $30{\times}56$ frame.
+It is conditioned on the previous $4$ frames, which are concatenated to the noisy frame channel-wise, and on the corresponding $4$ actions.
+Each action vector is projected linearly to a 2048-dimensional embedding, which is summed with Fourier embeddings of the noise level and of the noise level applied to the history, and then drives the U-Net's adaptive group-normalisation layers.
+The U-Net has four resolutions with $128,256,512,1024$ channels and two residual blocks each, with self-attention at the two lowest resolutions.
+Training sequences have $4+1+4$ frames: four conditioning frames, the target, and four more frames that the model unrolls on its own predictions.
+The optimiser is AdamW (learning rate $10^{-4}$, weight decay $10^{-2}$) with 100 warm-up steps and gradient-norm clipping at 10.
+Training noise levels $\sigma$ are drawn so that $\ln\sigma$ is normal with mean $-1.2$ and standard deviation $1.2$.
+Sampling uses Euler steps with $\rho=7$ over $\sigma\in[0.002,5]$; the number of denoising steps is a speed--quality knob that we state for each experiment.
+
+\textbf{Upsampler.}
+A second, smaller diffusion model maps a $30{\times}56$ frame to $150{\times}280$ (factor 5), conditioned on the bicubically upsampled frame.
+It sees no actions.
+For v2 we therefore \emph{reuse the v1 upsampler unchanged} and train only the denoiser.
+The reuse is possible because v2 low-resolution frames are made as v1's were, up to the clamp that fixes the uint8 wrap (\cref{sec:data}).
+We verify the compatibility in \cref{sec:experiments}.
+
+\subsection{Training}
+The denoiser is trained from scratch on the v2 training split for 150 epochs of 400 optimiser steps each, at an effective batch size of 128 sequences.
+These are v1's epoch definition and effective batch (v1 used 8 sequences $\times$ 16 gradient-accumulation steps on a smaller GPU), so v1 and v2 loss curves are directly comparable per epoch.
+On the cluster's H100 GPUs we run bf16 autocast with TF32 matrix multiplies and a batch of 128 with no gradient accumulation.
+Jobs are limited to 48 hours, so training must survive pre-emption: the scheduler sends SIGUSR1 ten minutes before the limit, the trainer saves a full checkpoint at the next optimiser step (including the steps already done in the current epoch) and exits, and a pre-submitted successor job resumes from it without double-counting an epoch.
+The main run took \TBDtrainwall\ hours of wall-clock time on one H100.
+
+\subsection{Shuffled-action control}
+To separate the effect of \emph{true} actions from that of an architecture that merely has an action input, we train a second denoiser with identical architecture, data and schedule, in which each training episode receives the action sequence of a different training episode (a seeded permutation that prefers a shift across demos, cropped or tiled to length).
+This keeps the marginal and temporal statistics of the actions and breaks the correspondence with the frames.
+The test split keeps its true actions.
+A model that merely memorises action statistics would do equally well as v2 in H1; a model that uses the actions would not.

@@ -1,1 +1,22 @@
-% TODO(#37): related
+\section{Related Work}
+\label{sec:related}
+\paragraph{Diffusion world models.}
+DIAMOND~\cite{alonso2024diamond} trains a diffusion model, in the EDM formulation~\cite{karras2022edm}, to predict the next observation from a short history of frames and actions.
+It was introduced as a world model for reinforcement learning on Atari and was also applied to Counter-Strike: Global Offensive.
+We use its denoiser--upsampler architecture and training code (\cref{sec:method}).
+GameNGen~\cite{valevski2025gamengen} simulates Doom with a diffusion model that is conditioned on past frames and actions; its training data was recorded from reinforcement-learning agents, which like our bots provide paired data without human effort.
+Oasis~\cite{oasis2024} and MineWorld~\cite{guo2025mineworld} are real-time interactive world models for Minecraft, the latter a visual--action autoregressive transformer.
+Genie~\cite{bruce2024genie} learns a playable model from videos \emph{without} action labels by inferring latent actions.
+We differ in scale and in where the labels come from: we simulate a game that exposes its state, so the actions are not learned.
+
+\paragraph{Counter-Strike data and behavioural cloning.}
+Pearce and Zhu~\cite{pearce2021counterstrike} collected Counter-Strike: Global Offensive deathmatch frames together with human keyboard and mouse input and trained an agent by behavioural cloning.
+Their action encoding (keys, clicks, and binned mouse deltas) is the 51-dimensional layout that DIAMOND's CS:GO model and our v2 model use.
+Our data differs in two ways: it is for CS2, and the actions are reconstructed from state because the demo format gives no reliable input stream (\cref{sec:data}).
+
+\paragraph{Inverse dynamics and action labelling.}
+When videos have no action labels, a common approach is to learn them.
+VPT~\cite{baker2022vpt} trains an inverse-dynamics model (IDM) on a small labelled set and uses it to label a large corpus of Minecraft videos; Genie~\cite{bruce2024genie} learns latent actions without any labels.
+Our labels are instead computed by deterministic rules from game state, which is possible only because the data is generated in the engine.
+The rules make every label auditable, at the cost of the systematic errors that we measure and list in \cref{sec:limits}.
+A learned IDM is a natural complement and is part of our future work.

@@ -1,1 +1,16 @@
-% TODO(#37): abstract
+\begin{abstract}
+Diffusion world models can simulate a game from pixels, but a model that ignores its inputs is a video generator, not a game.
+Our first attempt, v1, trained DIAMOND~\cite{alonso2024diamond} on about 5.7 hours of YouTube Counter-Strike~2 footage.
+Every action label in that data was zero, so the resulting model could not be controlled.
+We present v2, which generates its own paired data.
+Bots play offline deathmatches on one map; the demos are re-rendered in first person at 16\,fps with HLAE, without a HUD;
+and a 51-dimensional action is derived for every frame from the spectated player's state rather than from raw buttons.
+This yields \TBDhours hours of frames with exactly aligned actions.
+We retrain DIAMOND's denoiser on this data and reuse the v1 upsampler unchanged.
+We test two hypotheses.
+H1: the generated camera follows the commanded mouse motion.
+With scripted inputs and a phase-correlation estimate of ego-rotation, v2 reaches a yaw correlation of \TBDhOneRvTwo,
+against \TBDhOneRvOne for the zero-action v1 model and \TBDhOneRshuf for a control trained on shuffled actions.
+H2: CS2's volumetric smoke is harder to model than static geometry, which we measure with LPIPS and SSIM inside projected smoke masks.
+We also report the loss, FID and rollout metrics carried over from v1, and the frame rate of an interactive play loop.
+\end{abstract}
