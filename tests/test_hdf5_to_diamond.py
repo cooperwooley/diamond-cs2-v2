@@ -358,6 +358,12 @@ def test_dataset_stats_values(stats_mod, stats_ds, tmp_path, capsys) -> None:
     assert total["length_hist"]["counts"][0] == 6 and sum(total["length_hist"]["counts"]) == 6
 
 
+def test_dataset_stats_figure(stats_mod, stats_ds, tmp_path) -> None:
+    fig = tmp_path / "stats.png"
+    assert stats_mod.main([str(stats_ds), "--figure", str(fig)]) == 0
+    assert fig.read_bytes().startswith(b"\x89PNG")
+
+
 def test_dataset_stats_cli_errors(stats_mod, tmp_path) -> None:
     with pytest.raises(SystemExit):
         stats_mod.main([])
