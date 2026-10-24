@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import re
+import shlex
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -13,7 +15,11 @@ DEFAULT_CONFIG_PATH: Path = Path(__file__).resolve().parent.parent / "config" / 
 
 
 # Sections that change labels or stored data. ``paths`` is machine-specific and ``supervisor`` holds the secret ntfy topic.
-_HASHED_SECTIONS = ("timing", "resolution", "episodes", "actions", "qa", "segment", "pack", "render")
+_HASHED_SECTIONS = ("timing", "resolution", "episodes", "actions", "qa", "segment", "pack")
+# Only the render keys that change the pixels or the camera are hashed; poll_s, launch_options, paths, ... are not.
+_HASHED_RENDER_KEYS = ("tick_offset", "output_format", "spec_mode", "spec_player_field")
+# Names that end up in file names and console commands (demo ids, the mirv_streams stream name).
+SAFE_NAME_RE = re.compile(r"^[\w.\-]+$")
 
 
 class ConfigError(ValueError):
@@ -43,6 +49,24 @@ def load_config(path: str | Path | None = None, overrides: Sequence[str] = ()) -
 
 _UNSAFE_OPTIONS = ("-secure", "connect")
 _UNSAFE_PREFIXES = ("+connect", "-connect")
+
+
+def split_command_line(text: str) -> list[str]:
+    """Split a command line into tokens, keeping quoted arguments (and their quotes) as one token.
+
+    ``shlex`` in non-POSIX mode leaves backslashes alone, so Windows paths survive and a quoted path that happens to
+    contain ``-insecure`` stays a single token instead of producing a fake flag.
+
+    Args:
+        text: A command line such as ``-steam +playdemo "C:\\a b\\x.dem"``.
+
+    Returns:
+        The tokens.
+
+    Raises:
+        ValueError: On unbalanced quotes.
+    """
+    return shlex.split(text, posix=False)
 
 
 def launch_option_problem(options: Sequence[str]) -> str | None:
@@ -160,9 +184,15 @@ def validate_config(cfg: DictConfig) -> None:
     if cfg.actions.mouse.deg_per_unit <= 0:
         problems.append(f"actions.mouse.deg_per_unit must be > 0, got {cfg.actions.mouse.deg_per_unit}")
 
-    problem = launch_option_problem([str(o) for o in cfg.generate.launch_options])
-    if problem:
-        problems.append(f"generate.launch_options: {problem}")
+    for section in ("generate", "render"):
+        try:
+            options = [t for o in cfg[section].launch_options for t in split_command_line(str(o))]
+        except ValueError as exc:
+            problems.append(f"{section}.launch_options: {exc}")
+            continue
+        problem = launch_option_problem(options)
+        if problem:
+            problems.append(f"{section}.launch_options: {problem}")
     _check_generate(cfg.generate, problems)
 
     for key, value in cfg.qa.items():
@@ -172,11 +202,33 @@ def validate_config(cfg: DictConfig) -> None:
     if cfg.qa.max_fill_ticks < 0:
         problems.append(f"qa.max_fill_ticks must be >= 0, got {cfg.qa.max_fill_ticks}")
 
+    _validate_render(cfg, problems)
+
     if "default" not in cfg.actions.slots:
         problems.append("actions.slots.default is missing")
 
     if problems:
         raise ConfigError("invalid cs2wm config:\n  - " + "\n  - ".join(problems))
+
+
+def _validate_render(cfg: DictConfig, problems: list[str]) -> None:
+    """Append problems with the ``render`` section."""
+    r = cfg.render
+    if not SAFE_NAME_RE.match(str(r.stream_name)):
+        problems.append(f"render.stream_name may only hold letters, digits, '_', '.' and '-', got {r.stream_name!r}")
+    if r.output_format not in ("tga", "ffmpeg"):
+        problems.append(f"render.output_format must be 'tga' or 'ffmpeg', got {r.output_format!r}")
+    if r.spec_player_field not in ("entity_id", "user_id", "slot", "name"):
+        problems.append(
+            f"render.spec_player_field must be entity_id, user_id, slot or name, got {r.spec_player_field!r}"
+        )
+    for key in ("timeout_factor", "poll_s", "quit_delay_ticks"):
+        if r[key] <= 0:
+            problems.append(f"render.{key} must be > 0, got {r[key]}")
+    if r.startup_s < 0 or r.retries < 0:
+        problems.append(f"render.startup_s and render.retries must be >= 0, got {r.startup_s} and {r.retries}")
+    if not 0 <= r.png_compression <= 9:
+        problems.append(f"render.png_compression must be in [0, 9], got {r.png_compression}")
 
 
 def ticks_per_frame(cfg: DictConfig) -> int:
@@ -194,7 +246,8 @@ def ticks_per_frame(cfg: DictConfig) -> int:
 def config_sha256(cfg: DictConfig) -> str:
     """Hash the label-affecting config sections, for HDF5 attrs and demo sidecars.
 
-    ``paths`` (machine-specific) and ``supervisor`` (secret ntfy topic) are excluded on purpose.
+    ``paths`` (machine-specific), ``supervisor`` (secret ntfy topic), ``generate`` and the machine-local ``render``
+    keys (timeouts, launch options, HLAE paths, PNG level) are excluded on purpose.
 
     Args:
         cfg: A resolved config.
@@ -202,5 +255,8 @@ def config_sha256(cfg: DictConfig) -> str:
     Returns:
         Hex sha256 of the sorted-key YAML dump of ``_HASHED_SECTIONS``.
     """
-    subset = OmegaConf.create({name: cfg[name] for name in _HASHED_SECTIONS})
+    render = {key: cfg.render[key] for key in _HASHED_RENDER_KEYS}
+    if cfg.render.output_format == "ffmpeg":
+        render["ffmpeg_preset"] = cfg.render.ffmpeg_preset  # the codec changes the pixels; unused for tga
+    subset = OmegaConf.create({**{name: cfg[name] for name in _HASHED_SECTIONS}, "render": render})
     return hashlib.sha256(OmegaConf.to_yaml(subset, sort_keys=True).encode()).hexdigest()
