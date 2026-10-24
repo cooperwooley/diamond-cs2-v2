@@ -126,6 +126,22 @@ def build_parser() -> argparse.ArgumentParser:
     q = ev.add_parser("h2", help="volumetric smoke (#33)")
     q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=...")
     q.add_argument("--seed", type=int, default=0)
+    q.add_argument("--data", required=True, type=Path, help="directory of held-out full-res (150x280) smoke episodes")
+    q.add_argument("--split-json", type=Path, default=None, help="split.json (demo -> split); keep only test demos")
+    q.add_argument("--demos", type=Path, default=None, help="directory of .dem files (default: paths.demos)")
+    q.add_argument(
+        "--upsampler-ckpt",
+        type=Path,
+        default=None,
+        help="v1 checkpoint providing the upsampler for non-v1 models (default: the model named v1)",
+    )
+    q.add_argument("--v1-name", default="v1", help="name of the model that uses its own upsampler (default: v1)")
+    q.add_argument("--out", type=Path, default=Path("results/h2"))
+    q.add_argument("--device", default=None, help="torch device (default: cuda if available)")
+    q.add_argument("--batch-size", type=int, default=16, help="rollouts per batched forward pass")
+    q.add_argument("--rollout-steps", type=int, default=16, help="frames per rollout")
+    q.add_argument("--n-validate", type=int, default=20, help="mask overlay PNGs to write")
+    q.add_argument("--contexts", type=int, default=None, help="held-out contexts (default: eval.h2.contexts)")
     q = ev.add_parser("carried", help="carried-over v1 evals: loss curves, rollouts, FID (#34)")
     q.add_argument("--models", nargs="+", required=True, metavar="NAME=CKPT", help="e.g. v2=... v1=...")
     q.add_argument("--v2-metrics", type=Path, default=None, help="v2 metrics.jsonl")
@@ -269,7 +285,22 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
     elif sub == "h2":
         from cs2wm.eval import h2_smoke
 
-        h2_smoke.run_h2(_parse_models(args.models), _cfg(args), Path("results/h2"), args.seed)
+        h2_smoke.run_h2(
+            _parse_models(args.models),
+            _cfg(args),
+            args.out,
+            args.seed,
+            data_dir=args.data,
+            split_json=args.split_json,
+            demos_dir=args.demos,
+            upsampler_ckpt=args.upsampler_ckpt,
+            device=args.device,
+            batch_size=args.batch_size,
+            rollout_steps=args.rollout_steps,
+            n_validate=args.n_validate,
+            contexts=args.contexts,
+            v1_name=args.v1_name,
+        )
     elif sub == "carried":
         from cs2wm.eval import fid, loss_curve, rollouts
 

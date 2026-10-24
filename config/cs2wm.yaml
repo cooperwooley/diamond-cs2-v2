@@ -133,3 +133,15 @@ eval:
   h2:
     smoke_radius_units: 144
     mask_dilate_px: 2
+    max_los_units: 800     # a smoke counts only if its centre is within this distance of the view axis (line of sight)
+    viewmodel_box: [0.3, 0.55, 0.9, 1.0]  # x0, y0, x1, y1 as fractions of W/H: the weapon, left out of the static mask
+    enemy_max_dist_units: 2500  # an enemy inside the frustum within this distance disqualifies a frame as static
+    enemy_margin_px: 10    # enemy projections this far outside the frame still count as in view
+    eye_height_stand: 64   # CONFIRM(#14): eye height above the pawn origin when standing / fully ducked, used when the
+    eye_height_crouch: 46  #   tick table has no view-offset column
+    view_offset_prop: null # CONFIRM(#14): demoparser2 prop with the eye height above the origin (null: use duck_amount)
+    min_region_px: 50      # frames with fewer pixels in a region are left out of that region's metrics
+    min_smoke_frames: 4    # a context qualifies when this many of its predicted frames have a smoke in view
+    contexts: 100          # held-out contexts (4 GT frames + rollout_steps predicted frames) per model
+    examples: 6            # triptych rows per model
+    bootstrap: 1000        # resamples for the 95% CIs
