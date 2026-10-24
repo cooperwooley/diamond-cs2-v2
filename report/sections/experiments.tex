@@ -58,7 +58,7 @@ A smoke mask is built for every frame from the smoke events (detonation to expir
 The smoke volume is a sphere of radius 144 units that is projected to an image ellipse and dilated by 2 pixels.
 The static mask is the complement of all smoke masks, minus a box around the viewmodel, restricted to frames in which no enemy is in the view frustum.
 We compute LPIPS (AlexNet) and SSIM within each mask for teacher-forced single-step predictions and for 16-step autoregressive rollouts, with bootstrap intervals.
-\Cref{tab:h2} gives the result; for v2, the LPIPS is \TBDhTwoSmoke\ inside smoke and \TBDhTwoStatic\ on static geometry.
+\Cref{tab:h2} gives the result; for v2, the \TBDhTwoCondition LPIPS is \TBDhTwoSmoke\ inside smoke and \TBDhTwoStatic\ on static geometry.
 Examples are in \cref{fig:h2}.
 
 \begin{table}[t]
@@ -117,7 +117,7 @@ The play loop turns keyboard and mouse input into the same 51-dimensional action
 Mouse motion is accumulated over each frame and converted to degrees by $0.022\times$ sensitivity before binning.
 (DIAMOND's loop keeps only the last motion event of a frame, which undercounts fast turns.)
 It starts from four real frames and actions of a held-out episode.
-\Cref{tab:fps} reports frames per second on an RTX 3060 for one and three denoising steps, fp32 and bf16, with and without the upsampler; the headline configuration runs at \TBDfps\,fps.
+\Cref{tab:fps} reports frames per second on an \TBDfpsgpu for one and three denoising steps, fp32 and bf16, with and without the upsampler; the headline configuration runs at \TBDfps\,fps.
 
 \begin{table}[t]
   \centering\small
