@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -146,7 +147,15 @@ def _dispatch(args: argparse.Namespace) -> None:
     elif cmd == "sync":
         from cs2wm.pipeline import sync
 
-        sync.run(_cfg(args))
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        try:
+            ok = sync.run(_cfg(args)).ok
+        except sync.SyncError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if not ok:
+            print("error: sync finished with errors, see the log above", file=sys.stderr)
+            raise SystemExit(1)
     elif cmd == "supervise":
         from cs2wm.pipeline.supervisor import PipelineState, Supervisor
 
