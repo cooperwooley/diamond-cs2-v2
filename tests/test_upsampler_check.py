@@ -302,7 +302,7 @@ def test_cli_exit_code_2_when_incomplete(monkeypatch) -> None:
     monkeypatch.setattr(uc, "run_upsampler_check", lambda *a, **k: {"verdict": {"passed": None}})
     with pytest.raises(SystemExit) as exc:
         cli.main(["eval", "upsampler", "--ckpt", "c.pt", "--fullres", "f"])
-    assert exc.value.code == 2
+    assert exc.value.code == 3
 
 
 # --- grid, notes, references -------------------------------------------------------------------------------------

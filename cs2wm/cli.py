@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev = p.add_subparsers(dest="eval_cmd", required=True, metavar="<experiment>")
     q = ev.add_parser(
         "upsampler",
-        help="v1 upsampler compatibility check (#27); exit code 0 = PASS, 1 = FAIL, 2 = INCOMPLETE (no --v1-fullres)",
+        help="v1 upsampler compatibility check (#27); exit code 0 = PASS, 1 = FAIL, 3 = INCOMPLETE (no --v1-fullres; 2 means not implemented)",
     )
     q.add_argument("--ckpt", required=True, type=Path)
     q.add_argument("--fullres", required=True, type=Path, help="v2 hdf5_fullres directory")
@@ -233,7 +233,7 @@ def _dispatch_eval(args: argparse.Namespace) -> None:
         )
         passed = report["verdict"]["passed"]
         if passed is not True:
-            sys.exit(2 if passed is None else 1)  # 0 = PASS, 1 = FAIL, 2 = INCOMPLETE
+            sys.exit(3 if passed is None else 1)  # 0 = PASS, 1 = FAIL, 3 = INCOMPLETE
     elif sub == "h1":
         from cs2wm.eval import h1_controllability
 
