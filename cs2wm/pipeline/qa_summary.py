@@ -107,7 +107,7 @@ def summarize(
     for path in sorted(Path(cfg.paths.qa).glob("*.jsonl")):
         if since_s is not None and now - path.stat().st_mtime > since_s:
             continue
-        summary.demos += 1
+        contributed = False
         with open(path, encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
@@ -121,6 +121,7 @@ def summarize(
                     continue
                 if kind is not None and rec_kind != kind:
                     continue
+                contributed = True
                 k = summary.kinds.setdefault(rec_kind, KindSummary())
                 k.episodes += 1
                 k.frames += frames
@@ -129,6 +130,7 @@ def summarize(
                     k.passed_frames += frames
                 for reason in reasons:
                     k.failures[reason.split()[0]] += 1
+        summary.demos += contributed
     return summary
 
 
@@ -147,6 +149,7 @@ def format_summary(summary: QASummary, fps: float) -> str:
     verdict = "OK" if summary.drop_rate < DROP_RATE_LIMIT else "ABOVE LIMIT, explain with the reasons above"
     lines.append(f"  passing hours (all kinds): {total_h:.3f}")
     lines.append(f"  drop rate: {summary.drop_rate:.1%} (limit < {DROP_RATE_LIMIT:.0%}): {verdict}")
+    lines.append("  note: a QA file is a per-demo snapshot, rewritten when the demo is extracted again")
     if summary.bad_lines:
         lines.append(f"  skipped {summary.bad_lines} unreadable QA line(s)")
     return "\n".join(lines)

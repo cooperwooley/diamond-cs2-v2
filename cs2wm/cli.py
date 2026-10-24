@@ -161,9 +161,30 @@ def _setup_logging(cfg: DictConfig) -> None:
 
 def _supervisor(cfg: DictConfig):
     """A supervisor over ``state/pipeline.json``."""
-    from cs2wm.pipeline.supervisor import PipelineState, Supervisor
+    from cs2wm.pipeline.supervisor import PipelineState, StateError, Supervisor
 
-    return Supervisor(cfg, PipelineState.load(Path(cfg.paths.state) / "pipeline.json"))
+    try:
+        return Supervisor(cfg, PipelineState.load(Path(cfg.paths.state) / "pipeline.json"))
+    except StateError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+
+def _refuse_if_past(sup, stage: str, demo_id: str) -> None:
+    """Refuse an explicit re-run of a stage the demo is already past when the stage's inputs are gone.
+
+    Running it would fail and overwrite a good state (``synced``, ``packed``, ...) with ``failed``.
+    """
+    from cs2wm.pipeline.supervisor import _OUTPUT_STATE, STAGES
+
+    order = [s.value for s in dict.fromkeys([*_OUTPUT_STATE.values()])]
+    rec = sup.state.demos.get(demo_id)
+    if rec is None or rec["state"] not in order:
+        return
+    if order.index(rec["state"]) >= order.index(_OUTPUT_STATE[stage].value) and not sup.inputs_present(stage, demo_id):
+        raise SystemExit(
+            f"{stage}: {demo_id} is already {rec['state']} and the inputs of {stage} are gone (of {STAGES}); "
+            "refusing to re-run, the state is untouched"
+        )
 
 
 def _run_stage_cmd(stage: str, args: argparse.Namespace, **options: str | None) -> int:
@@ -184,14 +205,17 @@ def _run_stage_cmd(stage: str, args: argparse.Namespace, **options: str | None) 
     elif args.demo:
         path = _resolve_demo(args.demo, cfg)
         ids = [path.stem]
+        sup.explicit_paths[path.stem] = path
+        _refuse_if_past(sup, stage, path.stem)
         if path.stem not in sup.state.demos:
             sup.state.mark(
                 path.stem, "pending", **({"kind": path.parent.name} if path.parent.name in cfg.episodes.kinds else {})
             )
-        sup.explicit_paths[path.stem] = path
     else:
         raise SystemExit(f"{stage}: give a demo id or a path to a .dem file, or --all-pending")
     report = sup.run_stage(stage, ids, **options)
+    for demo_id, output in report.outputs.items():
+        print(f"{stage} {demo_id}: {output}")
     print(f"{stage}: {len(report.done)} done, {len(report.failed)} failed, {len(ids)} considered")
     for demo_id, reason in report.failed.items():
         print(f"  FAILED {demo_id}: {reason}", file=sys.stderr)

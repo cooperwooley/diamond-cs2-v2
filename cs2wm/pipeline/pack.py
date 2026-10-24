@@ -30,7 +30,7 @@ from torchvision.transforms import functional as TF
 from cs2wm import demo
 from cs2wm.actions import ACTION_DIM
 from cs2wm.config import config_sha256
-from cs2wm.pipeline.extract_actions import labels_dir, read_qa
+from cs2wm.pipeline.extract_actions import labels_dir, read_qa, sweep_deleting
 from cs2wm.pipeline.generate import _git_sha
 from cs2wm.pipeline.segment import episodes_from_plan, read_render_plan
 
@@ -422,23 +422,111 @@ def _sidecar(cfg: DictConfig, kind: str, demo_id: str) -> dict[str, Any]:
         return {}
 
 
-def _check_sliced(result: PackResult, labels: np.ndarray) -> None:
-    """Re-read what was written and require the stored actions to equal the labels frame by frame."""
+def _check_roundtrip(result: PackResult, labels: np.ndarray) -> None:
+    """Re-read what was written and require the stored actions to equal the labels (a write/read round trip)."""
     for path in (result.low_res_path, result.fullres_path):
         if path is None:
             continue
         _, actions, attrs = read_episode(path)
         if int(attrs["n_frames"]) != len(labels) or not np.array_equal(actions, labels):
-            raise PackError(f"{path.name}: stored actions differ from the labels (frame/label misalignment)")
+            raise PackError(f"{path.name}: stored actions differ from the labels (write/read round trip)")
+
+
+def _check_frame_alignment(result: PackResult, seg_dir: Path, first: int, n: int, size: tuple[int, int]) -> None:
+    """Spot check that the stored first and last frames are source frames ``first`` and ``first + n - 1``.
+
+    The source PNGs are read again from disk by index, independently of the slicing in ``run``. Low-res must equal
+    ``to_low_res`` of the source; full-res (JPEG) must equal the source encoded and decoded with the same quality.
+    """
+    ends = (0, n - 1)
+    src = np.stack([_read_frames(seg_dir, first + i, 1, size)[0] for i in ends])
+    for path, expected in ((result.low_res_path, None), (result.fullres_path, "jpeg")):
+        if path is None:
+            continue
+        frames, _, attrs = read_episode(path)
+        if expected is None:
+            want = to_low_res(src, (frames.shape[1], frames.shape[2]))
+        else:
+            quality = int(attrs["jpeg_quality"])
+            want = np.stack([cv2.imdecode(_encode_jpeg(f, quality), cv2.IMREAD_COLOR) for f in src])
+        if not np.array_equal(frames[list(ends)], want):
+            raise PackError(
+                f"{path.name}: stored frames 0 and {n - 1} are not source frames {first} and {first + n - 1}"
+            )
+
+
+def sweep_leftovers(cfg: DictConfig, demo_id: str) -> None:
+    """Remove ``*.staging`` / ``*.old`` output dirs of an interrupted pack (``*.deleting`` is handled by extract)."""
+    for tree in (cfg.paths.hdf5, cfg.paths.hdf5_fullres):
+        for suffix in (".staging", ".old"):
+            for path in Path(tree).glob(f"*/{demo_id}{suffix}"):
+                shutil.rmtree(path, ignore_errors=True)
+
+
+def _swap_in(staging: Path, final: Path) -> None:
+    """Replace ``final`` by ``staging``: rename the old aside, rename staging into place, delete the old."""
+    old = final.with_name(final.name + ".old")
+    shutil.rmtree(old, ignore_errors=True)
+    if final.exists():
+        os.replace(final, old)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staging, final)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def _done_results(cfg: DictConfig, demo_id: str, kind: str, expected: set[str]) -> list[PackResult] | None:
+    """Results rebuilt from ``manifest.jsonl`` if it lists every expected episode and every file matches its sha256."""
+    out, full = Path(cfg.paths.hdf5) / kind / demo_id, Path(cfg.paths.hdf5_fullres) / kind / demo_id
+    try:
+        with open(out / "manifest.jsonl", encoding="utf-8") as f:
+            records = [json.loads(line) for line in f if line.strip()]
+        by_file = {r["file"]: r for r in records}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if {Path(name).name.removesuffix(".hdf5") for name in by_file} != expected:
+        return None
+    results = []
+    for ep_id in sorted(expected):
+        low = by_file.get(f"{ep_id}.hdf5")
+        if low is None:
+            return None
+        sha = {}
+        paths: dict[str, Path] = {}
+        for name, path in ((f"{ep_id}.hdf5", out / f"{ep_id}.hdf5"), (f"fullres/{ep_id}.hdf5", full / f"{ep_id}.hdf5")):
+            rec = by_file.get(name)
+            if rec is None:
+                continue
+            if not path.is_file() or sha256_file(path) != rec["sha256"]:
+                return None
+            sha[name], paths[name] = rec["sha256"], path
+        results.append(PackResult(paths[f"{ep_id}.hdf5"], paths.get(f"fullres/{ep_id}.hdf5"), int(low["frames"]), sha))
+    return results
 
 
 def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
     """CLI stage: pack every QA-passing episode of a demo, then delete its rendered frames and labels.
 
     Reads ``qa/<demo_id>.jsonl`` (written by extract), the render plan and ``frames/<demo_id>/render.json``. Per
-    passing episode the first ``n`` of its ``n + 1`` rendered frames go into the file with the ``n`` labels. After each
-    write the episode is read back and its actions must equal the labels. The demo's ``manifest.jsonl`` is rewritten
-    once, after every episode succeeded; if one fails, the files of this run are removed and nothing is deleted.
+    passing episode the first ``n`` of its ``n + 1`` rendered frames go into the file with the ``n`` labels.
+
+    Safety:
+
+    * Episodes are written into ``<demo_id>.staging`` directories next to the final ones and checked there: the
+      stored actions must equal the labels, and stored frames 0 and ``n - 1`` must be source frames ``first`` and
+      ``first + n - 1``. Only when every episode succeeded are the staging dirs swapped in (the old dir is renamed
+      aside, staging renamed into place, the old removed; the manifest is part of the swapped low-res dir, so that
+      rename is the commit point). On any failure only the staging dirs are deleted and an earlier complete output
+      stays as it was.
+    * Idempotent: if the demo's ``manifest.jsonl`` already lists exactly the passing episodes and every file matches
+      its sha256, the work is done. The call then returns those results even when ``frames/`` or ``render.json``
+      is gone (a kill between the manifest write and the cleanup) and finishes the cleanup.
+    * Cleanup renames ``frames/<id>`` to ``frames/<id>.deleting`` before deleting it, so a partial delete is
+      recognisable; render and extract sweep such dirs.
+
+    Provenance meta: ``cs2_build`` is the Steam ``buildid`` from ``appmanifest_730.acf``. The sidecar value (the build
+    that recorded the demo) wins over the plan's (the build installed when planning); a warning is logged when they
+    differ or when neither is known (an empty string is stored then). ``demoparser2_version`` comes from the plan,
+    ``cs2wm_git_sha`` from the sidecar (else the current commit).
 
     Args:
         demo_id: Demo id.
@@ -451,30 +539,66 @@ def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
         FileNotFoundError: If the plan, ``render.json``, the QA file, a frame or a label file is missing.
         ValueError: If ``render.json`` was made from a different plan, or an episode is missing from the QA file or
             from ``render.json``.
-        PackError: If the read-back actions differ from the labels.
+        PackError: If a stored action or frame does not match what should have been written.
     """
     plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
     plan_sha = sha256_file(plan_path)
     plan = read_render_plan(plan_path)
     frames_root = Path(cfg.paths.frames) / demo_id
+    qa = read_qa(cfg, demo_id)
+    episodes = episodes_from_plan(plan)
+    sweep_leftovers(cfg, demo_id)
+    sweep_deleting(cfg, demo_id)
+
+    passing = [ep for ep in episodes if qa.get(ep.episode_id, {}).get("passed")]
+    kinds = sorted({ep.kind for ep in episodes})
+    done: list[PackResult] | None = []
+    for kind in kinds:
+        expected = {ep.episode_id for ep in passing if ep.kind == kind}
+        if not expected:
+            continue
+        part = _done_results(cfg, demo_id, kind, expected)
+        if part is None:
+            done = None
+            break
+        done += part
+    if done is not None and not passing and (frames_root / "render.json").is_file():
+        done = None  # nothing passes QA, but the inputs are still there: run, so stale output is cleared
+    if done is not None:
+        _cleanup(cfg, demo_id)
+        log.info("%s: already packed (%d episode(s)); cleaned up", demo_id, len(done))
+        return done
+
     with open(frames_root / "render.json", encoding="utf-8") as f:
         rendered = json.load(f)
     if rendered.get("plan_sha256") != plan_sha:
         raise ValueError(f"{demo_id}: render.json was made from a different plan than {plan_path}; re-run render")
-    qa = read_qa(cfg, demo_id)
     where = {e["episode_id"]: (seg["dir"], e["first_frame"]) for seg in rendered["segments"] for e in seg["episodes"]}
     size = (int(cfg.resolution.render[0]), int(cfg.resolution.render[1]))
-    episodes = episodes_from_plan(plan)
     sidecar = _sidecar(cfg, episodes[0].kind, demo_id) if episodes else {}
+    build, planned = sidecar.get("cs2_build"), plan.get("cs2_build")
+    if build is not None and planned is not None and build != planned:
+        log.warning(
+            "%s: demo was recorded on CS2 build %s but planned on build %s; storing %s", demo_id, build, planned, build
+        )
+    build = build if build is not None else planned
+    if build is None:
+        log.warning("%s: cs2_build is unknown (no sidecar value and no plan value); storing an empty string", demo_id)
     provenance = {
-        "cs2_build": plan.get("cs2_build") or sidecar.get("cs2_build"),
+        "cs2_build": build,
         "demoparser2_version": plan.get("parser_version") or demo.parser_version(),
         "cs2wm_git_sha": sidecar.get("cs2wm_git_sha") or _git_sha(),
     }
 
+    staging = {  # kind -> (low-res staging dir, full-res staging dir)
+        k: (
+            Path(cfg.paths.hdf5) / k / f"{demo_id}.staging",
+            Path(cfg.paths.hdf5_fullres) / k / f"{demo_id}.staging",
+        )
+        for k in kinds
+    }
     results: list[PackResult] = []
     records: dict[str, list[dict[str, Any]]] = {}  # kind -> manifest records
-    written: list[Path] = []
     try:
         for ep in episodes:
             if ep.episode_id not in qa:
@@ -495,26 +619,55 @@ def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
                 "start_tick": ep.start_tick,
                 **provenance,
             }
-            out = Path(cfg.paths.hdf5) / ep.kind / demo_id
-            full = Path(cfg.paths.hdf5_fullres) / ep.kind / demo_id
+            out, full = staging[ep.kind]
             result = write_episode(frames, labels, meta, out, cfg, fullres_dir=full)
-            written += [p for p in (result.low_res_path, result.fullres_path) if p is not None]
-            _check_sliced(result, labels)
+            _check_roundtrip(result, labels)
+            _check_frame_alignment(result, frames_root / seg_dir, int(first), ep.n_frames, size)
             results.append(result)
             for name, sha in result.sha256.items():
                 records.setdefault(ep.kind, []).append({"file": name, "frames": result.n_frames, "sha256": sha})
+        for kind in kinds:
+            if kind in records:
+                write_manifest(staging[kind][0] / "manifest.jsonl", records[kind])
     except BaseException:
-        for path in written:
-            path.unlink(missing_ok=True)
+        for out, full in staging.values():
+            shutil.rmtree(out, ignore_errors=True)
+            shutil.rmtree(full, ignore_errors=True)
         raise
 
-    for kind in {ep.kind for ep in episodes}:
-        manifest = Path(cfg.paths.hdf5) / kind / demo_id / "manifest.jsonl"
-        if kind in records:
-            write_manifest(manifest, records[kind])
+    # Commit: full-res first, then the low-res dir with its manifest (the rename that sync and verify look for).
+    final: list[PackResult] = []
+    for kind in kinds:
+        out, full = staging[kind]
+        final_out, final_full = Path(cfg.paths.hdf5) / kind / demo_id, Path(cfg.paths.hdf5_fullres) / kind / demo_id
+        if kind not in records:  # nothing passes QA now; do not leave an earlier run's output behind
+            shutil.rmtree(final_out, ignore_errors=True)
+            shutil.rmtree(final_full, ignore_errors=True)
+            continue
+        if full.exists():
+            _swap_in(full, final_full)
         else:
-            manifest.unlink(missing_ok=True)  # nothing passes QA now; do not leave an earlier run's records behind
-    shutil.rmtree(frames_root)
+            shutil.rmtree(final_full, ignore_errors=True)
+        _swap_in(out, final_out)
+    for r in results:
+        # The files were written under <demo_id>.staging; they now live in <demo_id>.
+        def moved(path: Path) -> Path:
+            return path.parent.with_name(path.parent.name.removesuffix(".staging")) / path.name
+
+        final.append(
+            PackResult(moved(r.low_res_path), moved(r.fullres_path) if r.fullres_path else None, r.n_frames, r.sha256)
+        )
+    _cleanup(cfg, demo_id)
+    log.info("%s: packed %d episode(s), %d frames", demo_id, len(final), sum(r.n_frames for r in final))
+    return final
+
+
+def _cleanup(cfg: DictConfig, demo_id: str) -> None:
+    """Delete ``frames/<id>`` and ``labels/<id>``; the frames are renamed to ``.deleting`` first."""
+    frames_root = Path(cfg.paths.frames) / demo_id
+    if frames_root.exists():
+        trash = frames_root.with_name(frames_root.name + ".deleting")
+        shutil.rmtree(trash, ignore_errors=True)
+        os.replace(frames_root, trash)
+        shutil.rmtree(trash)
     shutil.rmtree(labels_dir(cfg, demo_id), ignore_errors=True)
-    log.info("%s: packed %d episode(s), %d frames", demo_id, len(results), sum(r.n_frames for r in results))
-    return results

@@ -15,6 +15,7 @@ import enum
 import json
 import logging
 import os
+import shutil
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -60,6 +61,10 @@ _OUTPUT_STATE = {
 }
 
 
+class StateError(ValueError):
+    """The state file cannot be read; the message names the file and the backup to restore it from."""
+
+
 class StageFailure(RuntimeError):
     """A stage ran but did not produce its output (the message is recorded as the failure reason)."""
 
@@ -89,21 +94,23 @@ class PipelineState:
         """Load the state file (empty state if it does not exist).
 
         Raises:
-            ValueError: If the file is not a state file. Saves are atomic, so this means someone edited it.
+            StateError: If the file is corrupt, truncated or from another schema. Saves are atomic, so this means
+                it was edited or the disk failed; the previous state is kept in ``<name>.bak``.
         """
         path = Path(path)
+        hint = f"restore it from {path.name}.bak"
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return cls(path)
-        except ValueError as exc:
-            raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+        except (ValueError, OSError) as exc:
+            raise StateError(f"{path} is corrupt or unreadable ({exc}); {hint}") from exc
         if not isinstance(raw, dict) or raw.get("schema_version") != STATE_SCHEMA_VERSION:
-            raise ValueError(f"{path}: unsupported pipeline state schema")
+            raise StateError(f"{path} has an unsupported pipeline state schema; {hint}")
         return cls(path, dict(raw.get("demos", {})))
 
     def save(self) -> None:
-        """Write the state atomically (temp file + fsync + rename)."""
+        """Write the state atomically (temp file + fsync + rename), keeping the previous file as ``<name>.bak``."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
@@ -112,6 +119,8 @@ class PipelineState:
                 f.write("\n")
                 f.flush()
                 os.fsync(f.fileno())
+            if self.path.exists():
+                shutil.copyfile(self.path, self.path.with_name(self.path.name + ".bak"))
             os.replace(tmp, self.path)
         except BaseException:
             tmp.unlink(missing_ok=True)
@@ -205,10 +214,12 @@ class StageReport:
     Attributes:
         done: Demos that finished the stage.
         failed: Failed demos with their reasons.
+        outputs: Path written by each finished demo, for the stages that name one (segment: the plan).
     """
 
     done: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
+    outputs: dict[str, str] = field(default_factory=dict)
 
 
 class Supervisor:
@@ -237,6 +248,19 @@ class Supervisor:
             raise FileNotFoundError(f"demo {demo_id}: no {base}/*/{demo_id}.dem")
         return matches[0]
 
+    def inputs_present(self, stage: str, demo_id: str) -> bool:
+        """Whether the files ``stage`` reads for a demo still exist (the demo, the plan, ``render.json``)."""
+        plan = Path(self.cfg.paths.plans) / demo_id / "render_plan.json"
+        render_json = Path(self.cfg.paths.frames) / demo_id / "render.json"
+        if stage == "segment":
+            try:
+                return self.demo_path(demo_id).is_file()
+            except FileNotFoundError:
+                return False
+        if stage == "render":
+            return plan.is_file()
+        return plan.is_file() and render_json.is_file()
+
     def _stage_fn(self, stage: str, **options: Any) -> Callable[[str], dict[str, Any]]:
         """The function that runs one stage on one demo id and returns the info to record; raises on failure."""
         cfg = self.cfg
@@ -250,6 +274,7 @@ class Supervisor:
             if not totals["episodes"]:
                 raise StageFailure("the plan has no episodes (no life long enough to record)")
             return {
+                "_output": str(plan_path),
                 "demo_s": plan["demo_end_tick"] / plan["timing"]["tickrate"],
                 "episodes": totals["episodes"],
                 "frames_planned": totals["labeled_frames"],
@@ -309,6 +334,8 @@ class Supervisor:
                 report.failed[demo_id] = reason
             else:
                 wall = clock() - start
+                if "_output" in info:
+                    report.outputs[demo_id] = info.pop("_output")
                 self.state.mark(demo_id, _OUTPUT_STATE[stage], stage_wall_s=wall, **info)
                 log.info("%s %s: ok in %.1f s", stage, demo_id, wall)
                 report.done.append(demo_id)
@@ -320,7 +347,7 @@ class Supervisor:
 
         A demo that did not verify stays ``packed``, so the next sync retries it. A packed demo without any episode
         (none passed QA) has no manifest to verify; its demo and QA files travel with the push, so it is marked
-        synced once the pushes succeeded. The wall time of the whole sync is split evenly over the demos it marks.
+        synced once the pushes succeeded. The wall time of the whole sync is split over the demos it marks in proportion to their packed frames.
 
         Args:
             transport: Command builder/runner for ``sync.run`` (default: the real ssh/rsync).
@@ -343,11 +370,14 @@ class Supervisor:
             for d, rec in self.state.demos.items()
             if rec["state"] == "packed" and rec.get("packed_episodes") == 0 and not summary.push_errors
         ]
-        share = wall / max(len(done) + len(empty), 1)
+        marked = [d.demo_id for d in done] + empty
+        weight = {d: max(int(self.state.demos.get(d, {}).get("frames", 0)), 1) for d in marked}
         for res in done:
+            share = wall * weight[res.demo_id] / sum(weight.values())
             self.state.mark(res.demo_id, StageState.SYNCED, stage_wall_s=share, kind=res.kind)
             log.info("sync %s: ok in %.1f s (%d file(s) verified)", res.demo_id, share, res.verified)
         for demo_id in empty:
+            share = wall * weight[demo_id] / sum(weight.values())
             self.state.mark(demo_id, StageState.SYNCED, stage_wall_s=share)
             log.info("sync %s: ok in %.1f s (no episode passed QA; demo and QA pushed)", demo_id, share)
         self.state.save()
@@ -369,7 +399,8 @@ class Supervisor:
 
         One row per demo (id, kind, state, wall seconds of the last run of each stage, failure), then the demos per
         state, the QA-passing hours packed (frames / fps / 3600) and the wall time per stage per demo-hour (stage wall
-        time over the demo length, for the demos that have both).
+        time over the demo length, for the demos that have both). Demos currently ``failed`` are left out of the per-hour
+        figures, since their last timings are of attempts that did not produce output.
         """
         demos = self.state.demos
         header = ["demo", "kind", "state", *STAGES]
@@ -399,9 +430,9 @@ class Supervisor:
         lines.append(f"QA-passing hours packed: {packed / fps / 3600:.3f} ({packed} frames)")
         per_hour = []
         for stage in STAGES:
-            timed = [r for r in demos.values() if stage in r["stages"] and r.get("demo_s")]
+            timed = [r for r in demos.values() if r["state"] != "failed" and stage in r["stages"] and r.get("demo_s")]
             hours = sum(r["demo_s"] for r in timed) / 3600
             if hours > 0:
                 per_hour.append(f"{stage} {sum(r['stages'][stage]['wall_s'] for r in timed) / hours:.0f}")
-        lines.append("wall s per demo-hour: " + (", ".join(per_hour) if per_hour else "n/a"))
+        lines.append("wall s per demo-hour (failed demos excluded): " + (", ".join(per_hour) if per_hour else "n/a"))
         return "\n".join(lines)

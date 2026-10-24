@@ -11,7 +11,7 @@ import pytest
 
 from cs2wm.config import load_config
 from cs2wm.pipeline import qa_summary
-from cs2wm.pipeline.supervisor import PipelineState, StageFailure, StageState, Supervisor
+from cs2wm.pipeline.supervisor import PipelineState, StageFailure, StageState, StateError, Supervisor
 
 
 @pytest.fixture
@@ -61,17 +61,39 @@ def test_save_is_atomic(state: PipelineState, monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(OSError):
         state.save()
     assert state.path.read_text() == good  # the old file is intact
-    assert [p.name for p in state.path.parent.iterdir()] == ["pipeline.json"]  # and no temp file is left
+    assert sorted(p.name for p in state.path.parent.iterdir()) == ["pipeline.json", "pipeline.json.bak"]  # no temp file
 
 
 def test_load_rejects_a_corrupt_or_foreign_file(tmp_path: Path) -> None:
     bad = tmp_path / "p.json"
     bad.write_text("{not json")
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(StateError, match=r"p\.json is corrupt.*restore it from p\.json\.bak"):
         PipelineState.load(bad)
     bad.write_text('{"schema_version": 99}')
-    with pytest.raises(ValueError, match="schema"):
+    with pytest.raises(StateError, match="schema.*p\\.json\\.bak"):
         PipelineState.load(bad)
+
+
+def test_save_keeps_the_previous_state_as_bak(state: PipelineState) -> None:
+    state.mark("d1", StageState.PENDING)
+    state.save()
+    state.mark("d1", StageState.SEGMENTED)
+    state.save()
+    bak = PipelineState.load(state.path.with_name("pipeline.json.bak"))
+    assert bak.demos["d1"]["state"] == "pending" and PipelineState.load(state.path).demos["d1"]["state"] == "segmented"
+
+
+def test_cli_reports_a_corrupt_state_file_in_one_line(cfg, monkeypatch) -> None:
+    from cs2wm import cli
+
+    monkeypatch.setattr(cli, "_cfg", lambda args: cfg)
+    path = Path(cfg.paths.state) / "pipeline.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"schema_version": 1, "demos": {"a"')  # truncated
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["status"])
+    msg = str(exc.value)
+    assert "\n" not in msg and str(path) in msg and "pipeline.json.bak" in msg
 
 
 # --- transitions -------------------------------------------------------------------------------------------------
@@ -225,6 +247,19 @@ def test_run_sync_marks_only_fully_verified_demos(cfg, state: PipelineState, mon
     assert state.demos["ok"]["stages"]["sync"]["wall_s"] == 4.5  # 9 s shared by the two demos marked
 
 
+def test_run_sync_splits_wall_time_by_packed_frames(cfg, state: PipelineState, monkeypatch) -> None:
+    from cs2wm.pipeline import sync
+    from cs2wm.pipeline.sync import DemoResult, SyncSummary
+
+    summary = SyncSummary(demos=[DemoResult("a", "dm", True, 1, 1), DemoResult("b", "dm", True, 1, 1)])
+    monkeypatch.setattr(sync, "run", lambda cfg, transport=None: summary)
+    state.mark("a", StageState.PACKED, kind="dm", frames=3000, packed_episodes=1)
+    state.mark("b", StageState.PACKED, kind="dm", frames=1000, packed_episodes=1)
+    ticks = iter([0.0, 8.0])
+    Supervisor(cfg, state).run_sync(clock=lambda: next(ticks))
+    assert (state.demos["a"]["stages"]["sync"]["wall_s"], state.demos["b"]["stages"]["sync"]["wall_s"]) == (6.0, 2.0)
+
+
 def test_run_sync_does_not_mark_empty_demos_when_a_push_failed(cfg, state: PipelineState, monkeypatch) -> None:
     from cs2wm.pipeline import sync
     from cs2wm.pipeline.sync import SyncSummary
@@ -260,12 +295,21 @@ def test_status_table_rows_and_totals(cfg, state: PipelineState) -> None:
     assert "demos: 1 pending, 0 segmented, 0 rendered, 0 extracted, 1 packed, 1 synced, 1 failed (4 total)" in text
     assert "QA-passing hours packed: 1.000 (57600 frames)" in text
     # render: 2700 s over 1 demo-hour; segment: 18 s over 1 demo-hour; sync: only d1 timed (10 s over 0.5 h)
-    assert "wall s per demo-hour: segment 18, render 2700, extract 60, pack 120, sync 20" in text
+    assert (
+        "wall s per demo-hour (failed demos excluded): segment 18, render 2700, extract 60, pack 120, sync 20" in text
+    )
+
+
+def test_status_per_hour_figures_leave_out_failed_demos(cfg, state: PipelineState) -> None:
+    state.mark("ok", StageState.SEGMENTED, stage_wall_s=10, kind="dm", demo_s=3600)
+    state.mark("bad", StageState.SEGMENTED, stage_wall_s=1000, kind="dm", demo_s=3600)
+    state.mark("bad", "failed", "boom", 5.0, stage="render")
+    assert "segment 10" in Supervisor(cfg, state).status_table()
 
 
 def test_status_table_empty(cfg, state: PipelineState) -> None:
     text = Supervisor(cfg, state).status_table()
-    assert "(no demos)" in text and "QA-passing hours packed: 0.000" in text and "demo-hour: n/a" in text
+    assert "(no demos)" in text and "QA-passing hours packed: 0.000" in text and "excluded): n/a" in text
 
 
 # --- qa-summary --------------------------------------------------------------------------------------------------
@@ -301,11 +345,13 @@ def test_qa_summary_counts_rates_reasons_and_hours(cfg) -> None:
     assert dm.pass_rate == 0.5 and dm.failures == {"fire_recall": 1, "mouse_saturation_frac": 1, "missing_tick_frac": 1}
     assert s.demos == 2 and s.episodes == 5 and s.drop_rate == pytest.approx(0.4)
     assert qa_summary.summarize(cfg, kind="smoke").kinds.keys() == {"smoke"}
+    assert qa_summary.summarize(cfg, kind="smoke").demos == 1  # d1 has no smoke episode: not counted
     text = qa_summary.format_summary(s, 16.0)
     assert "dm: 2/4 episodes passed (50.0%); 1200/2064 frames; 0.021 h passing" in text
     assert "failed fire_recall: 1" in text and "smoke: 1/1 episodes passed (100.0%)" in text
     assert "passing hours (all kinds): 1.021" in text
     assert "drop rate: 40.0% (limit < 20%): ABOVE LIMIT" in text
+    assert "per-demo snapshot, rewritten when the demo is extracted again" in text
 
 
 def test_qa_summary_drop_rate_below_the_limit_is_ok(cfg) -> None:

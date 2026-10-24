@@ -47,6 +47,7 @@ import json
 import logging
 import math
 import os
+import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -403,6 +404,12 @@ def labels_dir(cfg: DictConfig, demo_id: str) -> Path:
     return Path(cfg.paths.labels) / demo_id
 
 
+def sweep_deleting(cfg: DictConfig, demo_id: str) -> None:
+    """Delete ``frames/<id>.deleting`` and ``labels/<id>.deleting``, left by a pack that died while cleaning up."""
+    for base in (cfg.paths.frames, cfg.paths.labels):
+        shutil.rmtree(Path(base) / f"{demo_id}.deleting", ignore_errors=True)
+
+
 def read_qa(cfg: DictConfig, demo_id: str) -> dict[str, dict[str, Any]]:
     """Read ``qa/<demo_id>.jsonl`` into ``{episode_id: record}``.
 
@@ -436,6 +443,7 @@ def run(demo_path: Path, cfg: DictConfig) -> list[EpisodeQA]:
     """
     demo_path = Path(demo_path)
     demo_id = demo_path.stem
+    sweep_deleting(cfg, demo_id)
     plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
     plan_sha = hashlib.sha256(plan_path.read_bytes()).hexdigest()
     plan = read_render_plan(plan_path)

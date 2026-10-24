@@ -207,7 +207,7 @@ def test_end_to_end_segment_render_extract_pack_sync(cfg, remote, use_parser, fa
     status = capsys.readouterr().out
     assert DEMO in status and "synced" in status and "1 synced" in status
     assert f"QA-passing hours packed: {40 / 16 / 3600:.3f} (40 frames)" in status
-    assert "wall s per demo-hour:" in status and "n/a" not in status
+    assert "wall s per demo-hour (failed demos excluded):" in status and "n/a" not in status
 
     assert cli.main(["qa-summary"]) == 0
     text = capsys.readouterr().out
@@ -312,7 +312,7 @@ def test_slicing_check_catches_an_off_by_one(cfg, use_parser, fake_hlae, monkeyp
         return real(frames, np.roll(actions, 1, axis=0), meta, out_dir, cfg, fullres_dir)  # labels one frame late
 
     monkeypatch.setattr(pack, "write_episode", shifted)
-    with pytest.raises(PackError, match="misalignment"):
+    with pytest.raises(PackError, match="write/read round trip"):
         pack.run(DEMO, cfg)
     # nothing half-packed is left for sync to find, and the inputs are kept for a retry
     assert not list((Path(cfg.paths.hdf5) / "dm" / DEMO).glob("*"))
@@ -345,8 +345,6 @@ def test_extract_needs_render_json_for_the_same_plan(cfg, use_parser, fake_hlae)
     render_json.write_text(json.dumps(rec))
     with pytest.raises(ValueError, match="different plan"):
         extract_actions.run(dem, cfg)
-    with pytest.raises(ValueError, match="different plan"):
-        pack.run(DEMO, cfg)
 
 
 def test_pack_without_extract_fails_clearly(cfg, use_parser, fake_hlae) -> None:
@@ -459,3 +457,194 @@ def test_zero_episode_plan_fails_the_segment_stage(cfg, use_parser) -> None:
     use_parser(parser)
     assert cli.main(["segment", "--all-pending"]) == 1
     assert "no episodes" in state_of(cfg)["reason"]
+
+
+# --- review fixes: pack crash safety -----------------------------------------------------------------------------
+
+
+def hdf5_dir(cfg) -> Path:
+    return Path(cfg.paths.hdf5) / "dm" / DEMO
+
+
+def snapshot(cfg) -> dict[str, str]:
+    """sha256 of every file under hdf5/ and hdf5_fullres/ of the demo, by relative path."""
+    out = {}
+    for tree in (cfg.paths.hdf5, cfg.paths.hdf5_fullres):
+        for p in sorted(Path(tree).rglob("*")):
+            if p.is_file():
+                out[p.relative_to(tree).as_posix()] = pack.sha256_file(p)
+    return out
+
+
+def test_pack_killed_after_the_manifest_is_idempotent_on_rerun(cfg, use_parser, fake_hlae, monkeypatch) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    real_cleanup = pack._cleanup
+
+    def killed(cfg, demo_id):
+        raise KeyboardInterrupt  # power loss after the swap/manifest, before frames and labels are deleted
+
+    monkeypatch.setattr(pack, "_cleanup", killed)
+    sup = Supervisor(cfg, PipelineState.load(Path(cfg.paths.state) / "pipeline.json"))
+    with pytest.raises(KeyboardInterrupt):
+        sup.run_stage("pack", sup.state.pending_for("pack"))
+    assert state_of(cfg)["state"] == "extracted" and (Path(cfg.paths.frames) / DEMO).is_dir()
+    done = snapshot(cfg)
+
+    # Worst case: the process died inside the delete and left a half-deleted tree, render.json already gone.
+    monkeypatch.setattr(pack, "_cleanup", real_cleanup)
+    frames = Path(cfg.paths.frames) / DEMO
+    frames.rename(frames.with_name(DEMO + ".deleting"))
+    (frames.with_name(DEMO + ".deleting") / "render.json").unlink()
+    assert cli.main(["pack", "--all-pending"]) == 0
+    assert state_of(cfg)["state"] == "packed" and state_of(cfg)["frames"] == 40
+    assert snapshot(cfg) == done  # nothing was rewritten
+    assert not any(Path(cfg.paths.frames).glob("*")) and not (Path(cfg.paths.labels) / DEMO).exists()
+    verify_manifest(cfg)
+
+
+def test_pack_killed_before_the_delete_leaves_render_json_missing_but_reruns(cfg, use_parser, fake_hlae) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    pack.run(DEMO, cfg)
+    frames = Path(cfg.paths.frames) / DEMO
+    frames.mkdir(parents=True)  # a partial tree whose render.json is already gone
+    (frames / "seg000").mkdir()
+    results = pack.run(DEMO, cfg)
+    assert [r.n_frames for r in results] == [20, 20] and all(r.low_res_path.is_file() for r in results)
+    assert not frames.exists()
+
+
+def test_render_and_extract_sweep_deleting_dirs(cfg, use_parser, fake_hlae) -> None:
+    run_to_rendered(cfg, use_parser, fake_hlae)
+    junk = Path(cfg.paths.frames) / f"{DEMO}.deleting"
+    junk.mkdir()
+    labels_junk = Path(cfg.paths.labels) / f"{DEMO}.deleting"
+    labels_junk.mkdir(parents=True)
+    extract_actions.run(Path(cfg.paths.demos) / "dm" / f"{DEMO}.dem", cfg)
+    assert not junk.exists() and not labels_junk.exists()
+    junk.mkdir()
+    render.run(Path(cfg.paths.demos) / "dm" / f"{DEMO}.dem", cfg)
+    assert not junk.exists()
+
+
+def test_a_failing_rerun_keeps_the_earlier_complete_output(cfg, use_parser, fake_hlae, monkeypatch, tmp_path) -> None:
+    import shutil
+
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    backup = tmp_path / "backup"
+    shutil.copytree(Path(cfg.paths.frames) / DEMO, backup / "frames")
+    shutil.copytree(Path(cfg.paths.labels) / DEMO, backup / "labels")
+    pack.run(DEMO, cfg)
+    before = snapshot(cfg)
+    shutil.copytree(backup / "frames", Path(cfg.paths.frames) / DEMO)
+    shutil.copytree(backup / "labels", Path(cfg.paths.labels) / DEMO)
+    monkeypatch.setattr(pack, "_done_results", lambda *a: None)  # force a real re-pack, not the idempotent shortcut
+    real = pack.write_episode
+    calls = {"n": 0}
+
+    def second_fails(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        return real(*a, **k)
+
+    monkeypatch.setattr(pack, "write_episode", second_fails)
+    with pytest.raises(OSError):
+        pack.run(DEMO, cfg)
+    assert snapshot(cfg) == before  # files and manifest of the earlier complete output are untouched
+    verify_manifest(cfg)
+    assert not list(Path(cfg.paths.hdf5).glob("*/*.staging")) and not list(
+        Path(cfg.paths.hdf5_fullres).glob("*/*.staging")
+    )
+    assert (Path(cfg.paths.frames) / DEMO).is_dir()  # inputs kept for the retry
+
+
+def test_a_failing_first_pack_leaves_no_output_at_all(cfg, use_parser, fake_hlae, monkeypatch) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    real = pack.write_episode
+    calls = {"n": 0}
+
+    def second_fails(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        return real(*a, **k)
+
+    monkeypatch.setattr(pack, "write_episode", second_fails)
+    with pytest.raises(OSError):
+        pack.run(DEMO, cfg)
+    assert snapshot(cfg) == {} and not list(Path(cfg.paths.hdf5).glob("*/*"))
+
+
+def test_frame_alignment_check_catches_wrongly_sliced_frames(cfg, use_parser, fake_hlae, monkeypatch) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    real = pack._read_frames
+    calls = {"n": 0}
+
+    def off_by_one(seg_dir, first, n, size):
+        calls["n"] += 1
+        # Only the slicing in run() is wrong (the first call per episode); the checker's own reads stay right.
+        return real(seg_dir, first + 1, n, size) if calls["n"] == 1 else real(seg_dir, first, n, size)
+
+    monkeypatch.setattr(pack, "_read_frames", off_by_one)
+    with pytest.raises(PackError, match="not source frames"):
+        pack.run(DEMO, cfg)
+    assert snapshot(cfg) == {}
+
+
+# --- review fixes: provenance, explicit runs, plan paths ---------------------------------------------------------
+
+
+def test_cs2_build_prefers_the_sidecar_and_warns_on_a_disagreement(cfg, use_parser, fake_hlae, caplog) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    plan_path = Path(cfg.paths.plans) / DEMO / "render_plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["cs2_build"] = 9999  # planned on another build than the one that recorded the demo (sidecar: 4242)
+    plan_path.write_text(json.dumps(plan))
+    rj = Path(cfg.paths.frames) / DEMO / "render.json"
+    rec = json.loads(rj.read_text())
+    rec["plan_sha256"] = pack.sha256_file(plan_path)
+    rj.write_text(json.dumps(rec))
+    with caplog.at_level("WARNING"):
+        (res, *_) = pack.run(DEMO, cfg)
+    assert read_episode(res.low_res_path)[2]["cs2_build"] == 4242
+    assert "recorded on CS2 build 4242 but planned on build 9999" in caplog.text
+
+
+def test_unknown_cs2_build_warns_and_stores_empty(cfg, use_parser, fake_hlae, caplog) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    (Path(cfg.paths.demos) / "dm" / f"{DEMO}.json").unlink()
+    with caplog.at_level("WARNING"):
+        (res, *_) = pack.run(DEMO, cfg)
+    assert read_episode(res.low_res_path)[2]["cs2_build"] == ""
+    assert "cs2_build is unknown" in caplog.text
+
+
+def test_explicit_rerun_of_a_later_state_demo_without_inputs_is_refused(
+    cfg, use_parser, fake_hlae, remote, capsys
+) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    assert cli.main(["pack", "--all-pending"]) == 0
+    Supervisor(cfg, PipelineState.load(Path(cfg.paths.state) / "pipeline.json")).run_sync(LocalTransport())
+    before = (Path(cfg.paths.state) / "pipeline.json").read_text()
+    for stage in ("extract", "pack"):
+        with pytest.raises(SystemExit, match=f"{stage}: {DEMO} is already synced.*refusing"):
+            cli.main([stage, DEMO])
+    assert (Path(cfg.paths.state) / "pipeline.json").read_text() == before
+    assert state_of(cfg)["state"] == "synced"
+
+
+def test_explicit_run_in_the_matching_or_earlier_state_still_runs(cfg, use_parser, fake_hlae) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    assert cli.main(["extract", DEMO]) == 0  # already extracted, but the inputs exist: allowed
+    assert state_of(cfg)["state"] == "extracted"
+    assert cli.main(["segment", DEMO]) == 0  # segmenting again is allowed too (the .dem is there)
+
+
+def test_segment_prints_each_plan_path(cfg, use_parser, capsys) -> None:
+    add_demo(cfg, "dm-0001")
+    add_demo(cfg, "dm-0002")
+    use_parser(make_parser())
+    assert cli.main(["segment", "--all-pending"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[:2] == [f"segment {d}: {Path(cfg.paths.plans) / d / 'render_plan.json'}" for d in ("dm-0001", "dm-0002")]
+    assert out[2] == "segment: 2 done, 0 failed, 2 considered"
