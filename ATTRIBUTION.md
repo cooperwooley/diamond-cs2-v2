@@ -42,6 +42,11 @@ SOFTWARE.
   curves under `results/v1/`, and of the evaluation scripts (`evaluate.py`, `eval_single_step.py`, `compute_fid.py`)
   that are ported into `cs2wm/eval/` in issue #34. v1's `src/cs2/` (hard-coded action bins) is not carried over;
   action encoding lives in `cs2wm.actions`.
+- Ported evaluation scripts (issue #34), each with a header crediting v1 and DIAMOND:
+  - `cs2wm/eval/loss_curve.py` from `scripts/evaluate.py` (loss curve plot, v1 loss JSONs);
+  - `cs2wm/eval/rollouts.py` from `scripts/eval_single_step.py` and the frame generation of `scripts/evaluate.py`
+    (single-step grid, 64-frame rollouts, comparison strips);
+  - `cs2wm/eval/fid.py` from `scripts/compute_fid.py` (pytorch-fid at 30x56, 2048-dim Inception features).
 
 ## Counter-Strike Deathmatch with Large-Scale Behavioural Cloning
 
