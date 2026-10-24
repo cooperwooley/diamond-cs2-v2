@@ -12,9 +12,7 @@ from pathlib import Path
 from omegaconf import DictConfig
 
 
-def render_overlay_clip(
-    episode: Path, frames_dir: Path, start: int, n_frames: int, out: Path, cfg: DictConfig
-) -> Path:
+def render_overlay_clip(episode: Path, frames_dir: Path, start: int, n_frames: int, out: Path, cfg: DictConfig) -> Path:
     """Render the half-speed label-overlay video.
 
     Args:

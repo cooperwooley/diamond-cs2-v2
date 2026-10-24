@@ -14,7 +14,12 @@ from omegaconf import DictConfig
 
 
 def project_sphere(
-    center: np.ndarray, radius: float, eye: np.ndarray, yaw_deg: float, pitch_deg: float, hfov_deg: float,
+    center: np.ndarray,
+    radius: float,
+    eye: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+    hfov_deg: float,
     size: tuple[int, int],
 ) -> tuple[float, float, float, float] | None:
     """Project a world-space sphere to a screen ellipse.
@@ -36,7 +41,12 @@ def project_sphere(
 
 
 def smoke_mask_for_frame(
-    tick: int, events: pd.DataFrame, eye: np.ndarray, yaw_deg: float, pitch_deg: float, cfg: DictConfig,
+    tick: int,
+    events: pd.DataFrame,
+    eye: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+    cfg: DictConfig,
     size: Sequence[int] = (150, 280),
 ) -> np.ndarray:
     """Boolean smoke mask of one frame.

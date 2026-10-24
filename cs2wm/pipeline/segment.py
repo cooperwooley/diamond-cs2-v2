@@ -102,9 +102,7 @@ def plan_spectate(
     raise NotImplementedError("TODO(#10): plan_spectate")
 
 
-def split_episodes(
-    segments: Sequence[ViewSegment], demo_id: str, kind: str, cfg: DictConfig
-) -> list[EpisodeSpec]:
+def split_episodes(segments: Sequence[ViewSegment], demo_id: str, kind: str, cfg: DictConfig) -> list[EpisodeSpec]:
     """Split segments into episodes of at most ``episodes.max_frames`` frames.
 
     Args:
