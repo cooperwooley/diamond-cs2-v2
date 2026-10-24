@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "demo_id": "fixture-0001",
+  "demo_file": "fixture-0001.dem",
+  "cs2_build": null,
+  "demo_end_tick": 120,
+  "parser_version": "0.42.0",
+  "header": {
+    "map_name": "de_dust2",
+    "demo_version_name": "synthetic"
+  },
+  "tick_offset": 0,
+  "settle_ticks": 10,
+  "timing": {
+    "tickrate": 64,
+    "fps": 16,
+    "ticks_per_frame": 4
+  },
+  "meta": {
+    "policy": "longest_remaining",
+    "player": null,
+    "seed": 0,
+    "kind": "dm",
+    "diagnostics": {
+      "duplicate_spawns": 0,
+      "deaths_without_spawn": 0
+    }
+  },
+  "segments": [
+    {
+      "segment_idx": 0,
+      "target": {
+        "name": "Bot A",
+        "user_id": 1,
+        "steamid": 0,
+        "entity_id": null
+      },
+      "life": {
+        "spawn_tick": 0,
+        "death_tick": 120
+      },
+      "record_start_tick": 10,
+      "record_end_tick": 106,
+      "mirv_record_start_tick": 10,
+      "mirv_record_end_tick": 106,
+      "mirv_spec_tick": 0,
+      "labeled_frames": 24,
+      "rendered_frames": 25,
+      "episodes": [
+        {
+          "episode_id": "dm-fixture-0001-s000-c00",
+          "kind": "dm",
+          "chunk_idx": 0,
+          "start_tick": 10,
+          "end_tick": 58,
+          "n_frames": 12,
+          "rendered_frames": 13,
+          "first_frame": 0
+        },
+        {
+          "episode_id": "dm-fixture-0001-s000-c01",
+          "kind": "dm",
+          "chunk_idx": 1,
+          "start_tick": 58,
+          "end_tick": 106,
+          "n_frames": 12,
+          "rendered_frames": 13,
+          "first_frame": 12
+        }
+      ]
+    }
+  ],
+  "mirv_cmd_schedule": [
+    {
+      "mirv_tick": 0,
+      "demo_tick": 0,
+      "action": "spec",
+      "segment_idx": 0,
+      "target": {
+        "name": "Bot A",
+        "user_id": 1,
+        "steamid": 0,
+        "entity_id": null
+      }
+    },
+    {
+      "mirv_tick": 10,
+      "demo_tick": 10,
+      "action": "record_start",
+      "segment_idx": 0
+    },
+    {
+      "mirv_tick": 106,
+      "demo_tick": 106,
+      "action": "record_end",
+      "segment_idx": 0
+    }
+  ],
+  "totals": {
+    "segments": 1,
+    "episodes": 2,
+    "labeled_frames": 24,
+    "rendered_frames": 25
+  }
+}

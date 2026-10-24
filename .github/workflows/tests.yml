@@ -18,5 +18,7 @@ jobs:
         run: pip install -r requirements.txt -e .[dev]
       - name: Lint
         run: ruff check cs2wm tests scripts
+      - name: Format
+        run: ruff format --check cs2wm tests scripts
       - name: Test
         run: pytest -q
