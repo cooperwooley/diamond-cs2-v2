@@ -55,6 +55,19 @@ def _bad(tmp_path: Path, overrides: list[str]) -> str:
         (["actions.mouse.x_units=[-10,0,10]"], "total 51"),
         (["actions.mouse.deg_per_unit=0"], "deg_per_unit"),
         (["generate.launch_options=[-novid]"], "-insecure"),
+        (["generate.chunking=udp"], "generate.chunking"),
+        (["generate.chunk_min=0"], "generate.chunk_min"),
+        (["generate.netconport=80"], "netconport"),
+        (["generate.netconport=70000"], "netconport"),
+        (["generate.map_load_wait_s=0"], "map_load_wait_s"),
+        (["generate.netcon_connect_timeout_s=0"], "netcon_connect_timeout_s"),
+        (["generate.close_stable_s=70"], "close_stable_s"),
+        (["generate.hang_timeout_min=null"], "must be a number"),
+        (["generate.netconport=null"], "must be a number"),
+        (["generate.hang_timeout_min=2"], "hang_timeout_min"),
+        (["generate.min_chunk_s=0"], "min_chunk_s"),
+        (["generate.launch_options=[-insecure,-secure]"], "not allowed"),
+        (["generate.launch_options=[-insecure,+connect,1.2.3.4]"], "not allowed"),
         (["qa.min_fire_recall=1.5"], "qa.min_fire_recall"),
         (["qa.max_missing_tick_frac=-0.1"], "qa.max_missing_tick_frac"),
         (["qa.max_fill_ticks=-1"], "qa.max_fill_ticks"),
@@ -98,6 +111,28 @@ def test_sha256_ignores_paths_and_supervisor(cfg) -> None:
     assert config_sha256(other) == config_sha256(cfg)
 
 
+def test_sha256_tracks_only_pixel_affecting_render_keys(cfg) -> None:
+    local = [
+        "render.poll_s=9", "render.startup_s=1", "render.launch_options=[-insecure]", "render.hlae_exe=X.exe",
+        "render.hook_dll=y.dll", "render.stream_name=other", "render.retries=3", "render.png_compression=9",
+        "render.quit_delay_ticks=99", "render.timeout_factor=9", "generate.chunk_min=7",
+    ]  # fmt: skip
+    assert config_sha256(load_config(overrides=local)) == config_sha256(cfg)
+    for override in ("render.tick_offset=2", "render.spec_mode=1", "render.spec_player_field=user_id",
+                     "render.output_format=ffmpeg"):  # fmt: skip
+        assert config_sha256(load_config(overrides=[override])) != config_sha256(cfg)
+    ff = load_config(overrides=["render.output_format=ffmpeg"])
+    assert config_sha256(load_config(overrides=["render.output_format=ffmpeg", "render.ffmpeg_preset=other"])) != (
+        config_sha256(ff)
+    )
+
+
 def test_num_actions_matches_env_config(cfg, repo_root) -> None:
     env = OmegaConf.load(repo_root / "config" / "env" / "cs2.yaml")
     assert env.num_actions == ActionSpec.from_config(cfg).dim
+
+
+def test_netcon_timing_check_is_skipped_for_gotv(tmp_path: Path) -> None:
+    assert "grace period" in _bad(tmp_path, ["generate.hang_timeout_min=2"])
+    cfg = load_config(overrides=["generate.hang_timeout_min=2", "generate.chunking=gotv"])
+    assert cfg.generate.chunking == "gotv"

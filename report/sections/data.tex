@@ -1,1 +1,105 @@
-% TODO(#37): data
+\section{Data}
+\label{sec:data}
+\Cref{fig:pipeline} shows the pipeline. Everything that labels and live input must agree on (timing, resolutions, action layout, mouse bins, thresholds) is read from one configuration file by both the extractor and the play loop.
+
+\begin{figure*}[t]
+  \centering
+  \input{figures/pipeline}
+  \caption{Data pipeline. Each stage advances one demo; failing episodes are dropped before packing. The rendered frames are deleted after packing, and the packed HDF5 files are the unit that is transferred to the training cluster.}
+  \label{fig:pipeline}
+\end{figure*}
+
+\subsection{Generation, segmentation and rendering}
+\textbf{Generate.}
+CS2 is started offline as a listen server, always with \texttt{-insecure}; the launcher refuses to start without it, and neither HLAE nor our tools are ever used on VAC-secured servers.
+A deathmatch on \texttt{de\_dust2} is played by 10 bots, with the local player as a spectator.
+Demos are recorded in fixed-length chunks, and a watchdog restarts the game after a crash or hang.
+The build ID of CS2 is recorded per demo (\TBDcsbuild), because a game update can break both the renderer and the parser; HLAE is pinned to the matching release (\TBDhlaever).
+Besides bot-only deathmatches (\texttt{dm}), the data has a \texttt{human} kind, in which a person plays against bots, and a \texttt{smoke} kind with grenade-heavy sessions for H2.
+
+\textbf{Segment.}
+A demo contains ten players, but a frame needs one camera.
+We turn spawn and death events into \emph{lives} and render one player in first person at a time, switching only at the current target's death.
+The next target is the alive player with the most life remaining, with ties broken round-robin for viewpoint diversity.
+The first and last 32 ticks (0.5\,s) of each life are dropped to avoid camera transitions.
+View segments are cut into \emph{episodes} of at most 1000 frames (62.5\,s), and remainders shorter than 64 frames (4\,s) are dropped.
+
+\textbf{Render.}
+HLAE's \texttt{mirv\_streams} replays each segment at a fixed 16\,fps, captured before the UI is drawn, so frames have no HUD, crosshair or killfeed.
+Frames are captured at $1280{\times}720$ and downscaled with area interpolation to $280{\times}150$, the same procedure that produced v1's frames, so that the reused v1 upsampler sees familiar statistics.
+The number of frames of every segment is checked against the plan, and one retry is made before a demo is marked as failed.
+
+\subsection{Frame--tick convention}
+CS2 demos tick at 64\,Hz, so a 16\,fps frame spans $4$ ticks.
+Frame $k$ of an episode is rendered at tick $T_k=T_0+4k$.
+Action $k$ is what the player did while frame $k$ was on screen: it covers ticks $(T_k,T_{k+1}]$, open at the start and closed at the end.
+Labelling the last frame $n-1$ needs the state at $T_n$, so each episode renders one extra frame that is not stored.
+This convention is defined once, and the renderer, the extractor and the packer all use it.
+
+\subsection{State-derived action labels}
+The action is a 51-vector: 11 keys (W, A, S, D, space, ctrl, shift, 1, 2, 3, R), two buttons (LMB, RMB), a one-hot over 23 horizontal mouse bins and a one-hot over 15 vertical mouse bins.
+This is the layout of Pearce and Zhu~\cite{pearce2021counterstrike} and DIAMOND.
+Mouse bin centres are theirs too: $\pm\{2,4,10,20,30,60,100,200,300,500,1000\}$ and 0 for $x$, $\pm\{2,4,10,20,50,100,200\}$ and 0 for $y$.
+One unit is $0.055^\circ$ per 16\,Hz frame ($0.022^\circ$ per count at sensitivity 2.5), so the bins span $\pm55^\circ$ per frame in yaw and $\pm11^\circ$ in pitch.
+We bin in degrees, to the nearest centre, so labels and live mouse input share one definition.
+Positive $x$ is a turn to the right and positive $y$ is looking down.
+
+Labels come from \emph{state}, not from buttons.
+CS2 delta-encodes the user commands in demos, and the parser version we use has wrong bit positions for some buttons and no columns for jump or duck.
+Raw buttons serve only as a non-gating QA cross-check.
+The rules are as follows (full list in the repository's dataset sheet):
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item \textbf{Mouse.} $x=-\mathrm{wrap}_{180}(\psi_{k+1}-\psi_k)$ and $y=\theta_{k+1}-\theta_k$ for yaw $\psi$ and pitch $\theta$, binned as above.
+  \item \textbf{WASD.} Horizontal velocity $v=(p_{k+1}-p_k)\cdot 16$ in units/s from the position displacement over the frame window (not from the parser's per-tick velocity, which spikes at teleports), projected onto the view direction at the window start. W if the forward component exceeds $+30$ units/s, S if below $-30$; D and A likewise for the right component.
+  \item \textbf{Space, ctrl, shift.} Space from a jump event or an upward take-off speed above 100 units/s; ctrl from the duck amount rising or fully ducked; shift from the walking flag when the demo has one.
+  \item \textbf{Slots, R, mouse buttons.} A change of the active weapon sets the key of its slot; reload and zoom events set R and RMB; a weapon-fire event sets LMB, and gaps of at most 0.2\,s between shots of one weapon are filled because the trigger was held.
+\end{itemize}
+The layout has no slot-4 key, so the knife and every grenade, smoke included, share the key `3'.
+
+\subsection{Quality control and label accuracy}
+For every episode the extractor writes QA statistics, and an episode that fails any gating check is not packed.
+The checks are: at most 1\,\% missing ticks and no NaN states; at most 2\,\% of frames in the extreme mouse bins; a yaw change of at most $60^\circ$ per frame; no teleports (horizontal displacement over 30 units per frame); and at least 64 frames.
+A fire-recall check against the player's weapon-fire events guards against alignment errors.
+QA dropped a share of \TBDqadroprate of the episodes.
+Because the labels are rule-based, we also measured them directly.
+We hand-checked a clip of about two minutes with labels overlaid at half speed; a reviewer judges each label transition and 200 random frames for mouse direction and size.
+\Cref{tab:labelacc} reports accuracy per label group.
+The lowest group reaches \TBDlabelmin\,\%, and the sign of horizontal mouse motion is right in \TBDlabelxsign\,\%.
+Groups below 90\,\% had their thresholds tuned on this clip and were re-scored, so the numbers are in-sample.
+
+\begin{table}[t]
+  \centering\small
+  \resulttable{label_accuracy}{\#18}{Per-group label accuracy and number of judged rows.}
+  \caption{Label accuracy of the state-derived actions on a hand-checked clip of about two minutes.}
+  \label{tab:labelacc}
+\end{table}
+
+\subsection{Packing, splits and statistics}
+Each episode is stored as one HDF5 file at $30{\times}56$ in v1's schema, plus a deterministic subset of about 10\,\% of episodes (selected by a hash of the episode ID) at $150{\times}280$ as JPEG (quality 95) for evaluating the upsampler.
+The low-resolution frames follow v1's recipe: convert to $[-1,1]$, bicubic resize with torchvision, then map back to bytes.
+
+\textbf{The uint8 wrap.}
+v1's recipe ends with a float-to-uint8 cast.
+Bicubic resampling overshoots $[-1,1]$ at hard edges, and the cast \emph{wraps} instead of clamping: a value of $257.5$ becomes 1 and $-3.0$ becomes 253, so white turns almost black and vice versa.
+On a synthetic high-contrast edge image, 3.7\,\% of low-resolution pixels differ from the clamped result; on random noise none do.
+The v1 training frames, and the inputs of its upsampler, therefore carry salt-and-pepper artefacts at bright--dark edges.
+v2 clamps before the cast, and the tests check bit-equality with v1 wherever v1 stays in range.
+We check that the v1 upsampler is still adequate on the cleaner v2 inputs in \cref{sec:experiments}.
+
+\textbf{Splits.}
+Train and test are split \emph{by demo}, so no demo contributes to both; at least 30\,\% of smoke demos, and at least three, go to test for H2.
+\Cref{tab:dataset} and \cref{fig:dstats} give the size and label statistics: \TBDhours hours in \TBDnumepisodes episodes from \TBDnumdemos demos (\TBDtrainhours\,h train, \TBDtesthours\,h test).
+
+\begin{table}[t]
+  \centering\small
+  \resulttable{dataset}{\#25}{Episodes, frames and hours per kind and split.}
+  \caption{Dataset size per episode kind and split.}
+  \label{tab:dataset}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \resultfigure{dataset_stats}{\linewidth}{\#25}{Label rates and mouse-bin histograms, train vs.\ test.}
+  \caption{Label statistics of the training and test splits: the rate of each key and button, and the histograms of the mouse-bin labels.}
+  \label{fig:dstats}
+\end{figure}

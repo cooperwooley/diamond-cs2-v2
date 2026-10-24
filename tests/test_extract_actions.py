@@ -279,6 +279,27 @@ def test_hold_fill_without_weapon_column_and_clipping() -> None:
     assert lmb_frames(a) == [N - 1]
 
 
+def test_hold_fill_pair_entirely_outside_the_episode_marks_nothing() -> None:
+    ep = make_episode()
+    # Two close shots well before T0 (e.g. the end of a burst of the previous episode) must not wrap to frame 0.
+    a, qa = run(make_ticks(ep), {"weapon_fire": ev(T0 - 40, T0 - 39)})
+    assert lmb_frames(a) == [] and qa.stats["n_fire_events"] == 0
+    a, _ = run(make_ticks(ep), {"weapon_fire": ev(ep.end_tick + 20, ep.end_tick + 21)})
+    assert lmb_frames(a) == []
+
+
+def test_hold_fill_pair_straddling_the_start_or_end_and_split_pairs() -> None:
+    ep = make_episode()
+    a, _ = run(make_ticks(ep), {"weapon_fire": ev(T0 - 4, T0 + 4)})  # 8 ticks apart: held across the start
+    assert lmb_frames(a) == [0]
+    last = ep.end_tick
+    a, _ = run(make_ticks(ep), {"weapon_fire": ev(last - 3, last + 4)})  # held across the end
+    assert lmb_frames(a) == [N - 1]
+    # One shot before and one after the window are far apart, so nothing is held between them.
+    a, _ = run(make_ticks(ep), {"weapon_fire": ev(T0 - 4, last + 4)})
+    assert lmb_frames(a) == []
+
+
 # --- 8. jump ----------------------------------------------------------------------------------------------------
 
 

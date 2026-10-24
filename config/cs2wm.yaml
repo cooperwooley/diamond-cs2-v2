@@ -10,6 +10,8 @@ paths:
   demos: ${paths.root}/demos                 # master copy; mirrored to the Mill by sync
   plans: ${paths.root}/plans                 # render_plan.json per demo (#10)
   frames: ${paths.root}/frames               # rendered 280x150 frames, deleted after pack
+  raw: ${paths.root}/raw                     # HLAE raw captures (1280x720), deleted per segment after downscaling
+  labels: ${paths.root}/labels               # <demo_id>/<episode_id>.npy float32[n,51] from extract, deleted after pack
   hdf5: ${paths.root}/hdf5                   # packed low-res episodes, deleted after sync
   hdf5_fullres: ${paths.root}/hdf5_fullres   # ~10% full-res JPEG subset
   qa: ${paths.root}/qa
@@ -78,6 +80,9 @@ qa:
 segment:
   policy: longest_remaining         # bots; human sessions use fixed_player
   settle_ticks: 32                  # dropped after spawn and before death (camera transitions); tuned in #14
+                                    # also the gap between two segments (camera switch)
+  seed: 0                           # plan RNG seed (ties in the spectate policy); mixed with the demo id
+  event_player_props: [user_id]     # player props requested with spawn/death events; add entity_id once #14 confirms it
 
 pack:
   schema_version: 1
@@ -90,22 +95,68 @@ generate:
   chunk_min: 10
   hang_timeout_min: 5
   expected_build: null              # CS2 buildid from appmanifest_730.acf; set after #14
-  launch_options: [-insecure, -novid, -console, -sw, -w, "1280", -h, "720"]   # -insecure is mandatory
+  # Launch: plain cs2.exe (NOT HLAE; HLAE is for render only) started directly rather than via `steam -applaunch 730`,
+  # because steam.exe returns at once, which would leave nothing to watch, kill or restart.
+  # -steam makes a directly started cs2.exe attach to the running Steam client.   CONFIRM(#14)
+  # -insecure is mandatory: the launcher and the config validator both refuse to run without it.
+  launch_options: [-insecure, -steam, -novid, -console, -sw, -w, "1280", -h, "720"]
+  cs2_exe: game/bin/win64/cs2.exe   # relative to paths.cs2_dir
+  # Chunking: netcon = send `stop; record <name>` over -netconport every chunk_min (works for client demos);
+  # gotv = tv_enable/tv_autorecord with mp_timelimit=chunk_min, one demo per map cycle.
+  # CONFIRM(#14): #14 picks one (GOTV only if it records every bot).
+  chunking: netcon
+  netconport: 2121                  # used only when chunking = netcon
+  netcon_connect_timeout_s: 180     # CS2 takes a while to open the port.   CONFIRM(#14)
+  map_load_wait_s: 45               # wait after the netcon port opens, before the first `record`.   CONFIRM(#14)
+  poll_s: 5                         # watchdog polling interval
+  close_stable_s: 5                 # a demo is closed once its size has not changed for this long.   CONFIRM(#14)
+  close_timeout_s: 60               # give up waiting for a demo to close after this long
+  min_chunk_s: 30                   # a truncated chunk shorter than this is kept but is not progress for max_failures
+  max_failures: 3                   # give up after this many sessions (or publishes) in a row without a usable chunk
 
 render:
   tick_offset: 0                    # measured in #14
-  timeout_factor: 3.0               # x demo length
+  timeout_factor: 3.0               # x demo length (demo_end_tick / tickrate)
+  startup_s: 180                    # CS2 launch + demo load, added to the timeout.   CONFIRM(#14)
   output_format: tga                # tga | ffmpeg; decided in #14
+  ffmpeg_preset: afxFfmpegLosslessBest  # used when output_format = ffmpeg; must be lossless.   CONFIRM(#14)
+  retries: 1                        # a crash, timeout or frame-count mismatch is retried this often, then the demo fails
+  poll_s: 2                         # polling interval while waiting for HLAE / cs2.exe
+  quit_delay_ticks: 8               # `quit` is scheduled this many ticks after the last record end (capped at demo end)
+  stream_name: dcs2                 # `mirv_streams add normal <name>`; also the capture sub-folder.   CONFIRM(#14)
+  # In-eye spectator mode for `spec_mode <n>`.   CONFIRM(#14): 2 is the candidate, try 1 if not first person.
+  spec_mode: 2
+  # Which plan target field `spec_player` takes: entity_id | user_id | slot | name.   CONFIRM(#14)
+  # `slot` is a 1-based index that the plan does not carry, so it fails clearly until #14 defines how to map it.
+  spec_player_field: entity_id
+  hlae_exe: HLAE.exe                # relative to paths.hlae_dir
+  hook_dll: x64/AfxHookSource2.dll  # relative to paths.hlae_dir
+  # Command line handed to cs2.exe by the HLAE custom loader, before -w/-h (from resolution.capture) and +playdemo/+exec.
+  # -insecure is mandatory: the launcher and the config validator both refuse to run without it.
+  launch_options: [-steam, -insecure, -novid, -console, -sw]
+  png_compression: 1                # cv2 IMWRITE_PNG_COMPRESSION (0-9) for frames/; low = fast, see render.py
 
 sync:
   host: mill                        # ~/.ssh/config alias from #3
-  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill
-  delete_local_hdf5: true
+  remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill (only [A-Za-z0-9_./-] and $USER allowed)
+  rsync_timeout_s: 3600             # kill one rsync (a whole tree) after this long; rsync also has a 300 s I/O timeout
+  ssh_timeout_s: 120                # kill the preflight / mkdir / remote-root ssh calls after this long
+  verify_timeout_s: 900             # kill one per-demo remote sha256sum -c after this long
+  delete_local_hdf5: true           # free local hdf5/ + hdf5_fullres/ files whose remote sha256 verified; demos stay
 
 supervisor:
-  max_working_gb: 8
+  generate_block_min: 60            # one generate block per loop iteration, then everything pending is drained.   TUNE(#19)
+  drain_min: 45                     # stop generating this long before --until, to leave time to drain the pipeline.   TUNE(#19)
+  max_working_gb: 8                 # pause generation above this working set (frames, raw, labels, hdf5, hdf5_fullres)
+  min_free_gb: 15                   # stop generating and alert when the drive has less free space than this
   heartbeat_min: 60
-  max_attempts: 3
+  max_attempts: 3                   # attempts per stage per demo, then the demo is failed and the night goes on
+  backoff_s: 60                     # wait before attempt n+1 is backoff_s * 2^(n-1): 60 s, then 120 s
+  max_demo_wall_min: 90             # wall time one demo may use per night (all stages and attempts); then it is given up on
+  stall_backoff_min: 10             # when paused with packed demos that cannot sync, retry this often until the deadline
+  alert_failed_in_row: 3            # alert after this many demos in a row failed, or this many failures in one stage with no success
+  max_generate_failures: 2          # stop generating after this many generate blocks in a row that failed or gave no demo
+  smoke_s: 10                       # length of the render smoke test after a CS2 patch (seconds of footage)
   ntfy_server: https://ntfy.sh
   ntfy_topic: ${oc.env:DCS2_NTFY_TOPIC,null}   # secret; never committed
 
@@ -113,12 +164,35 @@ play:
   sensitivity: 2.5    # set to your CS2 sensitivity (#2); 2.5 reproduces P&Z units exactly
   m_yaw: 0.022        # deg per mouse count at sensitivity 1
   m_pitch: 0.022
+  window_scale: 4     # window = render resolution x this (280x150 -> 1120x600)
 
 eval:
   h1:
     hfov_deg: 106.26  # 16:9 render at CS2's fixed 90 deg (4:3-based) FOV; refit on GT in #32
     contexts: 50
-    rollout_frames: 32
+    rollout_frames: 32     # frames each scripted action is held
+    skip_initial_steps: 4  # pairs whose later frame index is below this are left out of the metrics: the first
+                           # num_steps_conditioning steps still see ground-truth context actions
+    yaw_units: [2, 4, 10, 20, 30, 60]   # scripted yaw bins, run as +u and -u (must be mouse_x bin centres)
+    pitch_units: [2, 4, 10, 20]         # scripted pitch bins, +u and -u (must be mouse_y bin centres)
+    keys: [w, s, a, d]
+    estimator: phasecorr   # phasecorr | flow: the shift estimator used on the rollouts
+    gt_pairs: 2000         # ground-truth frame pairs for the estimator validation, per resolution
+    gt_max_abs_deg: 5.0    # validation r/slope use pairs with |label| <= this (scripted bins reach 3.3 deg yaw)
+    r_threshold: 0.8       # estimator validation must reach this Pearson r on yaw
+    bootstrap: 1000        # resamples for the 95% CIs
   h2:
     smoke_radius_units: 144
     mask_dilate_px: 2
+    max_los_units: 800     # a smoke counts only if its centre is within this distance of the view axis (line of sight)
+    viewmodel_box: [0.3, 0.55, 0.9, 1.0]  # x0, y0, x1, y1 as fractions of W/H: the weapon, left out of the static mask
+    enemy_max_dist_units: 2500  # an enemy inside the frustum within this distance disqualifies a frame as static
+    enemy_margin_px: 10    # enemy projections this far outside the frame still count as in view
+    eye_height_stand: 64   # CONFIRM(#14): eye height above the pawn origin when standing / fully ducked, used when the
+    eye_height_crouch: 46  #   tick table has no view-offset column
+    view_offset_prop: null # CONFIRM(#14): demoparser2 prop with the eye height above the origin (null: use duck_amount)
+    min_region_px: 50      # frames with fewer pixels in a region are left out of that region's metrics
+    min_smoke_frames: 4    # a context qualifies when this many of its predicted frames have a smoke in view
+    contexts: 100          # held-out contexts (4 GT frames + rollout_steps predicted frames) per model
+    examples: 6            # triptych rows per model
+    bootstrap: 1000        # resamples for the 95% CIs

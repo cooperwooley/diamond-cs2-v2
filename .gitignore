@@ -51,6 +51,8 @@ report/**/*.fdb_latexmk
 report/**/*.fls
 report/**/*.out
 report/**/*.synctex.gz
+report/**/*.toc
+report/main.pdf
 
 # OS / IDE
 .DS_Store

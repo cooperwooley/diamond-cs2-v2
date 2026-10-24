@@ -73,8 +73,9 @@ class DatasetTraverser:
                     SegmentId(episode_id, start, stop),
                     should_pad=True,
                 )
-                segment_id_full_res = SegmentId(episode.info["original_file_id"], start, stop)
-                segment.info["full_res"] = self.dataset._dataset_full_res[segment_id_full_res].obs
+                if self.dataset._dataset_full_res is not None:
+                    segment_id_full_res = SegmentId(episode.info["original_file_id"], start, stop)
+                    segment.info["full_res"] = self.dataset._dataset_full_res[segment_id_full_res].obs
                 chunks.append(segment)
             if chunks[-1].effective_size < 2:
                 chunks.pop()
