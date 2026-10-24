@@ -231,6 +231,7 @@ def test_play_session_headless_with_record(dummy_pygame, agent, cfg, episode, tm
         agent=agent,
         event_source=scripted_events(pg, events),
         max_frames=50,
+        clock=FakeClock(step=1 / 32),  # two clock reads per frame: exactly 1/16 s, so each frame is written once
     )
     original = InputMapper.frame_action
 
