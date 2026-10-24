@@ -44,7 +44,15 @@ pip install -e ".[dev]"
 cs2wm --help
 ```
 
-`environment.yml` installs `requirements.txt`, which pulls whatever `torch` pip resolves. For a CUDA build, install
+`environment.yml` installs `requirements.txt`, which pulls whatever `torch` pip resolves: on Linux that is the CUDA
+build, several GB of wheels. Without a GPU (a laptop, CI, a grader running only the tests), prefer the CPU build, as CI
+does, by adding the CPU index when creating the env:
+
+```bash
+PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu conda env create -f environment.yml
+```
+
+For a CUDA build, install
 torch first from the matching index, for example
 `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126`, then re-run the steps above.
 Check with `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`.
@@ -108,6 +116,20 @@ echo 'source ~/.dcs2_env' >> ~/.bashrc && source ~/.dcs2_env
 
 `~/.dcs2_env` defines `S=/share/ceph/scratch/$USER/dcs2`, `H100_GRES` and `V100_GRES`. Always submit with `-p gpu`.
 Scratch is not backed up.
+
+## Try it without CS2
+
+The data format can be seen without CS2, HLAE or a `.dem` file. `tests/fixtures/demo_fixture/` (about 17 KB) holds the
+tick and event tables of a synthetic 120-tick demo and the render plan `segment` made from them. This command runs the
+real `extract` and `pack` stages on it in a temp dir, then reads the HDF5 files back and prints the episodes, decoded
+actions, file attrs and the manifest with its checksums:
+
+```bash
+python scripts/fixture_demo.py
+```
+
+Only the demo parser (replaced by a reader of the CSV tables) and the rendered frames (drawn, not captured) are stand-ins.
+`tests/test_fixture_demo.py` runs it in CI. Add `--root DIR` to keep the output for inspection.
 
 ## Pipeline commands
 
@@ -278,6 +300,7 @@ CI (`.github/workflows/tests.yml`, Python 3.10, CPU torch) runs exactly this:
 ```bash
 # WSL / Linux
 ruff check cs2wm tests scripts
+ruff format --check cs2wm tests scripts
 pytest -q
 ```
 
