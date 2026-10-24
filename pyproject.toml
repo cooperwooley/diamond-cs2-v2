@@ -27,6 +27,8 @@ include = ["cs2wm*"]
 testpaths = ["tests"]
 # Repo root on sys.path: tests import shared fakes as `tests.<module>`, and the checkout's own cs2wm wins over any install.
 pythonpath = ["."]
+# Every test gets a temp DCS2_ROOT (tests/isolation.py), so nothing writes into the checkout or a real data root.
+addopts = "-p tests.isolation"
 
 [tool.ruff]
 line-length = 120
