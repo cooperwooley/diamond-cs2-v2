@@ -41,6 +41,7 @@ done
 BATCH_SIZES=${BATCH_SIZES:-"32 64 128"}
 STEPS=${STEPS:-200}
 GPUS=${GPUS:-1}
+[[ "$GPUS" =~ ^[0-9]+$ ]] || die "GPUS must be a non-negative integer, got '$GPUS'."
 REPO_DIR=${REPO_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
 read -r -a BATCH_ARGS <<<"$BATCH_SIZES"
 [[ ${#BATCH_ARGS[@]} -gt 0 ]] || die "BATCH_SIZES is empty."

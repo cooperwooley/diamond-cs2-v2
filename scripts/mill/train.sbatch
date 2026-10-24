@@ -30,8 +30,10 @@
 # shell 600 s before the time limit (--signal=B:); it is forwarded to Python, which saves at the next optimizer step.
 set -euo pipefail
 
+PHASE=setup
 die() {
     echo "train.sbatch: ERROR: $*" >&2
+    PHASE=failed
     exit 2
 }
 
@@ -51,6 +53,7 @@ for var in S RUN_NAME DATASET HW; do
 done
 RESUBMITS_LEFT=${RESUBMITS_LEFT:-3}
 [[ "$RESUBMITS_LEFT" =~ ^[0-9]+$ ]] || die "RESUBMITS_LEFT must be a non-negative integer, got '$RESUBMITS_LEFT'."
+RESUBMITS_LEFT=$((10#$RESUBMITS_LEFT)) # "08" is not octal
 EXTRA=${EXTRA:-}
 if [[ "$DRY_RUN" == 1 ]]; then
     JOB_ID=${SLURM_JOB_ID:-dryrun}
@@ -119,19 +122,21 @@ fi
 
 # ---- 3. Cleanup and signal handling ---------------------------------------------------------------------------------
 # PHASE decides what the EXIT trap does with the successor: it is cancelled only when training is finished ("done"), has
-# crashed ("crash") or failed during setup ("setup"). A job killed while "running" (wall-time, node failure) or
-# "preempted" leaves the successor queued so the chain resumes.
-PHASE=setup
+# crashed ("crash") or the setup failed ("failed", set by die or a failing command). A job that is signalled or killed
+# ("setup" before launch, "running", "preempted") leaves the successor queued so the chain resumes.
 SUCC_ID=
-PID=
+PID=       # the trainer (python)
+SETUP_PID= # a background setup command (rsync)
 USR1_EARLY=0
+TRAPPED=0
+RC=0
 
 cleanup() {
     local rc=$?
     trap - EXIT
     rm -rf "$STAGE_DIR"
     case "$PHASE" in
-        setup | done | crash)
+        done | crash | failed)
             if [[ -n "$SUCC_ID" ]]; then
                 echo "Cancelling successor job $SUCC_ID ($PHASE)."
                 scancel "$SUCC_ID" || echo "WARNING: scancel $SUCC_ID failed; cancel it by hand." >&2
@@ -141,6 +146,7 @@ cleanup() {
     exit "$rc"
 }
 forward_usr1() {
+    TRAPPED=1
     if [[ -n "$PID" ]]; then
         echo "$(date +%T) SIGUSR1 received: forwarding to trainer (pid $PID)."
         kill -USR1 "$PID" 2>/dev/null || true
@@ -149,15 +155,52 @@ forward_usr1() {
     fi
 }
 on_term() {
-    echo "$(date +%T) SIGTERM received: stopping the trainer." >&2
-    [[ -z "$PID" ]] || kill -TERM "$PID" 2>/dev/null || true
+    local child=${PID:-$SETUP_PID} i
+    echo "$(date +%T) SIGTERM received: stopping ${child:+pid $child}." >&2
+    if [[ -n "$child" ]]; then
+        kill -TERM "$child" 2>/dev/null || true
+        # Give the trainer up to 30 s to go away before the staged data is removed under it.
+        for ((i = 0; i < 300; i++)); do
+            kill -0 "$child" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
     exit 143
 }
 trap cleanup EXIT
 trap forward_usr1 USR1
 trap on_term TERM
+trap '[[ $PHASE != setup ]] || PHASE=failed' ERR # `set -e` abort during setup
+
+# Wait for background process $1 and leave its real exit status in RC. `wait` returns early with status > 128 when a
+# trapped signal (USR1) arrives. Then the child is either still running (wait again), or it exited while the trap handler
+# ran, and bash has already reaped it: `wait` once more returns the status bash retained for it.
+wait_for() {
+    local pid=$1 rc2
+    while :; do
+        TRAPPED=0
+        RC=0
+        wait "$pid" || RC=$?
+        if [[ "$TRAPPED" == 1 && "$RC" -gt 128 ]]; then
+            if kill -0 "$pid" 2>/dev/null; then
+                continue
+            fi
+            rc2=0
+            wait "$pid" || rc2=$?
+            [[ "$rc2" -eq 127 ]] || RC=$rc2 # 127: status no longer known, keep the interrupted one
+        fi
+        return 0
+    done
+}
 
 echo "$(date +%T) job $JOB_ID on $(hostname): run $RUN_NAME, dataset $DATASET, hw $HW, resubmits left $RESUBMITS_LEFT"
+
+command -v python >/dev/null 2>&1 || die "python not found on PATH: is the conda env 'dcs2' active (~/.dcs2_env)?"
+if [[ -f "$RUN_DIR/checkpoints/DONE" ]]; then
+    PHASE=done
+    echo "$RUN_DIR/checkpoints/DONE already exists: training is complete, nothing to do (no successor submitted)."
+    exit 0
+fi
 
 # ---- 4. Successor (submitted at start so that hard kills still resume) ----------------------------------------------
 if [[ "$RESUBMITS_LEFT" -gt 0 ]]; then
@@ -176,7 +219,11 @@ fi
 [[ -d "$S/datasets/$DATASET" ]] || die "dataset $S/datasets/$DATASET not found."
 mkdir -p "$RUN_DIR" "$STAGE_DIR"
 echo "$(date +%T) staging $S/datasets/$DATASET -> $STAGE_DIR/$DATASET"
-"${RSYNC_CMD[@]}"
+"${RSYNC_CMD[@]}" & # in the background so that a SIGTERM trap can fire while it runs
+SETUP_PID=$!
+wait_for "$SETUP_PID"
+SETUP_PID=
+[[ "$RC" -eq 0 ]] || die "staging failed (rsync exit $RC)."
 [[ -d "$LOW_RES" ]] || die "staged dataset has no low_res/ directory ($LOW_RES); expected \$S/datasets/$DATASET/low_res/{train,test}."
 echo "$(date +%T) staging done"
 
@@ -194,18 +241,11 @@ echo
 "${PY_CMD[@]}" &
 PID=$!
 PHASE=running
+if [[ "$USR1_EARLY" == 1 ]]; then # arrived between the check above and the launch
+    kill -USR1 "$PID" 2>/dev/null || true
+fi
 
-# `wait` returns early (status > 128) when a trapped signal such as USR1 arrives, with the child still running. Loop
-# until the child is really gone, then take its real exit status from the final `wait`.
-RC=0
-while :; do
-    RC=0
-    wait "$PID" || RC=$?
-    if kill -0 "$PID" 2>/dev/null; then
-        continue # interrupted by a trapped signal; the child is still alive (or an unreaped zombie)
-    fi
-    break
-done
+wait_for "$PID"
 PID=
 CKPT_DIR=$RUN_DIR/checkpoints
 

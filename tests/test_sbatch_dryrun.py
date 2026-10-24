@@ -33,9 +33,17 @@ echo "04:00:00"
 """
 FAKE_RSYNC = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG/rsync.log"
+[ -n "$FAKE_RSYNC_SLEEP" ] && { touch "$FAKE_LOG/rsync.started"; exec sleep "$FAKE_RSYNC_SLEEP"; }
 mkdir -p "${@: -1}" && cp -a "${@: -2:1}". "${@: -1}"
 """
-# FAKE_PY_MODE: done | preempt | crash | wait_usr1 (blocks until SIGUSR1, then behaves like a preempted trainer).
+# After the trainer started, `date` (called by the script's SIGUSR1 handler) can be made slow by creating $FAKE_LOG/slow_date,
+# which keeps the handler running while the trainer exits: the window of the "interrupted wait" race.
+FAKE_DATE = """#!/bin/bash
+[ -e "$FAKE_LOG/slow_date" ] && sleep 0.4
+exec /bin/date "$@"
+"""
+# FAKE_PY_MODE: done | exit0 (no DONE) | preempt | crash | wait_usr1 (blocks until SIGUSR1, then behaves like a preempted
+# trainer) | timed_done / timed_exit3 (exit 0 with DONE / exit 3 without PREEMPTED, 0.2 s after $FAKE_LOG/go appears).
 FAKE_PYTHON = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG/python.log"
 for arg in "$@"; do
@@ -48,6 +56,14 @@ done
 mkdir -p "$RUN_DIR/checkpoints"
 case "$FAKE_PY_MODE" in
     done) touch "$RUN_DIR/checkpoints/DONE"; exit 0 ;;
+    exit0) exit 0 ;;
+    timed_done|timed_exit3)
+        trap '' USR1
+        touch "$FAKE_LOG/python.ready"
+        while [ ! -e "$FAKE_LOG/go" ]; do sleep 0.01; done
+        sleep 0.2
+        if [ "$FAKE_PY_MODE" = timed_done ]; then touch "$RUN_DIR/checkpoints/DONE"; exit 0; else exit 3; fi
+        ;;
     preempt) touch "$RUN_DIR/checkpoints/PREEMPTED" "$RUN_DIR/checkpoints/state.pt"; exit 3 ;;
     crash) echo "Traceback: boom" >&2; exit 1 ;;
     wait_usr1)
@@ -90,13 +106,25 @@ class Harness:
             "squeue": FAKE_SQUEUE,
             "rsync": FAKE_RSYNC,
             "python": FAKE_PYTHON,
+            "date": FAKE_DATE,
         }.items():
             write_exe(self.bin / name, text)
         (self.home / ".dcs2_env").write_text(
             f"export S={self.s}\nexport H100_GRES=gpu:h100:1\nexport V100_GRES=gpu:v100:1\n"
         )
         env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SBATCH_"))}
-        for k in ("DRY_RUN", "RESUBMITS_LEFT", "EXTRA", "GRES", "TIME_LIMIT", "RUN_NAME", "DATASET", "HW", "S"):
+        for k in (
+            "DRY_RUN",
+            "RESUBMITS_LEFT",
+            "EXTRA",
+            "GRES",
+            "TIME_LIMIT",
+            "RUN_NAME",
+            "DATASET",
+            "HW",
+            "S",
+            "FAKE_RSYNC_SLEEP",
+        ):
             env.pop(k, None)
         env.update(
             PATH=f"{self.bin}{os.pathsep}{env['PATH']}",
@@ -286,9 +314,9 @@ def test_resubmits_left_zero_submits_nothing(h: Harness) -> None:
 
 
 def test_resubmits_left_defaults_to_three_and_counts_down(h: Harness) -> None:
-    assert h.run().returncode == 0
+    assert h.run(FAKE_PY_MODE="exit0").returncode == 0  # (no DONE, so the second run is not a no-op)
     assert "RESUBMITS_LEFT=2" in h.logged("sbatch.log")[0]
-    assert h.run(RESUBMITS_LEFT="1").returncode == 0
+    assert h.run(FAKE_PY_MODE="exit0", RESUBMITS_LEFT="1").returncode == 0
     assert "RESUBMITS_LEFT=0" in h.logged("sbatch.log")[1]
 
 
@@ -335,6 +363,105 @@ def test_missing_dataset_fails_and_cancels_successor(h: Harness) -> None:
     assert "nope not found" in res.stderr
     assert h.logged("scancel.log") == [SUCCESSOR_ID]
     assert h.logged("python.log") == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "code", "cancelled"), [("timed_done", 0, True), ("timed_exit3", 3, False)], ids=["exit0_done", "exit3"]
+)
+@pytest.mark.parametrize("attempt", range(3))
+def test_trainer_exiting_during_usr1_handler_keeps_its_real_exit_code(
+    h: Harness, mode: str, code: int, cancelled: bool, attempt: int
+) -> None:
+    """The trainer exits while the shell's USR1 trap runs, so the interrupted `wait` must not be mistaken for 138."""
+    proc = h.start(FAKE_PY_MODE=mode)
+    try:
+        h.wait_for("python.ready")
+        (h.log / "slow_date").touch()  # the USR1 handler now takes 0.4 s ...
+        os.kill(proc.pid, signal.SIGUSR1)
+        (h.log / "go").touch()  # ... and the trainer exits 0.2 s from now, i.e. while the handler is running
+        out, err = proc.communicate(timeout=TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == code, (out, err)
+    assert "crashed" not in err
+    assert h.logged("scancel.log") == ([SUCCESSOR_ID] if cancelled else [])
+
+
+def test_sigterm_during_staging_keeps_successor(h: Harness) -> None:
+    proc = h.start(FAKE_RSYNC_SLEEP="30")
+    try:
+        h.wait_for("rsync.started")
+        start = time.monotonic()
+        os.kill(proc.pid, signal.SIGTERM)
+        proc.communicate(timeout=TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 143
+    assert time.monotonic() - start < 10  # the trap fired promptly instead of after the rsync
+    assert h.logged("scancel.log") == []
+    assert h.logged("python.log") == []
+    assert not h.staged.exists()
+
+
+def test_failed_staging_cancels_successor(h: Harness) -> None:
+    write_exe(h.bin / "rsync", "#!/bin/bash\nexit 23\n")
+    res = h.run()
+    assert res.returncode == 2
+    assert "staging failed (rsync exit 23)" in res.stderr
+    assert h.logged("scancel.log") == [SUCCESSOR_ID]
+
+
+def test_resubmits_left_with_leading_zero(h: Harness) -> None:
+    assert h.run(RESUBMITS_LEFT="08").returncode == 0
+    assert "RESUBMITS_LEFT=7" in h.logged("sbatch.log")[0]
+
+
+def test_missing_python_is_reported_before_staging(h: Harness) -> None:
+    (h.bin / "python").unlink()
+    if shutil.which("python", path="/usr/bin:/bin"):
+        pytest.skip("a system python is on the minimal PATH")
+    res = h.run(PATH=f"{h.bin}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    assert res.returncode == 2
+    assert "python not found" in res.stderr
+    assert h.logged("rsync.log") == [] and h.logged("sbatch.log") == []
+
+
+def test_existing_done_exits_without_staging_or_successor(h: Harness) -> None:
+    (h.run_dir / "checkpoints").mkdir(parents=True)
+    (h.run_dir / "checkpoints" / "DONE").touch()
+    res = h.run()
+    assert res.returncode == 0, res.stderr
+    assert "already exists" in res.stdout
+    assert h.logged("rsync.log") == [] and h.logged("python.log") == []
+    assert h.logged("sbatch.log") == []  # nothing to chain, so no successor was submitted (and none to cancel)
+    assert not h.staged.exists()
+
+
+def test_crash_with_stale_preempted_file_is_still_a_crash(h: Harness) -> None:
+    ckpt = h.run_dir / "checkpoints"
+    ckpt.mkdir(parents=True)
+    stale = ckpt / "PREEMPTED"
+    stale.touch()
+    old = time.time() - 3600
+    os.utime(stale, (old, old))  # written by a previous job: older than this job's launch marker
+    res = h.run(FAKE_PY_MODE="crash")
+    assert res.returncode == 1
+    assert "trainer crashed with exit code 1" in res.stderr
+    assert h.logged("scancel.log") == [SUCCESSOR_ID]
+
+
+def test_exit_zero_without_done_is_finished_with_warning(h: Harness) -> None:
+    res = h.run(FAKE_PY_MODE="exit0")
+    assert res.returncode == 0
+    assert "DONE is missing" in res.stderr
+    assert h.logged("scancel.log") == [SUCCESSOR_ID]
+
+
+def test_benchmark_rejects_non_numeric_gpus(h: Harness, tmp_path: Path) -> None:
+    res = h.run("benchmark.sbatch", DATA=str(tmp_path), GPUS="two")
+    assert res.returncode == 2 and "GPUS must be" in res.stderr
 
 
 def test_benchmark_dry_run(h: Harness) -> None:

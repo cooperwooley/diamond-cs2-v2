@@ -60,10 +60,11 @@ What a job does, in order:
    | anything else | crash | `scancel`led, `ERROR: trainer crashed with exit code N` in the log | N |
 
    A job that is killed before it can react (wall-time, node failure) leaves the successor queued. A failure while staging
-   or validating also cancels the successor, so setup errors cannot loop.
+   or validating (including a missing `python`) also cancels the successor, so setup errors cannot loop.
 
 A job that finds `checkpoints/DONE` already present (a successor that started after its predecessor finished) exits 0
-immediately.
+immediately, before submitting a successor or staging anything. A job that receives SIGTERM (`scancel`, wall-time) stops
+the trainer (waiting up to 30 s), removes its staged data and leaves the successor queued, also during staging.
 
 ### Local checks (no Mill needed)
 
