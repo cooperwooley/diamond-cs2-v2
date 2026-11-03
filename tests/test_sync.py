@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -71,7 +72,12 @@ def remote(tmp_path: Path) -> Path:
 @pytest.fixture
 def cfg(tmp_path: Path, remote: Path):
     return load_config(
-        overrides=[f"paths.root={tmp_path / 'data'}", f"sync.remote_root={remote}", "pack.fullres_mod=1"]
+        overrides=[
+            f"paths.root={tmp_path / 'data'}",
+            f"sync.remote_root={remote}",
+            "pack.fullres_mod=1",
+            "sync.batch_mode=true",  # the project yaml is in password mode
+        ]
     )
 
 
@@ -380,9 +386,10 @@ def test_preflight_failure_is_clear_and_transfers_nothing(cfg, remote) -> None:
 
 
 def test_cli_returns_1_with_message_on_preflight_failure(cfg, monkeypatch, capsys, tmp_path) -> None:
-    monkeypatch.setattr(sync, "Transport", lambda host: NoKeyTransport())
+    monkeypatch.setattr(sync, "Transport", lambda host, **kw: NoKeyTransport())
     config = tmp_path / "c.yaml"
-    config.write_text(Path(__file__).resolve().parent.parent.joinpath("config/cs2wm.yaml").read_text())
+    text = Path(__file__).resolve().parent.parent.joinpath("config/cs2wm.yaml").read_text()
+    config.write_text(text.replace("batch_mode: false", "batch_mode: true"))
     with pytest.raises(SystemExit) as e:
         main(["--config", str(config), "sync"])
     assert e.value.code == 1
@@ -614,3 +621,167 @@ def test_push_skips_pack_staging_dirs(cfg, remote: Path) -> None:
     sync.push(cfg, transport=LocalTransport())
     assert (remote / "hdf5/dm/d1/d1_e0.hdf5").is_file()
     assert not [p for p in remote.rglob("*") if p.suffix in (".staging", ".old", ".deleting")]
+
+
+# --- password mode (sync.batch_mode: false) ------------------------------------------------------------------------
+
+CONTROL_OPTS = [
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPersist=10m",
+    "-o",
+    "ControlPath=~/.ssh/cm-dcs2-%r@%h:%p",
+    "-o",
+    "ConnectTimeout=30",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+]
+
+
+class SharedTransport(LocalTransport):
+    """Password mode over the local "Mill": records when the master is opened and closed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_mode = False
+        self.events: list[str] = []
+
+    def open_master(self) -> None:
+        self.events.append("open")
+
+    def close_master(self) -> None:
+        self.events.append("close")
+
+    def ssh_argv(self, remote_cmd: str) -> list[str]:
+        self.events.append("ssh")
+        return super().ssh_argv(remote_cmd)
+
+
+def test_batch_mode_argv_has_batchmode_and_no_control_options() -> None:
+    t = Transport("mill", windows=False, batch_mode=True)
+    assert t.ssh_argv("true") == ["ssh", *SSH_OPTS, "mill", "true"]
+    assert not any("Control" in a for a in t.ssh_argv("true") + t.rsync_argv("/a/", "mill:/b/"))
+
+
+def test_password_mode_argv_shares_one_connection_and_never_batchmode() -> None:
+    t = Transport("u@mill.mst.edu", windows=False, batch_mode=False)
+    assert t.ssh_argv("true") == ["ssh", *CONTROL_OPTS, "u@mill.mst.edu", "true"]
+    rsync = t.rsync_argv("/a/", t.remote_spec("/b/"))
+    assert shlex.split(rsync[rsync.index("-e") + 1]) == ["ssh", *CONTROL_OPTS]
+    assert not any("BatchMode" in a for a in t.ssh_argv("true") + rsync)
+    assert Transport("mill", windows=True, batch_mode=False).ssh_argv("true")[:3] == ["wsl.exe", "-e", "ssh"]
+
+
+def recording_runner(calls: list[tuple[list[str], dict]], returncode: int = 0, raises: Exception | None = None):
+    def fake(argv, **kw):
+        calls.append((list(argv), kw))
+        if raises:
+            raise raises
+        return subprocess.CompletedProcess(argv, returncode, stdout=b"", stderr=b"")
+
+    return fake
+
+
+def test_open_master_inherits_the_terminal_and_has_no_timeout() -> None:
+    calls: list[tuple[list[str], dict]] = []
+    t = Transport("mill", windows=True, runner=recording_runner(calls), batch_mode=False)
+    t.open_master()
+    argv, kw = calls[0]
+    assert argv == ["wsl.exe", "-e", "ssh", *CONTROL_OPTS, "mill", "true"]
+    # no capture, no stdin, no timeout: the password prompt must reach the terminal and wait for typing
+    assert kw == {"check": False}
+
+
+def test_open_master_failure_is_a_syncerror() -> None:
+    t = Transport("mill", windows=False, runner=recording_runner([], returncode=255), batch_mode=False)
+    with pytest.raises(SyncError, match="login to 'mill' failed"):
+        t.open_master()
+    gone = Transport(
+        "mill", windows=False, runner=recording_runner([], raises=FileNotFoundError("ssh")), batch_mode=False
+    )
+    with pytest.raises(SyncError, match="cannot run"):
+        gone.open_master()
+
+
+def test_close_master_runs_ssh_O_exit_and_tolerates_failure() -> None:
+    calls: list[tuple[list[str], dict]] = []
+    Transport("mill", windows=False, runner=recording_runner(calls), batch_mode=False).close_master()
+    assert calls[0][0] == ["ssh", *CONTROL_OPTS, "-O", "exit", "mill"]
+    # master already gone (exit 255), ssh missing, or hung: never an exception
+    Transport("mill", windows=False, runner=recording_runner([], returncode=255), batch_mode=False).close_master()
+    Transport(
+        "mill", windows=False, runner=recording_runner([], raises=FileNotFoundError("ssh")), batch_mode=False
+    ).close_master()
+    hung = recording_runner([], raises=subprocess.TimeoutExpired("ssh", 30))
+    Transport("mill", windows=False, runner=hung, batch_mode=False).close_master()
+
+
+def test_batch_mode_never_opens_or_closes_a_master() -> None:
+    calls: list[tuple[list[str], dict]] = []
+    t = Transport("mill", windows=False, runner=recording_runner(calls), batch_mode=True)
+    t.open_master()
+    t.close_master()
+    assert calls == []
+
+
+def test_password_run_opens_the_master_first_and_closes_it_last(cfg, remote) -> None:
+    files = make_demo(cfg, "d1")
+    t = SharedTransport()
+    summary = sync.run(cfg, t)
+    assert summary.ok and not any(f.exists() for f in files)
+    assert t.events[0] == "open" and t.events[-1] == "close"
+    assert t.events.count("open") == t.events.count("close") == 1 and "ssh" in t.events[1:-1]
+    assert t.ssh_cmds[0].startswith("printf %s")  # no BatchMode preflight: the open call is the login
+
+
+def test_password_run_closes_the_master_when_the_login_or_a_step_fails(cfg) -> None:
+    make_demo(cfg, "d1")
+
+    class LoginFails(SharedTransport):
+        def open_master(self) -> None:
+            super().open_master()
+            raise SyncError("login to 'mill' failed (ssh exited 255)")
+
+    t = LoginFails()
+    with pytest.raises(SyncError, match="login"):
+        sync.run(cfg, t)
+    assert t.events == ["open", "close"]
+
+    t = SharedTransport()
+    with pytest.raises(SyncError):
+        sync.verify_remote(cfg, "nope", t)  # raises before connecting: nothing to close
+    assert t.events == []
+    t = SharedTransport()
+    sync.push(cfg, transport=t)
+    sync.verify_remote(cfg, "d1", t)
+    assert t.events.count("open") == t.events.count("close") == 2
+
+
+def test_run_survives_a_failing_O_exit(cfg, remote) -> None:
+    def runner(argv, **kw):
+        if "-O" in argv:  # the master is already gone
+            return subprocess.CompletedProcess(argv, 255, stdout=b"", stderr=b"Control socket connect: No such file")
+        return real_run(argv, **kw)
+
+    class Gone(SharedTransport):
+        close_master = Transport.close_master
+
+    make_demo(cfg, "d1")
+    t = Gone()
+    t._runner = runner
+    assert sync.run(cfg, t).ok
+
+
+def test_config_defaults_to_password_mode_and_host_comes_from_the_environment(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("DCS2_MILL_HOST", raising=False)
+    c = load_config()
+    assert c.sync.host == "mill" and c.sync.batch_mode is False and c.sync.auto is False
+    monkeypatch.setenv("DCS2_MILL_HOST", "me@mill.mst.edu")
+    assert load_config().sync.host == "me@mill.mst.edu"
+    made: list[Transport] = []
+    monkeypatch.setattr(sync, "run", lambda cfg, transport=None: made.append(sync._default_transport(cfg)))
+    sync.run(load_config())
+    assert made[0].host == "me@mill.mst.edu" and made[0].batch_mode is False

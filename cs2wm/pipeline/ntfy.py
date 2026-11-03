@@ -81,6 +81,8 @@ class Snapshot:
         free_gb: Free space on the data drive.
         stage: What the supervisor is doing, e.g. ``render dm-0007``.
         counts: Demos per state.
+        waiting_for_sync: Demos packed and waiting for a manual ``cs2wm sync`` (0 when the supervisor syncs itself).
+        waiting_h: Their hours.
     """
 
     generated_h: float
@@ -91,6 +93,8 @@ class Snapshot:
     free_gb: float
     stage: str = "idle"
     counts: Mapping[str, int] = field(default_factory=dict)
+    waiting_for_sync: int = 0
+    waiting_h: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -137,6 +141,13 @@ def _counts(counts: Mapping[str, int]) -> str:
     return ", ".join(f"{n} {state}" for state, n in counts.items() if n) or "no demos"
 
 
+def _waiting(snap: Snapshot) -> str:
+    """A line about the demos waiting for a manual sync, or nothing."""
+    if not snap.waiting_for_sync:
+        return ""
+    return f"\n{snap.waiting_for_sync} demos ({snap.waiting_h:.2f} h) packed, waiting for a manual `cs2wm sync`."
+
+
 def format_start(
     target_hours: float,
     deadline: datetime,
@@ -163,7 +174,8 @@ def format_heartbeat(snap: Snapshot, target_hours: float, now: datetime, deadlin
         f"{snap.synced_h:.2f}/{target_hours:g} synced.\n"
         f"QA pass rate {_rate(snap.qa_pass_rate)}.\n"
         f"Disk: working set {snap.working_gb:.1f} GB, {snap.free_gb:.0f} GB free.\n"
-        f"Now: {snap.stage}. Demos: {_counts(snap.counts)}.\n"
+        f"Now: {snap.stage}. Demos: {_counts(snap.counts)}."
+        f"{_waiting(snap)}\n"
         f"{_duration((deadline - now).total_seconds())} to the deadline."
     )
     return Message("dcs2: heartbeat", body, "low", ("hourglass_flowing_sand",))
@@ -190,6 +202,8 @@ def format_summary(s: NightSummary) -> Message:
         ),
         f"Demos: {_counts(snap.counts)}.",
     ]
+    if snap.waiting_for_sync:
+        lines.append(_waiting(snap).strip())
     if s.failures:
         lines.append("Failures by stage and reason:")
         lines += [f"  {stage}: {reason} (x{n})" for stage, reason, n in s.failures]

@@ -1,8 +1,10 @@
 """sync: push packed HDF5, demos and QA to the Mill, verify checksums, free local disk (#16).
 
 Pushes ``hdf5/``, ``hdf5_fullres/``, ``demos/`` and ``qa/`` with ``rsync -a --partial`` (via ``wsl.exe -e rsync`` on
-Windows, with ``wslpath`` translation; ``rsync`` directly on Linux) using ``ssh -o BatchMode=yes``. Idempotent and
-resumable. Only HDF5 whose remote sha256 matches the local ``manifest.jsonl`` is ever deleted; demos stay local.
+Windows, with ``wslpath`` translation; ``rsync`` directly on Linux). Two login modes (``sync.batch_mode``): key-based
+``ssh -o BatchMode=yes`` (never prompts, can run unattended), or password mode, where the run opens one shared ssh
+connection (``ControlMaster``) first, so the password (and Duo) is asked once, on the terminal, and every later
+ssh/rsync call reuses it. Idempotent and resumable. Only HDF5 whose remote sha256 matches the local ``manifest.jsonl`` is ever deleted; demos stay local.
 
 Layout (see ``cs2wm.pipeline.pack``): a demo's low-res episodes and ``manifest.jsonl`` live in
 ``hdf5/<kind>/<demo_id>/``, its full-res subset in ``hdf5_fullres/<kind>/<demo_id>/``, the demo itself in
@@ -19,7 +21,8 @@ import os
 import re
 import shlex
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,10 +40,8 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # ``sync.remote_root`` may only hold these characters plus ``$USER``/``${USER}``, so it is safe inside double quotes.
 _ROOT_RE = re.compile(r"[A-Za-z0-9_./-]+")
 _ROOT_VAR_RE = re.compile(r"\$\{USER\}|\$USER")
-# BatchMode: never prompt. The rest make a dead connection fail in about a minute instead of hanging unattended.
-_SSH_OPTS = (
-    "-o",
-    "BatchMode=yes",
+# The timeouts make a dead connection fail in about a minute instead of hanging.
+_SSH_TIMEOUT_OPTS = (
     "-o",
     "ConnectTimeout=30",
     "-o",
@@ -48,11 +49,24 @@ _SSH_OPTS = (
     "-o",
     "ServerAliveCountMax=4",
 )
+# BatchMode: never prompt (key-based, unattended).
+_SSH_OPTS = ("-o", "BatchMode=yes", *_SSH_TIMEOUT_OPTS)
+# Password mode: one master connection shared by every ssh/rsync call. ssh expands ``~`` and the ``%`` tokens itself
+# (user, host, port), so they stay literal here; ``~`` is the WSL home on Windows.
+_SHARED_SSH_OPTS = (
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPersist=10m",
+    "-o",
+    "ControlPath=~/.ssh/cm-dcs2-%r@%h:%p",
+    *_SSH_TIMEOUT_OPTS,
+)
 _RSYNC_IO_TIMEOUT_S = 300
 
 
 class SyncError(RuntimeError):
-    """Raised when the Mill is unreachable without a password prompt or a transport command cannot run."""
+    """Raised when the Mill cannot be logged in to or a transport command cannot run."""
 
 
 class Transport:
@@ -61,9 +75,11 @@ class Transport:
     Tests subclass it (override ``ssh_argv`` and ``remote_spec``) so a local directory acts as the Mill.
 
     Args:
-        host: ``~/.ssh/config`` alias of the Mill (``sync.host``).
+        host: ssh host of the Mill: a ``~/.ssh/config`` alias or ``user@host`` (``sync.host``).
         windows: Route commands through ``wsl.exe -e`` (default: ``os.name == "nt"``). The ssh key lives in WSL.
         runner: ``subprocess.run`` stand-in (receives bytes on stdin, may return bytes or str).
+        batch_mode: ``sync.batch_mode``. True: ``BatchMode=yes``, never prompts. False: password mode, every call
+            shares the connection that ``open_master`` made.
     """
 
     def __init__(
@@ -71,17 +87,52 @@ class Transport:
         host: str,
         windows: bool | None = None,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        batch_mode: bool = True,
     ) -> None:
         self.host = host
         self.windows = os.name == "nt" if windows is None else windows
         self._runner = runner
+        self.batch_mode = batch_mode
+
+    @property
+    def ssh_opts(self) -> tuple[str, ...]:
+        """The ``-o`` options of every ssh call (and of rsync's ``-e ssh``)."""
+        return _SSH_OPTS if self.batch_mode else _SHARED_SSH_OPTS
 
     def _wrap(self, argv: list[str]) -> list[str]:
         return ["wsl.exe", "-e", *argv] if self.windows else argv
 
     def ssh_argv(self, remote_cmd: str) -> list[str]:
-        """Argv that runs ``remote_cmd`` (a shell command line) on the Mill without ever prompting."""
-        return self._wrap(["ssh", *_SSH_OPTS, self.host, remote_cmd])
+        """Argv that runs ``remote_cmd`` (a shell command line) on the Mill (never prompts: batch mode or shared)."""
+        return self._wrap(["ssh", *self.ssh_opts, self.host, remote_cmd])
+
+    def open_master(self) -> None:
+        """Password mode: log in once and leave the connection open for the later calls (no-op in batch mode).
+
+        Runs ``ssh true`` with the terminal's stdin/stdout/stderr and no timeout, so the password (and Duo) prompt
+        is visible and waits for typing. ``ControlPersist`` keeps the connection alive after ``true`` exits.
+
+        Raises:
+            SyncError: If ssh cannot be started or the login failed.
+        """
+        if self.batch_mode:
+            return
+        argv = self.ssh_argv("true")
+        try:
+            proc = self._runner(argv, check=False)
+        except OSError as e:
+            raise SyncError(f"cannot run {argv[0]!r}: {e}") from e
+        if proc.returncode != 0:
+            raise SyncError(f"login to {self.host!r} failed (ssh exited {proc.returncode})")
+
+    def close_master(self) -> None:
+        """Close the shared connection with ``ssh -O exit``. Never fails: it may already be gone (no-op in batch mode)."""
+        if self.batch_mode:
+            return
+        try:
+            self.run(self._wrap(["ssh", *self.ssh_opts, "-O", "exit", self.host]), timeout=30)
+        except SyncError as e:
+            logger.debug("sync: closing the shared connection failed: %s", e)
 
     def rsync_argv(self, src: str, dest: str, files_from_stdin: bool = False) -> list[str]:
         """Argv for ``rsync -a --partial`` of ``src`` (already a path the rsync binary can read) to ``dest``.
@@ -105,7 +156,7 @@ class Transport:
             "--exclude=*.old/",
             "--exclude=*.deleting/",
             "-e",
-            shlex.join(["ssh", *_SSH_OPTS]),
+            shlex.join(["ssh", *self.ssh_opts]),
         ]
         if files_from_stdin:
             argv += ["--files-from=-", "--from0"]
@@ -235,27 +286,43 @@ def _remote_root(transport: Transport, cfg: DictConfig) -> str:
 
 
 def _connect(transport: Transport, cfg: DictConfig) -> str:
-    """Fail fast if key auth is missing, then create the remote directories.
+    """Log in (password mode: prompt once; batch mode: fail fast without a key), then create the remote directories.
 
     Returns:
         The expanded absolute remote root.
 
     Raises:
-        SyncError: If ssh cannot log in non-interactively or the remote directories cannot be made.
+        SyncError: If ssh cannot log in or the remote directories cannot be made.
     """
-    proc = transport.run(transport.ssh_argv("true"), timeout=_ssh_timeout(cfg))
-    if proc.returncode != 0:
-        raise SyncError(
-            f"cannot log in to {transport.host!r} without a password (ssh -o BatchMode=yes {transport.host} true "
-            f"exited {proc.returncode}: {proc.stderr.strip() or 'no output'}). Key-based SSH is not set up: "
-            "finish issue #3 (ssh-keygen, the 'Host mill' alias in ~/.ssh/config, ssh-copy-id) first."
-        )
+    if transport.batch_mode:
+        proc = transport.run(transport.ssh_argv("true"), timeout=_ssh_timeout(cfg))
+        if proc.returncode != 0:
+            raise SyncError(
+                f"cannot log in to {transport.host!r} without a password (ssh -o BatchMode=yes {transport.host} true "
+                f"exited {proc.returncode}: {proc.stderr.strip() or 'no output'}). Key-based SSH is not set up: "
+                "finish issue #3 (ssh-keygen, the 'Host mill' alias in ~/.ssh/config, ssh-copy-id) first."
+            )
+    else:
+        transport.open_master()
     root = _remote_root(transport, cfg)
     dirs = " ".join(shlex.quote(f"{root}/{t}") for t in _TREES)
     proc = transport.run(transport.ssh_argv(f"mkdir -p {dirs}"), timeout=_ssh_timeout(cfg))
     if proc.returncode != 0:
         raise SyncError(f"mkdir -p under {root} failed on {transport.host}: {proc.stderr.strip()}")
     return root
+
+
+@contextmanager
+def _session(transport: Transport, cfg: DictConfig) -> Iterator[str]:
+    """``_connect``, then close the shared connection (password mode) however the body ends.
+
+    Yields:
+        The expanded absolute remote root.
+    """
+    try:
+        yield _connect(transport, cfg)
+    finally:
+        transport.close_master()
 
 
 def _demo_files(cfg: DictConfig, tree: str, demo_id: str) -> list[str]:
@@ -307,18 +374,23 @@ def push(cfg: DictConfig, demo_id: str | None = None, transport: Transport | Non
     Args:
         cfg: A validated cs2wm config.
         demo_id: Restrict to one demo (all pending demos if None).
-        transport: Command builder/runner (default: ``Transport(sync.host)``).
+        transport: Command builder/runner (default: a ``Transport`` for ``sync.host`` and ``sync.batch_mode``).
 
     Raises:
-        SyncError: If key auth is not set up or rsync fails (after attempting every directory).
+        SyncError: If the login fails or rsync fails (after attempting every directory).
         ValueError: If ``demo_id`` is not a plain id.
     """
     if demo_id is not None:
         _check_demo_id(demo_id)
-    transport = transport or Transport(str(cfg.sync.host))
-    errors = _push_trees(transport, cfg, _connect(transport, cfg), demo_id)
+    transport = transport or _default_transport(cfg)
+    with _session(transport, cfg) as root:
+        errors = _push_trees(transport, cfg, root, demo_id)
     if errors:
         raise SyncError("; ".join(errors.values()))
+
+
+def _default_transport(cfg: DictConfig) -> Transport:
+    return Transport(str(cfg.sync.host), batch_mode=bool(cfg.sync.batch_mode))
 
 
 def _check_demo_id(demo_id: str) -> None:
@@ -425,7 +497,7 @@ def verify_remote(cfg: DictConfig, demo_id: str, transport: Transport | None = N
     Args:
         cfg: A validated cs2wm config.
         demo_id: Demo to verify.
-        transport: Command builder/runner (default: ``Transport(sync.host)``).
+        transport: Command builder/runner (default: a ``Transport`` for ``sync.host`` and ``sync.batch_mode``).
 
     Returns:
         Local files that still exist, match the manifest, and whose remote copy matches too.
@@ -438,9 +510,9 @@ def verify_remote(cfg: DictConfig, demo_id: str, transport: Transport | None = N
     demos, _ = _find_demos(cfg, demo_id)
     if not demos:
         raise SyncError(f"no manifest.jsonl for demo {demo_id!r} under {cfg.paths.hdf5}")
-    transport = transport or Transport(str(cfg.sync.host))
-    root = _connect(transport, cfg)
-    return [p for kind, did in demos for p in _verify_demo(transport, root, cfg, kind, did)[0]]
+    transport = transport or _default_transport(cfg)
+    with _session(transport, cfg) as root:
+        return [p for kind, did in demos for p in _verify_demo(transport, root, cfg, kind, did)[0]]
 
 
 def delete_verified(files: list[Path]) -> int:
@@ -475,16 +547,21 @@ def run(cfg: DictConfig, transport: Transport | None = None) -> SyncSummary:
 
     Args:
         cfg: A validated cs2wm config.
-        transport: Command builder/runner (default: ``Transport(sync.host)``).
+        transport: Command builder/runner (default: a ``Transport`` for ``sync.host`` and ``sync.batch_mode``).
 
     Returns:
         Per-demo results (pushed, verified, deleted, errors) and any rsync errors; also logged.
 
     Raises:
-        SyncError: If key auth is not set up (checked before anything is transferred).
+        SyncError: If the login fails (checked before anything is transferred).
     """
-    transport = transport or Transport(str(cfg.sync.host))
-    root = _connect(transport, cfg)
+    transport = transport or _default_transport(cfg)
+    with _session(transport, cfg) as root:
+        return _run_connected(transport, cfg, root)
+
+
+def _run_connected(transport: Transport, cfg: DictConfig, root: str) -> SyncSummary:
+    """The body of ``run``, after the login: push every tree, verify each demo, delete what verified."""
     failed = _push_trees(transport, cfg, root, None)
     demos, skipped = _find_demos(cfg, None)
     summary = SyncSummary(push_errors=list(failed.values()), skipped=skipped)

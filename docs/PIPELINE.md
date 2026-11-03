@@ -28,7 +28,10 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
    (rewritten per run, so re-runs never duplicate lines). Each episode is read back and its actions must equal the
    labels. `frames/<demo_id>/` and `labels/<demo_id>/` are deleted once every episode is packed.
 6. **sync** (#16, `cs2wm.pipeline.sync`). rsyncs HDF5, demos and QA to the Mill, verifies every checksum there, and
-   only then deletes the local HDF5.
+   only then deletes the local HDF5. With `sync.batch_mode: false` (password mode) it opens one shared ssh connection
+   first (`ControlMaster`, closed with `ssh -O exit` at the end), so the SSO password and Duo are asked once on the
+   terminal; with `true` it uses key-only `BatchMode=yes` and never prompts. `sync.host` is `DCS2_MILL_HOST`
+   (default `mill`; e.g. `<sso>@mill.mst.edu`). On Windows both go through `wsl.exe`, and the connection lives in WSL.
 7. **supervise** (#20, `cs2wm.pipeline.supervisor`). A Windows scheduled task that loops over generate and the other
    stages with retries, a disk guard, a CS2 patch guard and ntfy notifications. State is kept in
    `state/pipeline.json` (done in #19: `pending -> segmented -> rendered -> extracted -> packed -> synced | failed`,
@@ -36,7 +39,10 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
 
    `cs2wm supervise --until HH:MM --target-hours H [--profile dm|smoke]` repeats "generate one block
    (`supervisor.generate_block_min`), advance every pending demo through segment, render, extract and pack, sync"
-   until the deadline (the next `HH:MM`, so 07:30 at 23:00 is tomorrow) or until H QA-passing hours are synced.
+   until the deadline (the next `HH:MM`, so 07:30 at 23:00 is tomorrow) or until H QA-passing hours are synced (packed,
+   with `sync.auto: false`). With `sync.auto: false` there is no sync stage: `packed` is where a demo's night ends, with no
+   stall backoff, sync failure or alert, and the packed hdf5 is not counted by the disk guard. The heartbeat and
+   morning summary report the demos waiting for a manual `cs2wm sync`.
    Generation stops `supervisor.drain_min` before the deadline. Each stage gets `supervisor.max_attempts` attempts per
    demo (`attempts` in the state) with `backoff_s * 2^(n-1)` between them; a failed render also kills CS2/HLAE. Guards:
    generation pauses while the working set (frames, raw, labels, hdf5, hdf5_fullres; not the demo archive) exceeds
@@ -58,8 +64,9 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
 
 By hand (the #19 pilot): `cs2wm segment|render|extract|pack --all-pending` runs a stage over every demo that is ready
 for it, in id order; a failing demo is marked `failed` (stage and reason) and the rest still run; the exit code is 1
-if any failed. `--retry-failed` retries the demos that failed in that stage. `cs2wm sync` marks verified demos
-`synced`, `cs2wm status` prints the state table with wall seconds per stage per demo-hour, and `cs2wm qa-summary
+if any failed. `--retry-failed` retries the demos that failed in that stage. `cs2wm sync` (by hand each morning in
+password mode: `$env:DCS2_MILL_HOST="<sso>@mill.mst.edu"; cs2wm sync` in PowerShell, which prompts for the password
+once) picks up every `packed` demo and marks verified ones `synced`, `cs2wm status` prints the state table with wall seconds per stage per demo-hour, and `cs2wm qa-summary
 [--kind K] [--since 24h]` aggregates `qa/*.jsonl`. Logs: `logs/cs2wm.log` and stderr.
 
 On the Mill, #17 assembles the synced HDF5 into DIAMOND `.pt` datasets for training (#29, #30).
