@@ -67,7 +67,10 @@ class Trainer(StateDictMixin):
 
         set_seed(torch.seed() % 10 ** 9)
 
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu", self._rank)
+        # main() hides the GPUs for devices=cpu, but that is too late when the Trainer is built in a process that has
+        # already initialised CUDA, so honour it here too.
+        on_cpu = cfg.common.devices == "cpu" or not torch.cuda.is_available()
+        self._device = torch.device("cpu" if on_cpu else "cuda", self._rank)
         print(f"Starting on {self._device}")
         self._use_cuda = self._device.type == "cuda"
         if self._use_cuda:
