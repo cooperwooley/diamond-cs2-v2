@@ -42,7 +42,8 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
    until the deadline (the next `HH:MM`, so 07:30 at 23:00 is tomorrow) or until H QA-passing hours are synced (packed,
    with `sync.auto: false`). With `sync.auto: false` there is no sync stage: `packed` is where a demo's night ends, with no
    stall backoff, sync failure or alert, and the packed hdf5 is not counted by the disk guard. The heartbeat and
-   morning summary report the demos waiting for a manual `cs2wm sync`.
+   morning summary report the demos waiting for a manual `cs2wm sync`. The target counts packed plus synced hours,
+   cumulatively across nights, as before. `supervise` refuses `sync.auto: true` with `sync.batch_mode: false`.
    Generation stops `supervisor.drain_min` before the deadline. Each stage gets `supervisor.max_attempts` attempts per
    demo (`attempts` in the state) with `backoff_s * 2^(n-1)` between them; a failed render also kills CS2/HLAE. Guards:
    generation pauses while the working set (frames, raw, labels, hdf5, hdf5_fullres; not the demo archive) exceeds

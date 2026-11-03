@@ -625,13 +625,7 @@ def test_push_skips_pack_staging_dirs(cfg, remote: Path) -> None:
 
 # --- password mode (sync.batch_mode: false) ------------------------------------------------------------------------
 
-CONTROL_OPTS = [
-    "-o",
-    "ControlMaster=auto",
-    "-o",
-    "ControlPersist=10m",
-    "-o",
-    "ControlPath=~/.ssh/cm-dcs2-%r@%h:%p",
+TIMEOUT_OPTS = [
     "-o",
     "ConnectTimeout=30",
     "-o",
@@ -639,6 +633,10 @@ CONTROL_OPTS = [
     "-o",
     "ServerAliveCountMax=4",
 ]
+CONTROL_PATH = ["-o", "ControlPath=~/.ssh/cm-dcs2-%r@%h:%p"]
+# only the opening call is the master; every other call is a client of it
+MASTER_OPTS = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m", *CONTROL_PATH, *TIMEOUT_OPTS]
+CONTROL_OPTS = ["-o", "ControlMaster=no", *CONTROL_PATH, *TIMEOUT_OPTS]
 
 
 class SharedTransport(LocalTransport):
@@ -672,6 +670,10 @@ def test_password_mode_argv_shares_one_connection_and_never_batchmode() -> None:
     rsync = t.rsync_argv("/a/", t.remote_spec("/b/"))
     assert shlex.split(rsync[rsync.index("-e") + 1]) == ["ssh", *CONTROL_OPTS]
     assert not any("BatchMode" in a for a in t.ssh_argv("true") + rsync)
+    # non-opening calls never become the master: ControlMaster=no and no ControlPersist
+    everything = t.ssh_argv("true") + rsync + [rsync[rsync.index("-e") + 1]]
+    assert "ControlMaster=no" in everything[1:] and not any("ControlPersist" in a for a in everything)
+    assert not any("ControlMaster=auto" in a for a in everything)
     assert Transport("mill", windows=True, batch_mode=False).ssh_argv("true")[:3] == ["wsl.exe", "-e", "ssh"]
 
 
@@ -690,7 +692,7 @@ def test_open_master_inherits_the_terminal_and_has_no_timeout() -> None:
     t = Transport("mill", windows=True, runner=recording_runner(calls), batch_mode=False)
     t.open_master()
     argv, kw = calls[0]
-    assert argv == ["wsl.exe", "-e", "ssh", *CONTROL_OPTS, "mill", "true"]
+    assert argv == ["wsl.exe", "-e", "ssh", *MASTER_OPTS, "mill", "true"]
     # no capture, no stdin, no timeout: the password prompt must reach the terminal and wait for typing
     assert kw == {"check": False}
 

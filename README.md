@@ -156,7 +156,8 @@ python scripts/verify_manifests.py $S/hdf5 --fullres-root $S/hdf5_fullres
 The supervisor loops generate and the other stages with retries, disk and CS2-patch guards and ntfy alerts, until the
 deadline or the target hours of packed data are reached. Keep the PC logged in, CS2 closed and Steam running. With
 `sync.auto: false` (the default) a demo's night ends at `packed`: nothing syncs overnight, the summary and heartbeats
-say how many demos wait, and you run `cs2wm sync` by hand in the morning.
+say how many demos wait, and you run `cs2wm sync` by hand in the morning. The target then counts packed plus synced
+hours, cumulatively across nights, as before.
 
 ```powershell
 # Windows PowerShell: run once by hand

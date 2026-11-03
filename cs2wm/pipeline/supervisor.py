@@ -722,8 +722,13 @@ class Supervisor:
             What happened; ``exit_code`` is non-zero if a guard tripped or an alert was sent.
 
         Raises:
-            ValueError: If ``until`` is not ``HH:MM``.
+            ValueError: If ``until`` is not ``HH:MM``, or ``sync.auto`` is true without ``sync.batch_mode``.
         """
+        if self._auto_sync and not self.cfg.sync.batch_mode:
+            raise ValueError(
+                "sync.auto: true needs sync.batch_mode: true (an ssh key): password mode would block the unattended "
+                "night on a prompt. Set sync.batch_mode: true, or sync.auto: false and run `cs2wm sync` by hand."
+            )
         now = self.hooks.now()
         night = self.night = Night(now, resolve_deadline(now, until), target_hours, profile)
         self._current = "starting"

@@ -53,15 +53,11 @@ _SSH_TIMEOUT_OPTS = (
 _SSH_OPTS = ("-o", "BatchMode=yes", *_SSH_TIMEOUT_OPTS)
 # Password mode: one master connection shared by every ssh/rsync call. ssh expands ``~`` and the ``%`` tokens itself
 # (user, host, port), so they stay literal here; ``~`` is the WSL home on Windows.
-_SHARED_SSH_OPTS = (
-    "-o",
-    "ControlMaster=auto",
-    "-o",
-    "ControlPersist=10m",
-    "-o",
-    "ControlPath=~/.ssh/cm-dcs2-%r@%h:%p",
-    *_SSH_TIMEOUT_OPTS,
-)
+_CONTROL_PATH = ("-o", "ControlPath=~/.ssh/cm-dcs2-%r@%h:%p")
+# Only the opening call may become the master. Every other call is a client (``ControlMaster=no``): if the master
+# died, it fails fast instead of silently starting a new one that prompts for a password mid-run.
+_MASTER_OPTS = ("-o", "ControlMaster=auto", "-o", "ControlPersist=10m", *_CONTROL_PATH, *_SSH_TIMEOUT_OPTS)
+_SHARED_SSH_OPTS = ("-o", "ControlMaster=no", *_CONTROL_PATH, *_SSH_TIMEOUT_OPTS)
 _RSYNC_IO_TIMEOUT_S = 300
 
 
@@ -96,7 +92,7 @@ class Transport:
 
     @property
     def ssh_opts(self) -> tuple[str, ...]:
-        """The ``-o`` options of every ssh call (and of rsync's ``-e ssh``)."""
+        """The ``-o`` options of every ssh call but the opening one (and of rsync's ``-e ssh``)."""
         return _SSH_OPTS if self.batch_mode else _SHARED_SSH_OPTS
 
     def _wrap(self, argv: list[str]) -> list[str]:
@@ -117,7 +113,7 @@ class Transport:
         """
         if self.batch_mode:
             return
-        argv = self.ssh_argv("true")
+        argv = self._wrap(["ssh", *_MASTER_OPTS, self.host, "true"])
         try:
             proc = self._runner(argv, check=False)
         except OSError as e:

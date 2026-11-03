@@ -1256,3 +1256,15 @@ def test_measure_disk_skips_packed_hdf5_only_without_auto_sync(cfg: DictConfig) 
 def test_project_config_is_in_password_mode_with_a_working_set_that_fits_20_hours() -> None:
     c = load_config()
     assert c.sync.batch_mode is False and c.sync.auto is False and c.supervisor.max_working_gb >= 40
+
+
+def test_unattended_night_refuses_password_mode(cfg: DictConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    OmegaConf.set_readonly(cfg, False)
+    cfg.sync.batch_mode = False  # sync.auto is true in this fixture
+    sup, world = make(cfg)
+    with pytest.raises(ValueError, match=r"sync\.auto: true needs sync\.batch_mode: true"):
+        sup.run_until("07:30", target_hours=1)
+    assert world.sent == [] and world.events == []
+    monkeypatch.setattr(cli, "_cfg", lambda args: cfg)
+    with pytest.raises(SystemExit, match=r"supervise: sync\.auto: true needs"):
+        cli.main(["supervise", "--until", "07:30", "--target-hours", "1"])
