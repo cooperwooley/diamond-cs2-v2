@@ -20,6 +20,7 @@ from cs2wm.eval import rotation
 from cs2wm.pipeline.pack import write_episode
 from cs2wm.play.agent import DEFAULT_AGENT_CONFIG_PATH, build_play_agent
 from cs2wm.play.world_model import WorldModel, sample_from_noise
+from models.diffusion.denoiser import Denoiser
 
 H, W = 150, 280
 LOW_H, LOW_W = 30, 56
@@ -348,23 +349,35 @@ def random_batch(b: int, t: int, seed: int = 0):
     return frames, ctx_actions, actions
 
 
+@pytest.fixture
+def float_denoiser(monkeypatch):
+    """Skip the denoiser's uint8 quantisation (``Denoiser.wrap_model_output``), keeping its clamp to [-1, 1]."""
+
+    def wrap_model_output(self, noisy_next_obs, model_output, cs):
+        return (cs.c_skip * noisy_next_obs + cs.c_out * model_output).clamp(-1, 1)
+
+    monkeypatch.setattr(Denoiser, "wrap_model_output", wrap_model_output)
+
+
 @pytest.mark.parametrize("steps", [1, 3])
-def test_batched_rollout_equals_independent_rollouts(agent, steps) -> None:
-    # The denoiser quantises its output to uint8 levels (2/255 apart), so float differences between a batched and
-    # an unbatched convolution can flip a rare pixel by a level (and the flip feeds the next step): compare to within
-    # a few levels on at most a few percent of the pixels.
+def test_batched_rollout_equals_independent_rollouts(agent, steps, float_denoiser) -> None:
+    # A batched and an unbatched convolution can differ by float rounding (the kernel depends on the batch size and the
+    # thread count). The denoiser truncates its output to uint8 levels (2/255 apart), which turns a rounding error next
+    # to a level boundary into a whole-level flip that the next step then amplifies (up to 4 levels on 8% of the
+    # pixels with one thread), so the quantisation is switched off here: what is left is float rounding (~1e-6 here),
+    # and any real mismatch (noise drawn in another order, a stream leaking into its neighbour) is orders larger.
+    tol = 1e-4
     world = WorldModel(agent, steps, use_upsampler=True)
     frames, ctx_actions, actions = random_batch(3, 3)
     low, full = world.rollout(frames, ctx_actions, actions, gens(11, 12, 13))
     assert low.shape == (3, 3, 3, LOW_H, LOW_W) and full.shape == (3, 3, 3, H, W)
     for i in range(3):
         low_i, full_i = world.rollout(frames[i : i + 1], ctx_actions[i : i + 1], actions[i : i + 1], gens(11 + i))
-        for got, want in ((low[i : i + 1], low_i), (full[i : i + 1], full_i)):
-            diff = (got - want).abs()
-            assert diff.max() <= 4 * 2 / 255 and (diff > 1e-4).float().mean() < 0.03
+        torch.testing.assert_close(low[i : i + 1], low_i, atol=tol, rtol=0)
+        torch.testing.assert_close(full[i : i + 1], full_i, atol=tol, rtol=0)
     # A stream's noise (and so its frames) does not depend on its neighbours or its position in the batch.
     low_r, _ = world.rollout(frames.flip(0), ctx_actions.flip(0), actions.flip(0), gens(13, 12, 11))
-    assert (low_r.flip(0) - low).abs().max() <= 4 * 2 / 255
+    torch.testing.assert_close(low_r.flip(0), low, atol=tol, rtol=0)
 
 
 def test_rollout_depends_on_the_action_and_the_model(agent, agent_cfg) -> None:
