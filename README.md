@@ -97,8 +97,12 @@ setx DCS2_NTFY_TOPIC "dcs2-<pick-a-long-random-string>"   # phone notifications;
 
 Everything on the Mill is run by hand over SSH. Details and the job lifecycle: [docs/MILL.md](docs/MILL.md).
 
+`cs2wm sync` logs in with your SSO password (and Duo) by default (`sync.batch_mode: false`, `sync.auto: false`): there is
+no SSH key, nothing syncs unattended, and you run it by hand (see below). Set `DCS2_MILL_HOST` to `<sso-id>@mill.mst.edu`.
+To sync unattended instead, set up a key, then set `sync.batch_mode: true` and `sync.auto: true`:
+
 ```bash
-# WSL: key-based SSH so `cs2wm sync` can run unattended (Host alias "mill")
+# WSL, optional: key-based SSH (Host alias "mill")
 ssh-keygen -t ed25519 -f ~/.ssh/mill_dcs2 -C "dcs2-sync" -N ""
 # add a "Host mill" block (HostName mill.mst.edu, User <sso-id>, IdentityFile ~/.ssh/mill_dcs2) to ~/.ssh/config
 ssh-copy-id -i ~/.ssh/mill_dcs2.pub mill
@@ -148,7 +152,8 @@ cs2wm render --all-pending
 cs2wm extract --all-pending
 cs2wm pack --all-pending
 cs2wm qa-summary                  # per-kind pass rate and passing hours
-cs2wm sync                        # rsync to the Mill, verify sha256, free local disk
+$env:DCS2_MILL_HOST="<sso>@mill.mst.edu"   # once per PowerShell window
+cs2wm sync                        # asks for the SSO password (and Duo) once, then rsync, verify sha256, free local disk
 cs2wm status                      # every demo should be "synced"
 ```
 
@@ -171,7 +176,10 @@ python scripts/verify_manifests.py $S/hdf5 --fullres-root $S/hdf5_fullres
 ### Unattended overnight run
 
 The supervisor loops generate and the other stages with retries, disk and CS2-patch guards and ntfy alerts, until the
-deadline or the target hours of QA-passing data are synced. Keep the PC logged in, CS2 closed and Steam running.
+deadline or the target hours of packed data are reached. Keep the PC logged in, CS2 closed and Steam running. With
+`sync.auto: false` (the default) a demo's night ends at `packed`: nothing syncs overnight, the summary and heartbeats
+say how many demos wait, and you run `cs2wm sync` by hand in the morning. The target then counts packed plus synced
+hours, cumulatively across nights, as before.
 
 ```powershell
 # Windows PowerShell: run once by hand
@@ -179,7 +187,8 @@ cs2wm supervise --until 07:30 --target-hours 20 --profile dm
 # Windows PowerShell: install the scheduled task "dcs2-supervisor" (nightly)
 powershell -ExecutionPolicy Bypass -File scripts\windows\install_task.ps1 -Start 23:00 -Until 07:30 -TargetHours 20 -Profile dm
 schtasks /Query /TN dcs2-supervisor /V /FO LIST | findstr /i "Status Next Last"
-# every morning
+# every morning: sync what the night packed (prompts for the password once)
+$env:DCS2_MILL_HOST="<sso>@mill.mst.edu"; cs2wm sync
 cs2wm status
 cs2wm qa-summary --since 24h
 # stop and disable

@@ -12,12 +12,14 @@ at a time, so generation and rendering are interleaved, never parallel. Demos go
 
 * Deadline: ``--until HH:MM`` is the next such time (23:00 -> 07:30 means tomorrow). Generation stops
   ``supervisor.drain_min`` early so the pipeline can drain; no new demo is started after the deadline, but what is
-  packed is synced once more before the summary.
+  packed is synced once more before the summary. With ``sync.auto: false`` there is no sync stage: ``packed`` is the end of
+  a demo's night (no backoff, no failure, no alert, no pause) and the summary counts the demos waiting for a manual
+  ``cs2wm sync``.
 * Retries: a stage gets ``supervisor.max_attempts`` attempts per demo (counted in the demo's ``attempts``), with
   ``backoff_s * 2^(n-1)`` between them and CS2/HLAE killed after a failed render. After the last one the demo is
   ``failed`` and the night goes on.
 * Disk guard: generation pauses while the working set exceeds ``max_working_gb`` and stops (with an alert) when the
-  drive has less than ``min_free_gb`` free. The demo archive is not counted.
+  drive has less than ``min_free_gb`` free. The demo archive is not counted, nor (``sync.auto: false``) the packed hdf5.
 * Patch guard: when the CS2 ``buildid`` differs from the one in ``state.meta``, a ~10 s render smoke test runs before
   anything else (see ``Supervisor.render_smoke_test``). If it fails, generation and rendering stop. Generate's own
   ``PatchGuardError`` stops generation too; what is already generated is still drained.
@@ -368,7 +370,10 @@ def measure_disk(cfg: DictConfig, exclude: Iterable[str] = ()) -> tuple[float, f
     """Measure the disk guard's inputs.
 
     The working set is ``frames``, ``raw``, ``labels``, ``hdf5`` and ``hdf5_fullres`` (the pack ``.staging`` dirs live
-    inside them) but not the demo archive, which is never deleted. Free space is that of the drive holding ``paths.root``.
+    inside them) but not the demo archive, which is never deleted. With ``sync.auto: false`` the packed ``hdf5`` and
+    ``hdf5_fullres`` are the night's product, waiting for a manual sync, so they are not counted either (frames, raw
+    and labels are deleted by pack; ``min_free_gb`` still protects the drive). Free space is that of the drive
+    holding ``paths.root``.
 
     Args:
         cfg: A validated cs2wm config.
@@ -378,7 +383,8 @@ def measure_disk(cfg: DictConfig, exclude: Iterable[str] = ()) -> tuple[float, f
     Returns:
         ``(working set GB, free GB)``.
     """
-    working = sum(_dir_bytes(Path(cfg.paths[name])) for name in WORKING_SET_DIRS)
+    names = WORKING_SET_DIRS if cfg.sync.auto else tuple(n for n in WORKING_SET_DIRS if not n.startswith("hdf5"))
+    working = sum(_dir_bytes(Path(cfg.paths[name])) for name in names)
     working -= sum(size for _, _, size in failed_leftovers(cfg, exclude))
     probe = Path(cfg.paths.root)
     while not probe.exists() and probe != probe.parent:
@@ -716,8 +722,13 @@ class Supervisor:
             What happened; ``exit_code`` is non-zero if a guard tripped or an alert was sent.
 
         Raises:
-            ValueError: If ``until`` is not ``HH:MM``.
+            ValueError: If ``until`` is not ``HH:MM``, or ``sync.auto`` is true without ``sync.batch_mode``.
         """
+        if self._auto_sync and not self.cfg.sync.batch_mode:
+            raise ValueError(
+                "sync.auto: true needs sync.batch_mode: true (an ssh key): password mode would block the unattended "
+                "night on a prompt. Set sync.batch_mode: true, or sync.auto: false and run `cs2wm sync` by hand."
+            )
         now = self.hooks.now()
         night = self.night = Night(now, resolve_deadline(now, until), target_hours, profile)
         self._current = "starting"
@@ -804,13 +815,13 @@ class Supervisor:
             )
 
     def _can_progress(self) -> bool:
-        """Whether any demo could still move tonight: something to sync, or a demo whose next stage may run.
+        """Whether any demo could still move tonight: something to sync (``sync.auto``), or a demo whose next stage may run.
 
         A demo parked by ``supervisor.max_demo_wall_min`` is not started again before tomorrow.
         """
         cap_s = float(self.cfg.supervisor.max_demo_wall_min) * 60
         for demo_id, rec in self.state.demos.items():
-            if rec["state"] == "packed":
+            if rec["state"] == "packed" and self._auto_sync:
                 return True
             if rec["state"] in _ADVANCEABLE and self.night.demo_wall_s[demo_id] < cap_s:
                 stage = next(s for s in STAGES if _INPUT_STATE[s].value == rec["state"])
@@ -1120,9 +1131,12 @@ class Supervisor:
             )
 
     def _sync_packed(self) -> int:
-        """Sync everything packed (up to ``max_attempts`` tries with backoff). Returns the demos that reached the Mill."""
+        """Sync everything packed (up to ``max_attempts`` tries with backoff). Returns the demos that reached the Mill.
+
+        Does nothing with ``sync.auto: false``: ``packed`` is the end of the night and ``cs2wm sync`` is run by hand.
+        """
         night, limit = self.night, int(self.cfg.supervisor.max_attempts)
-        if self._sync_down or not any(r["state"] == "packed" for r in self.state.demos.values()):
+        if not self._auto_sync or self._sync_down or not any(r["state"] == "packed" for r in self.state.demos.values()):
             return 0
         synced_before = self._count("synced")
         ok = False
@@ -1155,6 +1169,11 @@ class Supervisor:
 
     # -- bookkeeping --------------------------------------------------------------------------------------------------
 
+    @property
+    def _auto_sync(self) -> bool:
+        """``sync.auto``: whether the night syncs by itself (key-based ssh) or stops at ``packed``."""
+        return bool(self.cfg.sync.auto)
+
     def _count(self, state: str) -> int:
         return sum(1 for rec in self.state.demos.values() if rec["state"] == state)
 
@@ -1168,7 +1187,9 @@ class Supervisor:
         return self._hours(("synced",), "frames", kind)
 
     def _target_reached(self) -> bool:
-        return self.synced_hours(self.night.profile) >= self.night.target_hours  # only the profile's kind counts
+        # Only the profile's kind counts. Without auto sync nothing is ever synced tonight, so packed hours count.
+        states = ("synced",) if self._auto_sync else ("packed", "synced")
+        return self._hours(states, "frames", self.night.profile) >= self.night.target_hours
 
     def _snapshot(self) -> ntfy.Snapshot:
         demos = self.state.demos.values()
@@ -1186,6 +1207,8 @@ class Supervisor:
             free_gb=free,
             stage=self._current,
             counts={s: self._count(s) for s in ordered},
+            waiting_for_sync=0 if self._auto_sync else self._count("packed"),
+            waiting_h=0.0 if self._auto_sync else self._hours(("packed",), "frames"),
         )
 
     def _summary(self) -> ntfy.Message:

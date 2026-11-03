@@ -137,7 +137,9 @@ render:
   png_compression: 1                # cv2 IMWRITE_PNG_COMPRESSION (0-9) for frames/; low = fast, see render.py
 
 sync:
-  host: mill                        # ~/.ssh/config alias from #3
+  host: ${oc.env:DCS2_MILL_HOST,mill}   # ~/.ssh/config alias from #3, or <sso>@mill.mst.edu in password mode
+  batch_mode: false                 # false: SSO password (and Duo), asked once per run on a shared ssh connection. true: key-only BatchMode=yes, never prompts
+  auto: false                       # false: the supervisor stops at packed and never syncs; run `cs2wm sync` by hand. true: it syncs unattended (needs batch_mode: true)
   remote_root: /share/ceph/scratch/$USER/dcs2   # $USER expanded on the Mill (only [A-Za-z0-9_./-] and $USER allowed)
   rsync_timeout_s: 3600             # kill one rsync (a whole tree) after this long; rsync also has a 300 s I/O timeout
   ssh_timeout_s: 120                # kill the preflight / mkdir / remote-root ssh calls after this long
@@ -147,7 +149,9 @@ sync:
 supervisor:
   generate_block_min: 60            # one generate block per loop iteration, then everything pending is drained.   TUNE(#19)
   drain_min: 45                     # stop generating this long before --until, to leave time to drain the pipeline.   TUNE(#19)
-  max_working_gb: 8                 # pause generation above this working set (frames, raw, labels, hdf5, hdf5_fullres)
+  # pause generation above this working set (frames, raw, labels, hdf5, hdf5_fullres). With sync.auto: false packed demos
+  # wait for a manual sync, so ~20 h of hdf5 stays on disk and is not counted; min_free_gb still protects the drive.
+  max_working_gb: 40
   min_free_gb: 15                   # stop generating and alert when the drive has less free space than this
   heartbeat_min: 60
   max_attempts: 3                   # attempts per stage per demo, then the demo is failed and the night goes on

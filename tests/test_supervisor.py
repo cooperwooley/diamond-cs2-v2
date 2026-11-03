@@ -18,7 +18,7 @@ from typing import Any, ClassVar
 
 import pytest
 import requests
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from cs2wm import cli
 from cs2wm.config import ConfigError, load_config
@@ -199,6 +199,8 @@ def cfg(tmp_path: Path) -> DictConfig:
             "supervisor.generate_block_min=60",
             "supervisor.max_working_gb=8",
             "supervisor.min_free_gb=15",
+            "sync.auto=true",  # the project yaml is in password mode; these tests drive the unattended key mode
+            "sync.batch_mode=true",
         ]
     )
 
@@ -817,7 +819,7 @@ def test_supervisor_config_is_validated(override: str, fragment: str) -> None:
 
 def test_default_supervisor_config() -> None:
     sup = load_config().supervisor
-    assert (sup.generate_block_min, sup.max_working_gb, sup.max_attempts, sup.heartbeat_min) == (60, 8, 3, 60)
+    assert (sup.generate_block_min, sup.max_working_gb, sup.max_attempts, sup.heartbeat_min) == (60, 40, 3, 60)
 
 
 def test_cli_supervise_returns_the_night_exit_code(cfg: DictConfig, monkeypatch) -> None:
@@ -943,6 +945,8 @@ def test_a_demo_that_used_its_wall_time_budget_is_given_up_on(tmp_path: Path) ->
             f"paths.root={tmp_path / 'data'}",
             f"paths.cs2_dir={tmp_path / 'cs2'}",
             "supervisor.max_demo_wall_min=90",
+            "sync.auto=true",
+            "sync.batch_mode=true",
         ]
     )
     world = World(cfg)
@@ -1162,3 +1166,105 @@ def test_stall_clears_as_soon_as_a_pass_makes_progress(cfg: DictConfig) -> None:
     night = sup.run_until("23:50", target_hours=99)
     assert len(world.by_title("pipeline stalled")) == 1 and len(world.by_title("stall cleared")) == 1
     assert world.generate_hours == [] and not night.stalled  # cleared by the sync, though generation is still paused
+
+
+# --- sync.auto: false (password mode): the night stops at packed (#63) --------------------------------------------
+
+
+@pytest.fixture
+def manual_cfg(cfg: DictConfig) -> DictConfig:
+    OmegaConf.set_readonly(cfg, False)
+    cfg.sync.auto = False
+    return cfg
+
+
+def test_manual_sync_night_ends_cleanly_at_packed(manual_cfg: DictConfig) -> None:
+    sup, world = make(manual_cfg)
+    world.sync_failures = 99  # would fail every attempt if the sync stage ever ran
+    night = sup.run_until("23:50", target_hours=99)
+    states = {r["state"] for r in sup.state.demos.values()}
+    assert states == {"packed"} and "sync" not in world.events
+    assert night.exit_code == 0 and not night.alerts and not night.stalled
+    assert not world.by_title("sync failing") and not world.by_title("pipeline stalled")
+    assert all("sync" not in r.get("stages", {}) and "failed_stage" not in r for r in sup.state.demos.values())
+    assert night.stage_runs["sync"] == 0 and night.stage_wall_s["sync"] == 0
+
+
+def test_manual_sync_night_does_not_back_off_for_unsynced_demos(manual_cfg: DictConfig) -> None:
+    sup, world = make(manual_cfg)
+    sup.state.mark("old", StageState.PACKED, kind="dm", frames=FRAMES)
+    night = sup.run_until("07:30", target_hours=99)
+    assert 600.0 not in world.sleeps  # supervisor.stall_backoff_min
+    assert "nothing left to do" in night.reason or "deadline" in night.reason
+    assert sup.state.state_of("old") is StageState.PACKED and "sync" not in world.events
+
+
+def test_manual_sync_does_not_pause_generation_for_unsynced_demos(manual_cfg: DictConfig) -> None:
+    sup, world = make(manual_cfg)
+    sup.state.mark("old", StageState.PACKED, kind="dm", frames=FRAMES)
+    sup.run_until("07:30", target_hours=0.5)
+    assert world.generate_hours and not world.by_title("disk")
+
+
+def test_manual_sync_target_counts_packed_hours(manual_cfg: DictConfig) -> None:
+    sup, world = make(manual_cfg)
+    night = sup.run_until("07:30", target_hours=1 / 3)  # two demos of 1/6 h each
+    assert night.reason == "target reached" and sup.synced_hours() == 0
+    assert sup._count("packed") == 2 and "sync" not in world.events
+
+
+def test_manual_sync_summary_and_heartbeat_count_the_waiting_demos(manual_cfg: DictConfig) -> None:
+    sup, world = make(manual_cfg)
+    sup.run_until("23:50", target_hours=99)
+    summary = world.by_title("morning summary")[0]["body"]
+    n = sup._count("packed")
+    assert n >= 1 and f"{n} demos (" in summary and "packed, waiting for a manual `cs2wm sync`" in summary
+    sup._next_heartbeat = T0
+    sup._heartbeat()
+    assert "waiting for a manual `cs2wm sync`" in world.by_title("heartbeat")[-1]["body"]
+
+
+def test_auto_sync_messages_do_not_mention_waiting_demos(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    sup.run_until("07:30", target_hours=0.3)
+    assert all("manual" not in m["body"] for m in world.sent)
+
+
+def test_ntfy_waiting_line_only_when_demos_wait() -> None:
+    waiting = ntfy.Snapshot(1, 1, 0, None, 1, 100, counts={"packed": 3}, waiting_for_sync=3, waiting_h=0.5)
+    assert (
+        "3 demos (0.50 h) packed, waiting for a manual `cs2wm sync`."
+        in ntfy.format_heartbeat(waiting, 20, T0, DEADLINE).body
+    )
+    assert "manual" not in ntfy.format_heartbeat(SNAP, 20, T0, DEADLINE).body
+    summary = ntfy.NightSummary(snapshot=waiting, target_hours=20, started=T0, ended=DEADLINE, reason="deadline")
+    assert "waiting for a manual" in ntfy.format_summary(summary).body
+
+
+def test_measure_disk_skips_packed_hdf5_only_without_auto_sync(cfg: DictConfig) -> None:
+    from cs2wm.pipeline.supervisor import measure_disk
+
+    for name, size in (("frames", 1000), ("hdf5", 4000), ("hdf5_fullres", 500)):
+        Path(cfg.paths[name]).mkdir(parents=True, exist_ok=True)
+        (Path(cfg.paths[name]) / "x.bin").write_bytes(b"0" * size)
+    assert measure_disk(cfg)[0] == pytest.approx(5500 / 1e9)  # sync.auto: true counts everything
+    OmegaConf.set_readonly(cfg, False)
+    cfg.sync.auto = False
+    assert measure_disk(cfg)[0] == pytest.approx(1000 / 1e9)
+
+
+def test_project_config_is_in_password_mode_with_a_working_set_that_fits_20_hours() -> None:
+    c = load_config()
+    assert c.sync.batch_mode is False and c.sync.auto is False and c.supervisor.max_working_gb >= 40
+
+
+def test_unattended_night_refuses_password_mode(cfg: DictConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    OmegaConf.set_readonly(cfg, False)
+    cfg.sync.batch_mode = False  # sync.auto is true in this fixture
+    sup, world = make(cfg)
+    with pytest.raises(ValueError, match=r"sync\.auto: true needs sync\.batch_mode: true"):
+        sup.run_until("07:30", target_hours=1)
+    assert world.sent == [] and world.events == []
+    monkeypatch.setattr(cli, "_cfg", lambda args: cfg)
+    with pytest.raises(SystemExit, match=r"supervise: sync\.auto: true needs"):
+        cli.main(["supervise", "--until", "07:30", "--target-hours", "1"])
