@@ -165,7 +165,7 @@ supervisor:
   ntfy_topic: ${oc.env:DCS2_NTFY_TOPIC,null}   # secret; never committed
 
 play:
-  sensitivity: 2.5    # set to your CS2 sensitivity (#2); 2.5 reproduces P&Z units exactly
+  sensitivity: 1.15   # the owner's CS2 sensitivity (#2); 2.5 would reproduce P&Z units exactly
   m_yaw: 0.022        # deg per mouse count at sensitivity 1
   m_pitch: 0.022
   window_scale: 4     # window = render resolution x this (280x150 -> 1120x600)
