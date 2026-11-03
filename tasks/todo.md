@@ -28,3 +28,31 @@ Tracking issue: https://github.com/cooperwooley/diamond-cs2-v2/issues/1
 - Found and fixed a v1 bug: `.byte()` wraps bicubic overshoot (257.5 -> 1). v2 clamps; see #12.
 - Still open: `fire_recall` is 1.0 by construction inside `extract_episode`. It becomes a real alignment check
   only when recomputed from packed labels in the #19 pilot.
+
+## Phase 4: Dev loop over the open issues (2026-10-23 to 10-24)
+Each code issue got the same treatment:
+1. A branch stacked on the issue it depends on.
+2. Implementation.
+3. An independent review, with its fixes applied.
+4. A PR.
+5. A comment on the issue listing any manual steps, with exact commands.
+
+PRs #40–#61 are merged into `main` (CI green, 1152 tests).
+
+- [x] M1: #5, #6, #7, #9, #10, #11, #12, #13, #15, #16, #17, #18 (tooling), stage wiring for #19
+- [x] M2: #20, #26 (draft), #27, #28
+- [x] M4: #32, #33, #34, #36
+- [x] M5: #37 (draft), #38 (README, fixture demo, fresh-clone check)
+- [ ] Manual or data-dependent, posted on the issues: #2, #3, #4, #8, #14 (`CONFIRM(#14)` checklist), #19, #21–#25, #29–#31, #35
+- [ ] #39 slides: needs results (#35, #36)
+
+## Review (Phase 4)
+Reviews found and fixed these before merge:
+- **sync (#16):** CRLF stdin on Windows (verification would never pass) and missing timeouts.
+- **generate (#13):** crash loops that never alerted, Windows file locks that killed the run, and duplicate publishes.
+- **supervisor (#20):** retry multiplication, Mill outages ending the night early, and a disk guard tripped by failed demos.
+- **train.sbatch (#7):** a lost exit code during the USR1 trap.
+- **H1 (#32):** regression dilution in the px→deg calibration. The fix regresses px on the exact label.
+- **H2 (#33):** inscribed-ellipse smoke masks, which gave 0 px on near smokes. The fix is an exact ray/sphere test.
+- **Pack (#12):** a crash window during cleanup, and a fire-mask wrap at episode starts. The fire-mask bug came from PR #40's extractor.
+- **Report assets (#36):** negative numbers in math mode, and null controls getting bold.
