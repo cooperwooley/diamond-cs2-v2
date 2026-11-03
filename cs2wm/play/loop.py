@@ -302,9 +302,9 @@ def benchmark(
     Returns:
         The report that was written: device info plus ``results[name]`` with ``status``, ``fps`` and ``ms_per_frame``.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if agent is None:
-        agent = load_agent(ckpt, upsampler_ckpt, device)
+        agent = load_agent(ckpt, upsampler_ckpt, "cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(agent.device)  # the models run where the agent lives, whatever the host has
     has_upsampler = agent.upsampler is not None
     spec = ActionSpec.from_config(cfg)
     idle = blank_context(1, cfg.resolution.low_res, spec)[1][0]
