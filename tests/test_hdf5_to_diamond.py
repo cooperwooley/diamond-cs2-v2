@@ -185,6 +185,37 @@ def test_errors_on_empty_input_and_existing_output(conv, tree, tmp_path) -> None
         convert(conv, tree, tmp_path / "ds")
 
 
+# Full-res subset
+
+
+def test_fullres_root_keeps_only_twins_with_the_full_datasets_split(conv, tree, tmp_path) -> None:
+    twins = {"dm0_e0", "dm2_e0", "human1_e0", "smoke0_e0", "smoke4_e0"}
+    fullres = tmp_path / "fullres"
+    for low in tree.rglob("*.hdf5"):
+        if low.stem in twins:
+            d = fullres / low.parent.relative_to(tree)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / low.name).write_bytes(b"")  # only the name matters for matching
+    convert(conv, tree, tmp_path / "full", "--seed", "3")
+    convert(conv, tree, tmp_path / "sub", "--seed", "3", "--fullres-root", str(fullres))
+
+    assert split_of(tmp_path / "sub") == split_of(tmp_path / "full")
+    full_rows = {
+        r["episode_id"]: r for r in json.loads((tmp_path / "full" / "dataset_meta.json").read_text())["episodes"]
+    }
+    sub_meta = json.loads((tmp_path / "sub" / "dataset_meta.json").read_text())
+    assert {r["episode_id"] for r in sub_meta["episodes"]} == twins
+    assert sub_meta["fullres_root"] == str(fullres)
+    for r in sub_meta["episodes"]:
+        assert r["split"] == full_rows[r["episode_id"]]["split"]
+
+
+def test_fullres_root_without_twins_fails(conv, tree, tmp_path) -> None:
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(SystemExit, match="no episode has a full-res twin"):
+        convert(conv, tree, tmp_path / "ds", "--fullres-root", str(tmp_path / "empty"))
+
+
 # Derangement and shuffled actions
 
 
