@@ -212,6 +212,32 @@ Fallbacks:
   `-p $V100_PARTITION --gres=$V100_GRES` and `HW=v100`. It resumes from the same run dir.
 - Time is short: stop at the last checkpoint at or after epoch 100 and report the epoch used.
 
+### #70: upsampler on the full-res subset
+
+v1's upsampler checkpoint is lost, so v2 trains its own, on the ~10% full-res JPEG subset (`$S/hdf5_fullres`). Build the
+subset dataset first (the split equals the full dataset's, so its test set never overlaps the denoiser's train demos; see
+DATASET.md §8.4):
+
+```bash
+python scripts/hdf5_to_diamond.py --hdf5 $S/hdf5 --fullres-root $S/hdf5_fullres --out $S/datasets/v2-upsampler \
+  --kinds dm,human,smoke --test-frac 0.1 --seed 0
+```
+
+Check the printed train/test frame counts before submitting: the 10% subset can leave a split small or empty.
+
+Then submit it like the denoiser run, on the free `requeue` partition with the same successor chain. `training.models=[upsampler]`
+makes the trainer step and evaluate only the upsampler, and `env.path_data_full_res` points at the full-res tree (read
+directly from scratch, not staged; the training job needs only a few frames per step). `DRY_RUN=1` shows both in the python command.
+
+```bash
+sbatch -p $H100_PARTITION --gres=$H100_GRES -J v2-ups \
+  --export=ALL,RUN_NAME=v2-upsampler,DATASET=v2-upsampler,HW=h100,RESUBMITS_LEFT=4,EXTRA="training.models=[upsampler] env.path_data_full_res=$S/hdf5_fullres" \
+  scripts/mill/train.sbatch
+```
+
+Its `agent_versions/agent_epoch_*.pt` hold the trained upsampler (the denoiser in them is untouched random init, ignore it).
+For play and eval use `build_play_agent(<v2 denoiser ckpt>, <upsampler ckpt>)` as with the v1 upsampler.
+
 ### #30: shuffled-action control (H1 null model)
 
 Run it concurrently with #29 on a second H100 if the queue allows, otherwise right after.

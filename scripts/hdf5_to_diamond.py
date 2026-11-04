@@ -13,6 +13,10 @@ says train has none), because an H2 evaluation without smoke test data is worse 
 derangement, tiled or cropped to the episode's length); test keeps the true actions. Where possible the source is
 from a different demo too (see ``assign_action_sources``), so the control cannot reuse the same match.
 
+``--fullres-root`` keeps only the episodes that have a full-res twin there (the ~10% subset, ``$S/hdf5_fullres``), for
+training the upsampler on its own. The split is computed on the full set first and filtered afterwards, so every kept
+episode is in the same split as in the full dataset built with the same ``--hdf5/--kinds/--test-frac/--seed``.
+
 The split depends on the full set of demos present. Build the main and the shuffled dataset together, from the same
 HDF5 snapshot and with the same ``--seed``; adding demos later re-draws the split.
 
@@ -78,6 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kinds", default="dm,human,smoke", help="comma-separated episode kinds to include")
     p.add_argument("--test-frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--fullres-root",
+        help="root of the full-res HDF5 tree ($S/hdf5_fullres): keep only the episodes that have a twin there",
+    )
     p.add_argument("--shuffle-actions", action="store_true", help="build the shuffled-action control (train only)")
     return p
 
@@ -298,6 +306,12 @@ def _manifest_checksums(hdf5_root: Path) -> dict[str, str]:
     return {str(p.relative_to(root)): sha256_file(p) for p in manifests}
 
 
+def fullres_keys(fullres_root: Path) -> set[str]:
+    """Keys ``<demo_id>/<episode_id>.hdf5`` of the full-res files under a root (the full-res loader's keys)."""
+    root = Path(fullres_root)
+    return {f"{p.parent.name}/{p.name}" for p in root.rglob("*.hdf5") if not _in_transient_dir(p, root)}
+
+
 def convert(
     hdf5_root: Path,
     out: Path,
@@ -305,6 +319,7 @@ def convert(
     test_frac: float,
     seed: int,
     shuffle_actions: bool,
+    fullres_root: Path | None = None,
 ) -> dict[str, Any]:
     """Assemble the dataset.
 
@@ -315,12 +330,14 @@ def convert(
         test_frac: Requested test fraction per kind.
         seed: Split and derangement seed.
         shuffle_actions: Build the shuffled-action control.
+        fullres_root: If given, keep only the episodes with a full-res twin under it. The split is computed before
+            filtering, so it equals the split of the unfiltered dataset.
 
     Returns:
         The contents of ``dataset_meta.json``.
 
     Raises:
-        SystemExit: If there is nothing to convert, train or test would be empty, the output exists, or
+        SystemExit: If there is nothing to convert, no episode has a full-res twin, train or test would be empty, the output exists, or
             ``--shuffle-actions`` has fewer than 2 train episodes.
     """
     hdf5_root, out = Path(hdf5_root), Path(out)
@@ -330,10 +347,21 @@ def convert(
     if not episodes:
         raise SystemExit(f"no episodes of kinds {list(kinds)} under {hdf5_root}")
     split = split_demos({e.demo_id: e.kind for e in episodes}, test_frac, seed)
+    if fullres_root is not None:
+        twins = fullres_keys(fullres_root)
+        episodes = [e for e in episodes if f"{e.demo_id}/{e.episode_id}.hdf5" in twins]
+        if not episodes:
+            raise SystemExit(f"no episode has a full-res twin under {fullres_root}")
     by_split = {s: [e for e in episodes if split[e.demo_id] == s] for s in SPLITS}
     for s, eps in by_split.items():
         if not eps:
-            raise SystemExit(f"the {s} split is empty ({len(episodes)} episodes, {len(split)} demos); add demos")
+            hint = (
+                f"the full-res subset left the {s} split empty (only {len(episodes)} episodes have a twin under "
+                f"{fullres_root}); add more data or raise --test-frac"
+                if fullres_root is not None
+                else f"the {s} split is empty ({len(episodes)} episodes, {len(split)} demos); add demos"
+            )
+            raise SystemExit(hint)
     sources: dict[str, EpisodeRef] = {}
     shuffle_info: dict[str, Any] | None = None
     if shuffle_actions:
@@ -374,6 +402,7 @@ def convert(
         "test_frac": test_frac,
         "seed": seed,
         "shuffle_actions": shuffle_actions,
+        "fullres_root": str(fullres_root) if fullres_root is not None else None,
         "shuffle": shuffle_info,
         "source_manifests": _manifest_checksums(hdf5_root),
         "episodes": table,
@@ -391,9 +420,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         Exit code.
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.fullres_root and args.shuffle_actions:
+        parser.error("the upsampler ignores actions; build the full-res dataset without --shuffle-actions")
     kinds = [k for k in args.kinds.split(",") if k]
-    meta = convert(Path(args.hdf5), Path(args.out), kinds, args.test_frac, args.seed, args.shuffle_actions)
+    fullres_root = Path(args.fullres_root) if args.fullres_root else None
+    meta = convert(
+        Path(args.hdf5), Path(args.out), kinds, args.test_frac, args.seed, args.shuffle_actions, fullres_root
+    )
     for s in SPLITS:
         rows = [r for r in meta["episodes"] if r["split"] == s]
         demos = {r["demo_id"] for r in rows}

@@ -159,11 +159,20 @@ class Trainer(StateDictMixin):
         def build_lr_sched(name: str) -> torch.optim.lr_scheduler.LambdaLR:
             return get_lr_sched(self.opt.get(name), getattr(cfg, name).training.lr_warmup_steps)
 
-        model_names = ["denoiser", "upsampler"]
-        self._model_names = [name for name in model_names if getattr(self.agent, name) is not None]
+        # Models that get optimizer steps and an eval pass (training.models); the others stay as built or loaded.
+        if cfg.training.models is None:
+            self._model_names = [name for name in ("denoiser", "upsampler") if getattr(self.agent, name) is not None]
+        else:
+            self._model_names = list(cfg.training.models)
+        assert len(set(self._model_names)) == len(self._model_names), \
+            f"training.models={self._model_names} lists a model more than once"
+        assert self._model_names and all(getattr(self.agent, name, None) is not None for name in self._model_names), \
+            f"training.models={self._model_names} must be a non-empty list of models the agent has (denoiser, upsampler)"
+        # The first one drives the epoch's train/test loss and lr in metrics.jsonl.
+        self._primary_model = self._model_names[0]
 
-        self.opt = CommonTools(**{name: build_opt(name) for name in self._model_names})
-        self.lr_sched = CommonTools(**{name: build_lr_sched(name) for name in self._model_names})
+        self.opt = CommonTools(**{"denoiser": None, **{name: build_opt(name) for name in self._model_names}})
+        self.lr_sched = CommonTools(**{"denoiser": None, **{name: build_lr_sched(name) for name in self._model_names}})
 
         # Data loaders
         make_data_loader = partial(
@@ -179,13 +188,16 @@ class Trainer(StateDictMixin):
 
         make_batch_sampler = partial(BatchSampler, self.train_dataset, self._rank, self._world_size)
 
-        c = cfg.denoiser.training
-        seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
-        bs = make_batch_sampler(c.batch_size, seq_length, None)
-        dl_denoiser_train = make_data_loader(batch_sampler=bs)
-        dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
+        if "denoiser" in self._model_names:
+            c = cfg.denoiser.training
+            seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
+            bs = make_batch_sampler(c.batch_size, seq_length, None)
+            dl_denoiser_train = make_data_loader(batch_sampler=bs)
+            dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
+        else:
+            dl_denoiser_train = dl_denoiser_test = None
 
-        if self.agent.upsampler is not None:
+        if "upsampler" in self._model_names:
             c = cfg.upsampler.training
             seq_length = cfg.agent.upsampler.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
             bs = make_batch_sampler(c.batch_size, seq_length, None)
@@ -245,7 +257,8 @@ class Trainer(StateDictMixin):
             if should_test:
                 test_logs = self.test_agent()
                 to_log += test_logs
-                losses = [d["denoiser/test/loss_denoising"] for d in test_logs if "denoiser/test/loss_denoising" in d]
+                key = f"{self._primary_model}/test/loss_denoising"
+                losses = [d[key] for d in test_logs if key in d]
                 test_loss = float(np.mean(losses)) if losses else None
 
             # Logging
@@ -260,7 +273,7 @@ class Trainer(StateDictMixin):
                         "epoch": self.epoch,
                         "train_loss": p["loss_sum"] / p["loss_n"] if p["loss_n"] > 0 else None,
                         "test_loss": test_loss,
-                        "lr": self.lr_sched.denoiser.get_last_lr()[0],
+                        "lr": self.lr_sched.get(self._primary_model).get_last_lr()[0],
                         "duration_s": duration,
                         "samples_per_s": p["samples"] / duration,
                         "gpu": torch.cuda.get_device_name(self._device) if self._use_cuda else "cpu",
@@ -333,7 +346,7 @@ class Trainer(StateDictMixin):
                 loss, metrics = model(batch) if batch is not None else model()
             self.scaler.scale(loss).backward()
 
-            if name == "denoiser":
+            if name == self._primary_model:
                 progress["loss_sum"] += metrics["loss_denoising"]
                 progress["loss_n"] += 1
                 progress["samples"] += cfg.batch_size

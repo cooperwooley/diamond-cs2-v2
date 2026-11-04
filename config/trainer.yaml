@@ -60,6 +60,7 @@ training:
   compile_wm: False
   precision: fp32  # bf16 | fp16 | fp32 (autocast dtype; fp16 adds a GradScaler); overridden by the hw profile
   tf32: False  # allow TF32 matmuls/convs; overridden by the hw profile
+  models: null  # models that get optimizer steps and an eval pass; null = every model of the agent. [upsampler] (with agent=cs2) trains the upsampler alone
 
 evaluation:
   should: True

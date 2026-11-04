@@ -185,6 +185,57 @@ def test_errors_on_empty_input_and_existing_output(conv, tree, tmp_path) -> None
         convert(conv, tree, tmp_path / "ds")
 
 
+# Full-res subset
+
+
+def test_fullres_root_keeps_only_twins_with_the_full_datasets_split(conv, tree, tmp_path) -> None:
+    twins = {"dm0_e0", "dm2_e0", "human1_e0", "smoke0_e0", "smoke4_e0"}
+    fullres = tmp_path / "fullres"
+    for low in tree.rglob("*.hdf5"):
+        if low.stem in twins:
+            d = fullres / low.parent.relative_to(tree)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / low.name).write_bytes(b"")  # only the name matters for matching
+    convert(conv, tree, tmp_path / "full", "--seed", "3")
+    convert(conv, tree, tmp_path / "sub", "--seed", "3", "--fullres-root", str(fullres))
+
+    assert split_of(tmp_path / "sub") == split_of(tmp_path / "full")
+    full_rows = {
+        r["episode_id"]: r for r in json.loads((tmp_path / "full" / "dataset_meta.json").read_text())["episodes"]
+    }
+    sub_meta = json.loads((tmp_path / "sub" / "dataset_meta.json").read_text())
+    assert {r["episode_id"] for r in sub_meta["episodes"]} == twins
+    assert sub_meta["fullres_root"] == str(fullres)
+    for r in sub_meta["episodes"]:
+        assert r["split"] == full_rows[r["episode_id"]]["split"]
+
+
+def test_fullres_root_without_twins_fails(conv, tree, tmp_path) -> None:
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(SystemExit, match="no episode has a full-res twin"):
+        convert(conv, tree, tmp_path / "ds", "--fullres-root", str(tmp_path / "empty"))
+
+
+def test_fullres_root_leaving_a_split_empty_is_actionable(conv, tree, tmp_path) -> None:
+    only = next(p for p in tree.rglob("*.hdf5") if p.stem == "dm0_e0")
+    fullres = tmp_path / "fullres" / "dm" / "dm0"
+    fullres.mkdir(parents=True)
+    (fullres / only.name).write_bytes(b"")
+    convert(conv, tree, tmp_path / "full")
+    split = split_of(tmp_path / "full")
+    empty = "test" if split["dm0"] == "train" else "train"
+    with pytest.raises(SystemExit, match=f"full-res subset left the {empty} split empty.*--test-frac"):
+        convert(conv, tree, tmp_path / "ds", "--fullres-root", str(tmp_path / "fullres"))
+
+
+def test_fullres_root_with_shuffle_actions_is_a_usage_error(conv, tree, tmp_path, capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        convert(conv, tree, tmp_path / "ds", "--fullres-root", str(tmp_path), "--shuffle-actions")
+    assert exc.value.code == 2
+    assert "upsampler ignores actions" in capsys.readouterr().err
+    assert not (tmp_path / "ds").exists()
+
+
 # Derangement and shuffled actions
 
 
