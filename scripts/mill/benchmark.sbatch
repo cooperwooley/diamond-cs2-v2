@@ -1,5 +1,4 @@
 #!/bin/bash
-#SBATCH -p gpu
 #SBATCH --time=01:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -15,8 +14,9 @@
 #                 measures one GPU even when the job was given more.
 #   REPO_DIR      optional, default $SLURM_SUBMIT_DIR (else $PWD). Must contain scripts/benchmark_denoiser.py.
 #   DRY_RUN=1     print the planned python command and exit.
-# Submit with: sbatch --gres=$H100_GRES -J bench-h100 --export=ALL,HW=h100,DATA=...,BATCH_SIZES="32 64 128",STEPS=200 \
+# Submit with: sbatch -p $H100_PARTITION --gres=$H100_GRES -J bench-h100 --export=ALL,HW=h100,DATA=...,BATCH_SIZES="32 64 128",STEPS=200 \
 #                     scripts/mill/benchmark.sbatch
+# Pick the partition with -p: $H100_PARTITION / $V100_PARTITION from ~/.dcs2_env. `requeue` (free, preemptible, 1-day limit) is the default; std-* are paid.
 # The script prints one 'BENCH {json}' line per batch size, so `grep -h '^BENCH ' $S/logs/bench-*.out` collects them.
 set -euo pipefail
 
@@ -59,6 +59,9 @@ fi
 [[ -d "$DATA" ]] || die "DATA directory $DATA not found."
 cd "$REPO_DIR"
 echo "$(date +%T) job ${SLURM_JOB_ID:-?} on $(hostname): hw $HW, gpus requested $GPUS, batch sizes ${BATCH_ARGS[*]}, steps $STEPS"
+if [[ "${SLURM_JOB_PARTITION:-}" == std-* ]]; then
+    echo "WARNING: running on ${SLURM_JOB_PARTITION}, a paid partition (MOU + MOCode). The free tier is -p requeue."
+fi
 [[ "$GPUS" -le 1 ]] || echo "NOTE: benchmark_denoiser.py is single-process; it measures one of the $GPUS GPUs." >&2
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv 2>/dev/null || true
 
