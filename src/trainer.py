@@ -164,6 +164,8 @@ class Trainer(StateDictMixin):
             self._model_names = [name for name in ("denoiser", "upsampler") if getattr(self.agent, name) is not None]
         else:
             self._model_names = list(cfg.training.models)
+        assert len(set(self._model_names)) == len(self._model_names), \
+            f"training.models={self._model_names} lists a model more than once"
         assert self._model_names and all(getattr(self.agent, name, None) is not None for name in self._model_names), \
             f"training.models={self._model_names} must be a non-empty list of models the agent has (denoiser, upsampler)"
         # The first one drives the epoch's train/test loss and lr in metrics.jsonl.

@@ -45,20 +45,21 @@ def make_run_dir(root: Path, name: str, monkeypatch) -> Path:
     return path
 
 
-def make_cfg(repo_root, data_dir, tiny_model_dotlist, resume=False, evaluation_every=1):
+def make_cfg(repo_root, data_dir, tiny_model_dotlist, resume=False, evaluation_every=1, mode="denoiser_only"):
     OmegaConf.register_new_resolver("eval", eval, replace=True)  # as in src/main.py
-    cfg = compose_cfg(repo_root, data_dir, "denoiser_only", tiny_model_dotlist)
-    cfg.denoiser.training.steps_first_epoch = STEPS_PER_EPOCH
-    cfg.denoiser.training.steps_per_epoch = STEPS_PER_EPOCH
+    cfg = compose_cfg(repo_root, data_dir, mode, tiny_model_dotlist)
+    model = "upsampler" if mode == "upsampler_only" else "denoiser"
+    cfg[model].training.steps_first_epoch = STEPS_PER_EPOCH
+    cfg[model].training.steps_per_epoch = STEPS_PER_EPOCH
     cfg.training.num_final_epochs = N_EPOCHS
     cfg.evaluation.every = evaluation_every
     cfg.common.resume = resume
     return cfg
 
 
-def preempt_after(trainer: Trainer, n_steps: int, signum: int = signal.SIGUSR1) -> None:
-    """Send a real SIGUSR1 (or `signum`) to this process during the n-th denoiser optimizer step."""
-    opt = trainer.opt.denoiser
+def preempt_after(trainer: Trainer, n_steps: int, signum: int = signal.SIGUSR1, model: str = "denoiser") -> None:
+    """Send a real SIGUSR1 (or `signum`) to this process during the n-th optimizer step of `model`."""
+    opt = trainer.opt.get(model)
     original_step = opt.step
     calls = []
 
@@ -71,8 +72,8 @@ def preempt_after(trainer: Trainer, n_steps: int, signum: int = signal.SIGUSR1) 
     opt.step = step
 
 
-def optimizer_steps(trainer: Trainer) -> int:
-    return int(next(iter(trainer.opt.denoiser.state.values()))["step"])
+def optimizer_steps(trainer: Trainer, model: str = "denoiser") -> int:
+    return int(next(iter(trainer.opt.get(model).state.values()))["step"])
 
 
 def read_metrics(path: Path) -> list[dict]:
@@ -146,6 +147,40 @@ def test_preempt_and_resume_matches_uninterrupted_run(
         assert any(st["exp_avg"].abs().sum() > 0 for st in states)
     assert (run / "checkpoints" / "DONE").is_file()
     assert [m["epoch"] for m in read_metrics(run / "metrics.jsonl")] == [1, 2]
+
+
+def test_upsampler_only_preempt_and_resume(data, tmp_path, repo_root, tiny_model_dotlist, monkeypatch) -> None:
+    cfg = make_cfg(repo_root, data, tiny_model_dotlist, mode="upsampler_only")
+    make_run_dir(tmp_path, "straight", monkeypatch)
+    straight = Trainer(cfg, tmp_path)
+    straight.run()
+
+    run = make_run_dir(tmp_path, "preempted", monkeypatch)
+    first = Trainer(cfg, tmp_path)
+    preempt_after(first, STEPS_PER_EPOCH + 2, model="upsampler")
+    with pytest.raises(SystemExit) as exc:
+        first.run()
+    assert exc.value.code == 3
+    saved = torch.load(run / "checkpoints" / "state.pt", map_location="cpu", weights_only=False)
+    assert saved["epoch"] == 2
+    assert saved["epoch_progress"]["steps"] == {"upsampler": 2}
+
+    cfg.common.resume = "auto"
+    resumed = Trainer(cfg, tmp_path)  # reloads the None denoiser optimizer / lr slots
+    assert resumed.opt.denoiser is None and resumed.lr_sched.denoiser is None
+    assert (resumed.epoch, resumed.epoch_progress["steps"]) == (2, {"upsampler": 2})
+    resumed.run()
+
+    for t in (straight, resumed):
+        assert t.epoch == N_EPOCHS and t.epoch_progress is None
+        assert t.num_batch_train.upsampler == N_EPOCHS * STEPS_PER_EPOCH
+        assert t.num_batch_train.denoiser == 0
+        assert optimizer_steps(t, "upsampler") == N_EPOCHS * STEPS_PER_EPOCH
+        assert t.lr_sched.upsampler.last_epoch == N_EPOCHS * STEPS_PER_EPOCH
+    assert (run / "checkpoints" / "DONE").is_file()
+    rows = read_metrics(run / "metrics.jsonl")
+    assert [m["epoch"] for m in rows] == [1, 2]
+    assert all(m["train_loss"] is not None and m["test_loss"] is not None for m in rows)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")

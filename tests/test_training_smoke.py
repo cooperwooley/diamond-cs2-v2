@@ -120,6 +120,14 @@ def test_upsampler_only_checkpoint_loads_into_play_agent(data, run_dir, repo_roo
     )
 
 
+def test_duplicate_training_model_is_rejected(data, run_dir, repo_root, tiny_model_dotlist) -> None:
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+    cfg = compose_cfg(repo_root, data, "upsampler_only", tiny_model_dotlist)
+    cfg.training.models = ["upsampler", "upsampler"]
+    with pytest.raises(AssertionError, match="more than once"):
+        Trainer(cfg, run_dir)
+
+
 def test_unknown_training_model_is_rejected(data, run_dir, repo_root, tiny_model_dotlist) -> None:
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     cfg = compose_cfg(repo_root, data, "denoiser_only", tiny_model_dotlist)
