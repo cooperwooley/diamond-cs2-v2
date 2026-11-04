@@ -1,6 +1,7 @@
 """bash -n on the Mill sbatch scripts."""
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -25,16 +26,25 @@ def test_scripts_are_executable_with_shebang(repo_root, script: str) -> None:
 
 
 @pytest.mark.parametrize("script", ["train.sbatch", "benchmark.sbatch"])
-def test_sbatch_first_line_and_gpu_partition(repo_root, script: str) -> None:
+def test_sbatch_first_line_and_no_hardcoded_partition(repo_root, script: str) -> None:
     lines = (repo_root / "scripts" / "mill" / script).read_text().splitlines()
     assert lines[0] == "#!/bin/bash"
-    assert "#SBATCH -p gpu" in lines
+    # The Mill has no `gpu` partition: users pass -p at submit time.
+    assert not [ln for ln in lines if re.match(r"#SBATCH\s+(-p\b|--partition\b)", ln)]
+
+
+def test_train_successor_stays_on_the_jobs_partition(repo_root) -> None:
+    text = (repo_root / "scripts" / "mill" / "train.sbatch").read_text()
+    assert "SLURM_JOB_PARTITION" in text
+    assert '-p "$PARTITION"' in text
+    assert "-p gpu" not in text
 
 
 def test_train_sbatch_directives(repo_root) -> None:
     text = (repo_root / "scripts" / "mill" / "train.sbatch").read_text()
     for directive in (
-        "#SBATCH --time=2-00:00:00",
+        "#SBATCH --time=1-00:00:00",  # requeue rejects longer jobs
+        "#SBATCH --requeue",
         "#SBATCH --signal=B:USR1@600",
         "#SBATCH --cpus-per-task=16",
         "#SBATCH --mem=128G",
@@ -49,6 +59,8 @@ def test_env_example_defines_mill_variables(repo_root) -> None:
         "export S=/share/ceph/scratch/$USER/dcs2",
         "export H100_GRES=",
         "export V100_GRES=",
+        "export H100_PARTITION=requeue",
+        "export V100_PARTITION=requeue",
         "module load anaconda",
         "conda activate dcs2",
     ):

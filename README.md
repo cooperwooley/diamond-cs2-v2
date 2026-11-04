@@ -114,11 +114,13 @@ ssh -o BatchMode=yes mill hostname          # must print a login node with no pr
 git clone https://github.com/cooperwooley/diamond-cs2-v2.git ~/diamond-cs2-v2 && cd ~/diamond-cs2-v2
 conda env create -f environment.yml && conda activate dcs2 && pip install -e . && conda clean -a -y
 mkdir -p /share/ceph/scratch/$USER/dcs2/{v1,demos,hdf5,hdf5_fullres,qa,datasets,runs,logs}
-cp scripts/mill/env.example.sh ~/.dcs2_env  # edit H100_GRES / V100_GRES from `sinfo -p gpu -N -o "%N %G"`
+cp scripts/mill/env.example.sh ~/.dcs2_env  # check H100_GRES / V100_GRES and the partitions against `sinfo -a -N -o "%N %P %G"`
 echo 'source ~/.dcs2_env' >> ~/.bashrc && source ~/.dcs2_env
 ```
 
-`~/.dcs2_env` defines `S=/share/ceph/scratch/$USER/dcs2`, `H100_GRES` and `V100_GRES`. Always submit with `-p gpu`.
+`~/.dcs2_env` defines `S=/share/ceph/scratch/$USER/dcs2`, `H100_GRES`, `V100_GRES`, `H100_PARTITION` and `V100_PARTITION`.
+There is no `gpu` partition. The free tier is `requeue` (1-day limit, preemptible; jobs checkpoint, resume and resubmit
+themselves): submit with `-p $H100_PARTITION --gres=$H100_GRES`. `std-h100` / `std-v100` are paid and not used.
 Scratch is not backed up.
 
 ## Try it without CS2
@@ -217,13 +219,13 @@ Training is one command per job (`scripts/mill/train.sbatch`); jobs resubmit the
 before the wall limit, and resume with `common.resume=auto`.
 
 ```bash
-# Mill: main model (150 epochs, one H100, chain of up to 5 x 48 h jobs)
-sbatch --gres=$H100_GRES -J v2-main \
+# Mill: main model (150 epochs, one H100, chain of up to 5 x 24 h jobs)
+sbatch -p $H100_PARTITION --gres=$H100_GRES -J v2-main \
   --export=ALL,RUN_NAME=v2-main,DATASET=v2-full,HW=h100,RESUBMITS_LEFT=4,EXTRA="agent=cs2_denoiser_only" \
   scripts/mill/train.sbatch
 
 # Mill: shuffled-action control (H1 null model)
-sbatch --gres=$H100_GRES -J v2-shuf \
+sbatch -p $H100_PARTITION --gres=$H100_GRES -J v2-shuf \
   --export=ALL,RUN_NAME=v2-shuffled,DATASET=v2-full-shuffled,HW=h100,RESUBMITS_LEFT=4,EXTRA="agent=cs2_denoiser_only" \
   scripts/mill/train.sbatch
 

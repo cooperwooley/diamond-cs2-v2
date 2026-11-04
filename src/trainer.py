@@ -43,9 +43,14 @@ from utils import (
 )
 
 
+_PREEMPT_SIGNALS = (signal.SIGUSR1, signal.SIGTERM)
+
+
 def _ignore_sigusr1(worker_id: int) -> None:
     # DataLoader workers are forked after the trainer installed its handler; the flag it sets would be meaningless there.
-    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    # (The workers also ignore SIGTERM: the trainer stops them itself when it exits.)
+    for signum in _PREEMPT_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
 
 
 class Trainer(StateDictMixin):
@@ -57,11 +62,13 @@ class Trainer(StateDictMixin):
         torch.backends.cudnn.allow_tf32 = cfg.training.tf32
         self._precision = cfg.training.precision
 
-        # SIGUSR1 (sent by SLURM shortly before the wall-time kill) only sets a flag; it is acted on at the next optimizer
-        # step boundary. Handlers can only be installed from the main thread of the main process.
+        # SIGUSR1 (sent by SLURM shortly before the wall-time kill) and SIGTERM (scancel, preemption, the wall-time kill itself;
+        # SLURM sends it to every process of the job, not only the batch shell) only set a flag; it is acted on at the next
+        # optimizer step boundary. Handlers can only be installed from the main thread of the main process.
         self._preempt_requested = False
         if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGUSR1, self._on_sigusr1)
+            for signum in _PREEMPT_SIGNALS:
+                signal.signal(signum, self._on_sigusr1)
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._world_size = dist.get_world_size() if dist.is_initialized() else 1
 
@@ -391,7 +398,7 @@ class Trainer(StateDictMixin):
     def _save_state_and_exit(self) -> None:
         """Full state checkpoint at an optimizer-step boundary, then exit with code 3 (preempted)."""
         if self._rank == 0:
-            print("SIGUSR1 received: saving state and exiting")
+            print("SIGUSR1/SIGTERM received: saving state and exiting")
             save_with_backup(self.state_dict(), self._path_state_ckpt)
         self._exit_preempted()
 

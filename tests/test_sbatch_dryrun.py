@@ -29,7 +29,10 @@ FAKE_SCANCEL = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG/scancel.log"
 """
 FAKE_SQUEUE = """#!/bin/bash
-echo "04:00:00"
+case "$*" in
+    *%T*) echo "$FAKE_SQUEUE_STATE" ;;
+    *) echo "04:00:00" ;;
+esac
 """
 FAKE_RSYNC = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG/rsync.log"
@@ -42,8 +45,8 @@ FAKE_DATE = """#!/bin/bash
 [ -e "$FAKE_LOG/slow_date" ] && sleep 0.4
 exec /bin/date "$@"
 """
-# FAKE_PY_MODE: done | exit0 (no DONE) | preempt | crash | wait_usr1 (blocks until SIGUSR1, then behaves like a preempted
-# trainer) | timed_done / timed_exit3 (exit 0 with DONE / exit 3 without PREEMPTED, 0.2 s after $FAKE_LOG/go appears).
+# FAKE_PY_MODE: done | exit0 (no DONE) | preempt | crash | wait_usr1 / wait_preempt (block until SIGUSR1, or also SIGTERM, then behave like a
+# preempted trainer) | timed_done / timed_exit3 (exit 0 with DONE / exit 3 without PREEMPTED, 0.2 s after $FAKE_LOG/go appears).
 FAKE_PYTHON = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG/python.log"
 for arg in "$@"; do
@@ -66,6 +69,11 @@ case "$FAKE_PY_MODE" in
         ;;
     preempt) touch "$RUN_DIR/checkpoints/PREEMPTED" "$RUN_DIR/checkpoints/state.pt"; exit 3 ;;
     crash) echo "Traceback: boom" >&2; exit 1 ;;
+    wait_preempt)
+        trap 'echo "got_signal" >> "$FAKE_LOG/python.log"; touch "$RUN_DIR/checkpoints/PREEMPTED"; exit 3' USR1 TERM
+        touch "$FAKE_LOG/python.ready"
+        while :; do sleep 0.05; done
+        ;;
     wait_usr1)
         trap 'echo "got_usr1" >> "$FAKE_LOG/python.log"; touch "$RUN_DIR/checkpoints/PREEMPTED"; exit 3' USR1
         touch "$FAKE_LOG/python.ready"
@@ -110,7 +118,7 @@ class Harness:
         }.items():
             write_exe(self.bin / name, text)
         (self.home / ".dcs2_env").write_text(
-            f"export S={self.s}\nexport H100_GRES=gpu:h100:1\nexport V100_GRES=gpu:v100:1\n"
+            f"export S={self.s}\nexport H100_GRES=gpu:H100:1\nexport V100_GRES=gpu:V100-SXM2-32GB:1\n"
         )
         env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SBATCH_"))}
         for k in (
@@ -118,12 +126,14 @@ class Harness:
             "RESUBMITS_LEFT",
             "EXTRA",
             "GRES",
+            "PARTITION",
             "TIME_LIMIT",
             "RUN_NAME",
             "DATASET",
             "HW",
             "S",
             "FAKE_RSYNC_SLEEP",
+            "FAKE_SQUEUE_STATE",
         ):
             env.pop(k, None)
         env.update(
@@ -152,9 +162,10 @@ class Harness:
         return path.read_text().splitlines() if path.is_file() else []
 
     def start(self, script: str = "train.sbatch", slurm: bool = True, **env) -> subprocess.Popen:
-        full = {**self.env, **env}
+        full = dict(self.env)
         if slurm:
-            full.update(SLURM_JOB_ID=JOB_ID, SLURM_JOB_NAME="run1")
+            full.update(SLURM_JOB_ID=JOB_ID, SLURM_JOB_NAME="run1", SLURM_JOB_PARTITION="requeue")
+        full.update(env)
         return subprocess.Popen(
             [BASH, str(self.repo_root / "scripts" / "mill" / script)],
             env=full,
@@ -182,11 +193,14 @@ def h(tmp_path, repo_root) -> Harness:
 
 
 def test_dry_run_prints_planned_commands(h: Harness) -> None:
-    res = h.run(slurm=False, DRY_RUN="1", EXTRA="training.num_final_epochs=2 evaluation.every=1")
+    res = h.run(
+        slurm=False, DRY_RUN="1", SLURM_JOB_PARTITION="requeue", EXTRA="training.num_final_epochs=2 evaluation.every=1"
+    )
     assert res.returncode == 0, res.stderr
     out = res.stdout
     assert "sbatch --parsable --dependency=afterany:dryrun" in out
-    assert "--gres=gpu:h100:1" in out
+    assert " -p requeue " in out
+    assert "--gres=gpu:H100:1" in out
     assert "--export=ALL,RESUBMITS_LEFT=2" in out
     assert f"rsync -a {h.s}/datasets/pilot/ " in out
     assert "python src/main.py" in out
@@ -234,6 +248,21 @@ def test_missing_env_file_is_reported(h: Harness) -> None:
     assert ".dcs2_env not found" in res.stderr
 
 
+def test_partition_override_and_missing_partition(h: Harness) -> None:
+    res = h.run(slurm=False, DRY_RUN="1", SLURM_JOB_PARTITION="requeue", PARTITION="other")
+    assert " -p other " in res.stdout
+    res = h.run(SLURM_JOB_PARTITION="")
+    assert res.returncode == 2 and "partition" in res.stderr
+    assert h.run(SLURM_JOB_PARTITION="", RESUBMITS_LEFT="0").returncode == 0
+
+
+def test_paid_partition_warns_but_runs(h: Harness) -> None:
+    res = h.run(SLURM_JOB_PARTITION="std-h100")
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.count("WARNING: running on std-h100, a paid partition") == 1
+    assert "paid partition" not in h.run(SLURM_JOB_PARTITION="requeue").stdout
+
+
 def test_missing_slurm_job_id_is_reported(h: Harness) -> None:
     res = h.run(slurm=False)
     assert res.returncode == 2
@@ -255,8 +284,8 @@ def test_done_submits_successor_then_cancels_it(h: Harness) -> None:
     for expected in (
         "--parsable",
         f"--dependency=afterany:{JOB_ID}",
-        "-p gpu",
-        "--gres=gpu:h100:1",
+        "-p requeue",
+        "--gres=gpu:H100:1",
         "-J run1",
         "--export=ALL,RESUBMITS_LEFT=2",
         "--time=04:00:00",  # inherited from the running job's own limit
@@ -353,8 +382,67 @@ def test_sigterm_keeps_successor_and_cleans_up(h: Harness) -> None:
         if proc.poll() is None:
             proc.kill()
     assert proc.returncode == 143
+    assert "got_usr1" in h.logged("python.log")  # SIGTERM (preemption) makes the trainer save like USR1 does
     assert h.logged("scancel.log") == []
     assert not h.staged.exists()
+    assert not (h.run_dir / ".owner").exists()
+
+
+def test_sigterm_to_the_whole_job_still_saves(h: Harness) -> None:
+    """SLURM signals every process of the job, so the trainer gets SIGTERM too, not only the forwarded USR1."""
+    proc = h.start(FAKE_PY_MODE="wait_preempt")
+    try:
+        h.wait_for("python.ready")
+        os.killpg(proc.pid, signal.SIGTERM)  # the batch shell and the trainer, as on a preempt-requeue
+        proc.communicate(timeout=TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 143
+    assert "got_signal" in h.logged("python.log")  # the trainer handled the signal instead of dying
+    assert (h.run_dir / "checkpoints" / "PREEMPTED").is_file()
+    assert h.logged("scancel.log") == []  # the successor stays queued
+    assert not h.staged.exists()
+
+
+def test_requeued_job_keeps_its_successor(h: Harness) -> None:
+    """After a REQUEUE preemption the same job ID restarts: it must not submit a second successor."""
+    proc = h.start(FAKE_PY_MODE="wait_usr1")
+    try:
+        h.wait_for("python.ready")
+        os.kill(proc.pid, signal.SIGTERM)
+        proc.communicate(timeout=TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert len(h.logged("sbatch.log")) == 1
+    res = h.run(SLURM_RESTART_COUNT="1")  # the restarted job runs to completion
+    assert res.returncode == 0, res.stderr
+    assert f"keeping successor job {SUCCESSOR_ID}" in res.stdout
+    assert len(h.logged("sbatch.log")) == 1  # still the first job's single successor
+    assert h.logged("scancel.log") == [SUCCESSOR_ID]  # cancelled once training finished
+
+
+def test_restart_without_recorded_successor_submits_one(h: Harness) -> None:
+    assert h.run(SLURM_RESTART_COUNT="1").returncode == 0
+    assert len(h.logged("sbatch.log")) == 1
+
+
+def test_second_trainer_on_a_run_dir_is_refused(h: Harness) -> None:
+    (h.run_dir).mkdir(parents=True, exist_ok=True)
+    (h.run_dir / ".owner").write_text("999\n")
+    res = h.run(FAKE_SQUEUE_STATE="RUNNING")
+    assert res.returncode == 2 and "job 999 is already training" in res.stderr
+    assert h.logged("python.log") == [] and h.logged("sbatch.log") == []
+    assert (h.run_dir / ".owner").read_text().strip() == "999"  # the other job's claim is untouched
+
+
+def test_stale_owner_file_is_taken_over(h: Harness) -> None:
+    h.run_dir.mkdir(parents=True, exist_ok=True)
+    (h.run_dir / ".owner").write_text("999\n")
+    assert h.run().returncode == 0  # squeue no longer lists job 999
+    assert h.logged("python.log")
+    assert not (h.run_dir / ".owner").exists()
 
 
 def test_missing_dataset_fails_and_cancels_successor(h: Harness) -> None:

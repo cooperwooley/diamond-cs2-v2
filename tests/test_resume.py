@@ -15,7 +15,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from test_training_smoke import compose_cfg
 
-from trainer import Trainer
+from trainer import Trainer, _ignore_sigusr1
 from utils import autocast
 
 STEPS_PER_EPOCH = 4
@@ -28,10 +28,11 @@ PRE_CHANGE_FP32_LOSSES = [0.4566754102706909, 0.5001824498176575, 0.295988321304
 
 @pytest.fixture(autouse=True)
 def restore_sigusr1():
-    """Trainer installs a SIGUSR1 handler in the test process; put the previous one back afterwards."""
-    previous = signal.getsignal(signal.SIGUSR1)
+    """Trainer installs SIGUSR1/SIGTERM handlers in the test process; put the previous ones back afterwards."""
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGUSR1, signal.SIGTERM)}
     yield
-    signal.signal(signal.SIGUSR1, previous)
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 def make_run_dir(root: Path, name: str, monkeypatch) -> Path:
@@ -55,8 +56,8 @@ def make_cfg(repo_root, data_dir, tiny_model_dotlist, resume=False, evaluation_e
     return cfg
 
 
-def preempt_after(trainer: Trainer, n_steps: int) -> None:
-    """Send a real SIGUSR1 to this process during the n-th denoiser optimizer step."""
+def preempt_after(trainer: Trainer, n_steps: int, signum: int = signal.SIGUSR1) -> None:
+    """Send a real SIGUSR1 (or `signum`) to this process during the n-th denoiser optimizer step."""
     opt = trainer.opt.denoiser
     original_step = opt.step
     calls = []
@@ -64,7 +65,7 @@ def preempt_after(trainer: Trainer, n_steps: int) -> None:
     def step(*args, **kwargs):
         calls.append(1)
         if len(calls) == n_steps:
-            os.kill(os.getpid(), signal.SIGUSR1)
+            os.kill(os.getpid(), signum)
         return original_step(*args, **kwargs)
 
     opt.step = step
@@ -145,6 +146,41 @@ def test_preempt_and_resume_matches_uninterrupted_run(
         assert any(st["exp_avg"].abs().sum() > 0 for st in states)
     assert (run / "checkpoints" / "DONE").is_file()
     assert [m["epoch"] for m in read_metrics(run / "metrics.jsonl")] == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+def test_sigterm_sets_the_preempt_flag_instead_of_killing_the_process(
+    data, tmp_path, repo_root, tiny_model_dotlist, monkeypatch
+) -> None:
+    make_run_dir(tmp_path, "term", monkeypatch)
+    trainer = Trainer(make_cfg(repo_root, data, tiny_model_dotlist), tmp_path)
+    assert not trainer._preempt_requested
+    os.kill(os.getpid(), signal.SIGTERM)  # the default action would terminate the test process
+    assert trainer._preempt_requested
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+def test_sigterm_during_a_step_saves_state_and_exits_preempted(
+    data, tmp_path, repo_root, tiny_model_dotlist, monkeypatch
+) -> None:
+    run = make_run_dir(tmp_path, "term_save", monkeypatch)
+    trainer = Trainer(make_cfg(repo_root, data, tiny_model_dotlist), tmp_path)
+    preempt_after(trainer, 2, signal.SIGTERM)
+    with pytest.raises(SystemExit) as exc:
+        trainer.run()
+    assert exc.value.code == 3
+    assert (run / "checkpoints" / "PREEMPTED").is_file()
+    assert (run / "checkpoints" / "state.pt").is_file()
+
+
+def test_dataloader_workers_ignore_the_preempt_signals() -> None:
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGUSR1, signal.SIGTERM)}
+    try:
+        _ignore_sigusr1(0)
+        assert all(signal.getsignal(signum) == signal.SIG_IGN for signum in previous)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def test_preempt_on_last_step_of_the_run_resumes_to_done(

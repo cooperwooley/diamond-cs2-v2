@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH -p gpu
-#SBATCH --time=2-00:00:00
+#SBATCH --time=1-00:00:00
+#SBATCH --requeue
 #SBATCH --signal=B:USR1@600
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
@@ -8,7 +8,13 @@
 # NOTE: #SBATCH lines do not expand $S, so the -o path spells out the scratch root (S=/share/ceph/scratch/$USER/dcs2).
 #
 # Mill training job (#7). Every training job is this one script. Submit from the repo checkout (the job runs there):
-#   sbatch --gres=$H100_GRES -J $RUN_NAME --export=ALL,RUN_NAME=...,DATASET=...,HW=h100 scripts/mill/train.sbatch
+#   sbatch -p $H100_PARTITION --gres=$H100_GRES -J $RUN_NAME --export=ALL,RUN_NAME=...,DATASET=...,HW=h100 scripts/mill/train.sbatch
+#
+# The partition is chosen at submit time (-p $H100_PARTITION / $V100_PARTITION from ~/.dcs2_env), `requeue` by default: the
+# free tier, 1-day limit, jobs can be preempted. std-h100 / std-v100 are paid (MOU + MOCode) and not used.
+# Preemption: with PreemptMode=REQUEUE the same job ID is killed (SIGTERM) and restarted, and its successor stays held;
+# with CANCEL the job ends and the successor (afterany) resumes the run. Either way the trainer is asked to save first and
+# `common.resume=auto` continues from the last checkpoint. A restarted job reuses its existing successor.
 #
 # Environment:
 #   RUN_NAME        required. Run dir is $S/runs/$RUN_NAME (checkpoints go straight to scratch, never /local/scratch).
@@ -19,8 +25,10 @@
 #   EXTRA           optional. Whitespace-separated Hydra overrides appended to the trainer command.
 #   GRES            optional. --gres for the successor. Default: $H100_GRES for HW=h100, $V100_GRES for HW=v100
 #                   (from ~/.dcs2_env). Required for other HW values. Pass the same value as the original --gres.
+#   PARTITION       optional. -p for the successor. Default: this job's own partition ($SLURM_JOB_PARTITION), so a chain
+#                   stays on the partition it started on.
 #   TIME_LIMIT      optional. --time for the successor. Default: this job's own limit (from squeue), else the
-#                   #SBATCH default above.
+#                   #SBATCH default above (requeue allows at most 1-00:00:00).
 #   LOCAL_SCRATCH_ROOT  optional, default /local/scratch. Staged data lives in $LOCAL_SCRATCH_ROOT/$USER/$SLURM_JOB_ID.
 #   REPO_DIR        optional, default $SLURM_SUBMIT_DIR (else $PWD). Must contain src/main.py.
 #   DRY_RUN=1       print the planned sbatch / rsync / python commands and exit without running anything.
@@ -76,16 +84,23 @@ fi
 if [[ -z "$GRES" && "$RESUBMITS_LEFT" -gt 0 ]]; then
     die "cannot determine --gres for the successor job: set GRES (or H100_GRES / V100_GRES in ~/.dcs2_env), or RESUBMITS_LEFT=0."
 fi
+PARTITION=${PARTITION:-${SLURM_JOB_PARTITION:-}}
+if [[ -z "$PARTITION" && "$RESUBMITS_LEFT" -gt 0 ]]; then
+    [[ "$DRY_RUN" == 1 ]] || die "cannot determine the partition for the successor job: set PARTITION, or RESUBMITS_LEFT=0."
+    PARTITION="<partition>"
+fi
 if [[ -z "${TIME_LIMIT:-}" && "$DRY_RUN" != 1 ]] && command -v squeue >/dev/null 2>&1; then
     TIME_LIMIT=$(squeue -h -j "$JOB_ID" -o %l 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)
 fi
 
 RUN_DIR=$S/runs/$RUN_NAME
+OWNER_FILE=$RUN_DIR/.owner         # job ID of the job training in RUN_DIR
+SUCCESSOR_FILE=$RUN_DIR/.successor-$JOB_ID # survives a requeue (same job ID), so the restarted job does not chain twice
 STAGE_DIR=$LOCAL_SCRATCH_ROOT/${USER:-$(id -un)}/$JOB_ID
 LOW_RES=$STAGE_DIR/$DATASET/low_res
 
 # ---- 2. Planned commands --------------------------------------------------------------------------------------------
-SBATCH_CMD=(sbatch --parsable "--dependency=afterany:$JOB_ID" -p gpu "--gres=$GRES" -J "$JOB_NAME"
+SBATCH_CMD=(sbatch --parsable "--dependency=afterany:$JOB_ID" -p "$PARTITION" "--gres=$GRES" -J "$JOB_NAME"
     "--export=ALL,RESUBMITS_LEFT=$((RESUBMITS_LEFT - 1))")
 [[ -z "${TIME_LIMIT:-}" ]] || SBATCH_CMD+=("--time=$TIME_LIMIT")
 SBATCH_CMD+=("$REPO_DIR/scripts/mill/train.sbatch")
@@ -125,6 +140,7 @@ fi
 # crashed ("crash") or the setup failed ("failed", set by die or a failing command). A job that is signalled or killed
 # ("setup" before launch, "running", "preempted") leaves the successor queued so the chain resumes.
 SUCC_ID=
+OWNED=0
 PID=       # the trainer (python)
 SETUP_PID= # a background setup command (rsync)
 USR1_EARLY=0
@@ -135,11 +151,13 @@ cleanup() {
     local rc=$?
     trap - EXIT
     rm -rf "$STAGE_DIR"
+    [[ "$OWNED" != 1 ]] || rm -f "$OWNER_FILE"
     case "$PHASE" in
         done | crash | failed)
             if [[ -n "$SUCC_ID" ]]; then
                 echo "Cancelling successor job $SUCC_ID ($PHASE)."
                 scancel "$SUCC_ID" || echo "WARNING: scancel $SUCC_ID failed; cancel it by hand." >&2
+                rm -f "$SUCCESSOR_FILE"
             fi
             ;;
     esac
@@ -156,14 +174,19 @@ forward_usr1() {
 }
 on_term() {
     local child=${PID:-$SETUP_PID} i
-    echo "$(date +%T) SIGTERM received: stopping ${child:+pid $child}." >&2
-    if [[ -n "$child" ]]; then
+    echo "$(date +%T) SIGTERM received (scancel, preemption or wall-time): stopping ${child:+pid $child}." >&2
+    if [[ -n "$PID" ]]; then
+        kill -USR1 "$PID" 2>/dev/null || true # the trainer saves its state at the next optimizer step, like on USR1
+    elif [[ -n "$child" ]]; then
         kill -TERM "$child" 2>/dev/null || true
-        # Give the trainer up to 30 s to go away before the staged data is removed under it.
+    fi
+    if [[ -n "$child" ]]; then
+        # Give the child up to 30 s to go away before the staged data is removed under it (SLURM's GraceTime may be shorter).
         for ((i = 0; i < 300; i++)); do
             kill -0 "$child" 2>/dev/null || break
             sleep 0.1
         done
+        kill -TERM "$child" 2>/dev/null || true
     fi
     exit 143
 }
@@ -194,6 +217,9 @@ wait_for() {
 }
 
 echo "$(date +%T) job $JOB_ID on $(hostname): run $RUN_NAME, dataset $DATASET, hw $HW, resubmits left $RESUBMITS_LEFT"
+if [[ "${SLURM_JOB_PARTITION:-}" == std-* ]]; then
+    echo "WARNING: running on ${SLURM_JOB_PARTITION}, a paid partition (MOU + MOCode). The free tier is -p requeue."
+fi
 
 command -v python >/dev/null 2>&1 || die "python not found on PATH: is the conda env 'dcs2' active (~/.dcs2_env)?"
 if [[ -f "$RUN_DIR/checkpoints/DONE" ]]; then
@@ -202,10 +228,28 @@ if [[ -f "$RUN_DIR/checkpoints/DONE" ]]; then
     exit 0
 fi
 
-# ---- 4. Successor (submitted at start so that hard kills still resume) ----------------------------------------------
+# ---- 4. One trainer per run dir, then the successor (submitted at start so that hard kills still resume) ------------
+mkdir -p "$RUN_DIR"
+if [[ -s "$OWNER_FILE" ]]; then
+    OWNER=$(<"$OWNER_FILE")
+    OWNER_STATE=
+    if [[ "$OWNER" != "$JOB_ID" ]] && command -v squeue >/dev/null 2>&1; then
+        OWNER_STATE=$(squeue -h -j "$OWNER" -o %T 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)
+    fi
+    case "$OWNER_STATE" in # a stale file (hard kill) names a job that is gone; a requeued job finds its own ID
+        RUNNING | SUSPENDED) die "job $OWNER is already training in $RUN_DIR: not starting a second trainer." ;;
+    esac
+fi
+echo "$JOB_ID" >"$OWNER_FILE"
+OWNED=1
+
 if [[ "$RESUBMITS_LEFT" -gt 0 ]]; then
-    if SUCC_ID=$(cd "$REPO_DIR" && "${SBATCH_CMD[@]}"); then
+    if [[ "${SLURM_RESTART_COUNT:-0}" -gt 0 && -s "$SUCCESSOR_FILE" ]]; then
+        SUCC_ID=$(<"$SUCCESSOR_FILE") # requeued after a preemption: its successor is still queued behind this job ID
+        echo "Requeued job (restart ${SLURM_RESTART_COUNT}): keeping successor job $SUCC_ID."
+    elif SUCC_ID=$(cd "$REPO_DIR" && "${SBATCH_CMD[@]}"); then
         SUCC_ID=${SUCC_ID%%;*} # --parsable prints "<id>[;<cluster>]"
+        echo "$SUCC_ID" >"$SUCCESSOR_FILE.tmp" && mv "$SUCCESSOR_FILE.tmp" "$SUCCESSOR_FILE" # atomic: a kill never leaves it half-written
         echo "Successor job: $SUCC_ID (afterany:$JOB_ID, resubmits left: $((RESUBMITS_LEFT - 1)))"
     else
         SUCC_ID=
@@ -217,7 +261,7 @@ fi
 
 # ---- 5. Stage the read-only dataset to node-local scratch -----------------------------------------------------------
 [[ -d "$S/datasets/$DATASET" ]] || die "dataset $S/datasets/$DATASET not found."
-mkdir -p "$RUN_DIR" "$STAGE_DIR"
+mkdir -p "$STAGE_DIR"
 echo "$(date +%T) staging $S/datasets/$DATASET -> $STAGE_DIR/$DATASET"
 "${RSYNC_CMD[@]}" & # in the background so that a SIGTERM trap can fire while it runs
 SETUP_PID=$!
