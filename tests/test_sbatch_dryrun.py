@@ -45,8 +45,8 @@ FAKE_DATE = """#!/bin/bash
 [ -e "$FAKE_LOG/slow_date" ] && sleep 0.4
 exec /bin/date "$@"
 """
-# FAKE_PY_MODE: done | exit0 (no DONE) | preempt | crash | wait_usr1 (blocks until SIGUSR1, then behaves like a preempted
-# trainer) | timed_done / timed_exit3 (exit 0 with DONE / exit 3 without PREEMPTED, 0.2 s after $FAKE_LOG/go appears).
+# FAKE_PY_MODE: done | exit0 (no DONE) | preempt | crash | wait_usr1 / wait_preempt (block until SIGUSR1, or also SIGTERM, then behave like a
+# preempted trainer) | timed_done / timed_exit3 (exit 0 with DONE / exit 3 without PREEMPTED, 0.2 s after $FAKE_LOG/go appears).
 FAKE_PYTHON = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG/python.log"
 for arg in "$@"; do
@@ -69,6 +69,11 @@ case "$FAKE_PY_MODE" in
         ;;
     preempt) touch "$RUN_DIR/checkpoints/PREEMPTED" "$RUN_DIR/checkpoints/state.pt"; exit 3 ;;
     crash) echo "Traceback: boom" >&2; exit 1 ;;
+    wait_preempt)
+        trap 'echo "got_signal" >> "$FAKE_LOG/python.log"; touch "$RUN_DIR/checkpoints/PREEMPTED"; exit 3' USR1 TERM
+        touch "$FAKE_LOG/python.ready"
+        while :; do sleep 0.05; done
+        ;;
     wait_usr1)
         trap 'echo "got_usr1" >> "$FAKE_LOG/python.log"; touch "$RUN_DIR/checkpoints/PREEMPTED"; exit 3' USR1
         touch "$FAKE_LOG/python.ready"
@@ -381,6 +386,23 @@ def test_sigterm_keeps_successor_and_cleans_up(h: Harness) -> None:
     assert h.logged("scancel.log") == []
     assert not h.staged.exists()
     assert not (h.run_dir / ".owner").exists()
+
+
+def test_sigterm_to_the_whole_job_still_saves(h: Harness) -> None:
+    """SLURM signals every process of the job, so the trainer gets SIGTERM too, not only the forwarded USR1."""
+    proc = h.start(FAKE_PY_MODE="wait_preempt")
+    try:
+        h.wait_for("python.ready")
+        os.killpg(proc.pid, signal.SIGTERM)  # the batch shell and the trainer, as on a preempt-requeue
+        proc.communicate(timeout=TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 143
+    assert "got_signal" in h.logged("python.log")  # the trainer handled the signal instead of dying
+    assert (h.run_dir / "checkpoints" / "PREEMPTED").is_file()
+    assert h.logged("scancel.log") == []  # the successor stays queued
+    assert not h.staged.exists()
 
 
 def test_requeued_job_keeps_its_successor(h: Harness) -> None:

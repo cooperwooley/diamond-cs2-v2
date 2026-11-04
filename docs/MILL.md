@@ -73,6 +73,9 @@ Preemption on `requeue` (the PreemptMode decides which case applies):
   resumes with `common.resume=auto`. A restarted job (`SLURM_RESTART_COUNT > 0`) keeps the successor recorded in
   `$RUN_DIR/.successor-<jobid>` instead of submitting a second one.
 - **CANCEL:** the job ends, the successor is released and resumes the run (this costs one of `RESUBMITS_LEFT`).
+- **SIGTERM reaches the trainer too:** SLURM signals every process of the job, so the trainer handles SIGTERM like SIGUSR1
+  (it sets the preempt flag and saves at the next optimizer step) rather than dying at once.
+- **Held chain:** if `squeue` shows the successor held (e.g. "launch failed requeue held"), run `scontrol release <jobid>`.
 - **One trainer per run dir:** a job records its ID in `$RUN_DIR/.owner` and refuses to start (exit 2) while `squeue` shows
   that other job `RUNNING` or `SUSPENDED`. A stale file from a hard-killed job is ignored.
 
@@ -174,6 +177,9 @@ squeue -u $USER                              # successor should start after the 
 cat $S/runs/sanity-preempt/metrics.jsonl     # expect epochs 1,2,3 exactly once each
 ls $S/runs/sanity-preempt/checkpoints        # expect DONE
 sacct -u $USER -S today -o JobID,JobName%10,NodeList,Elapsed,State,ExitCode
+
+# 4) repeat step 3 with a real `scancel <jobid>` (SIGTERM, what a preemption or the time limit sends) instead of the USR1
+#    signal; checkpoints/PREEMPTED and a fresh state.pt (newer mtime) must appear before the job exits.
 ```
 
 ### #29: main v2 training (150 epochs, H100)

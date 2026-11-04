@@ -249,7 +249,7 @@ if [[ "$RESUBMITS_LEFT" -gt 0 ]]; then
         echo "Requeued job (restart ${SLURM_RESTART_COUNT}): keeping successor job $SUCC_ID."
     elif SUCC_ID=$(cd "$REPO_DIR" && "${SBATCH_CMD[@]}"); then
         SUCC_ID=${SUCC_ID%%;*} # --parsable prints "<id>[;<cluster>]"
-        echo "$SUCC_ID" >"$SUCCESSOR_FILE"
+        echo "$SUCC_ID" >"$SUCCESSOR_FILE.tmp" && mv "$SUCCESSOR_FILE.tmp" "$SUCCESSOR_FILE" # atomic: a kill never leaves it half-written
         echo "Successor job: $SUCC_ID (afterany:$JOB_ID, resubmits left: $((RESUBMITS_LEFT - 1)))"
     else
         SUCC_ID=
