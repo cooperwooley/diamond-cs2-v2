@@ -406,6 +406,8 @@ Split rules:
 - For `smoke`, which is the H2 evaluation set, at least 30% of the demos and at least 3 go to test. With fewer than 3 smoke demos all of them go to test and train has none.
 - **Shuffled-action control** (`--shuffle-actions`, the H1 null): each train episode receives the action sequence of another train episode. The preferred method is a cross-demo shift, which guarantees that no episode receives actions from its own demo when no demo holds more than half of the train episodes; otherwise a seeded derangement is used (`dataset_meta.json` records `shuffle.method` and `same_demo_swaps`). The test split keeps its true actions. This preserves the marginal and temporal statistics of the actions while breaking the frame-action correspondence.
 
+**Full-res subset (upsampler training, #70).** `--fullres-root $S/hdf5_fullres` keeps only the episodes that have a full-res twin there (matched by `<demo_id>/<episode_id>.hdf5`) and fails if there is none. The split is computed on the full set of demos first and filtered afterwards, so every kept episode has the same train/test assignment as in the full dataset built with the same `--hdf5/--kinds/--test-frac/--seed`, and `split.json` is identical to it. `dataset_meta.json` records `fullres_root`. If the subset leaves train or test empty, the build stops with an error. Train the upsampler on it with `training.models=[upsampler]` (docs/MILL.md).
+
 ## 9. Known limitations
 
 State-derived labels (what the labels are not):

@@ -216,6 +216,22 @@ def test_dry_run_prints_planned_commands(h: Harness) -> None:
     assert not h.run_dir.exists()
 
 
+def test_dry_run_upsampler_only_on_requeue(h: Harness) -> None:
+    fullres = f"{h.s}/hdf5_fullres"
+    res = h.run(
+        slurm=False,
+        DRY_RUN="1",
+        SLURM_JOB_PARTITION="requeue",
+        EXTRA=f"training.models=[upsampler] env.path_data_full_res={fullres}",
+    )
+    assert res.returncode == 0, res.stderr
+    python = next(line for line in res.stdout.splitlines() if "python src/main.py" in line)
+    assert "common.resume=auto" in python
+    assert "training.models=\\[upsampler\\]" in python  # show_cmd shell-quotes the brackets
+    assert f"env.path_data_full_res={fullres}" in python
+    assert " -p requeue " in res.stdout and "--export=ALL,RESUBMITS_LEFT=2" in res.stdout  # the successor chain is kept
+
+
 def test_dry_run_without_successor(h: Harness) -> None:
     res = h.run(slurm=False, DRY_RUN="1", RESUBMITS_LEFT="0")
     assert res.returncode == 0, res.stderr
