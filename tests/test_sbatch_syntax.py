@@ -49,6 +49,7 @@ def test_env_example_defines_mill_variables(repo_root) -> None:
         "export S=/share/ceph/scratch/$USER/dcs2",
         "export H100_GRES=",
         "export V100_GRES=",
+        "module load anaconda",
         "conda activate dcs2",
     ):
         assert needle in text
