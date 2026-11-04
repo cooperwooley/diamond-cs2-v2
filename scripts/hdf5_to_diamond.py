@@ -355,7 +355,13 @@ def convert(
     by_split = {s: [e for e in episodes if split[e.demo_id] == s] for s in SPLITS}
     for s, eps in by_split.items():
         if not eps:
-            raise SystemExit(f"the {s} split is empty ({len(episodes)} episodes, {len(split)} demos); add demos")
+            hint = (
+                f"the full-res subset left the {s} split empty (only {len(episodes)} episodes have a twin under "
+                f"{fullres_root}); add more data or raise --test-frac"
+                if fullres_root is not None
+                else f"the {s} split is empty ({len(episodes)} episodes, {len(split)} demos); add demos"
+            )
+            raise SystemExit(hint)
     sources: dict[str, EpisodeRef] = {}
     shuffle_info: dict[str, Any] | None = None
     if shuffle_actions:
@@ -414,7 +420,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         Exit code.
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.fullres_root and args.shuffle_actions:
+        parser.error("the upsampler ignores actions; build the full-res dataset without --shuffle-actions")
     kinds = [k for k in args.kinds.split(",") if k]
     fullres_root = Path(args.fullres_root) if args.fullres_root else None
     meta = convert(

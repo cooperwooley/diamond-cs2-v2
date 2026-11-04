@@ -223,6 +223,8 @@ python scripts/hdf5_to_diamond.py --hdf5 $S/hdf5 --fullres-root $S/hdf5_fullres 
   --kinds dm,human,smoke --test-frac 0.1 --seed 0
 ```
 
+Check the printed train/test frame counts before submitting: the 10% subset can leave a split small or empty.
+
 Then submit it like the denoiser run, on the free `requeue` partition with the same successor chain. `training.models=[upsampler]`
 makes the trainer step and evaluate only the upsampler, and `env.path_data_full_res` points at the full-res tree (read
 directly from scratch, not staged; the training job needs only a few frames per step). `DRY_RUN=1` shows both in the python command.

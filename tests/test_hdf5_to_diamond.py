@@ -216,6 +216,26 @@ def test_fullres_root_without_twins_fails(conv, tree, tmp_path) -> None:
         convert(conv, tree, tmp_path / "ds", "--fullres-root", str(tmp_path / "empty"))
 
 
+def test_fullres_root_leaving_a_split_empty_is_actionable(conv, tree, tmp_path) -> None:
+    only = next(p for p in tree.rglob("*.hdf5") if p.stem == "dm0_e0")
+    fullres = tmp_path / "fullres" / "dm" / "dm0"
+    fullres.mkdir(parents=True)
+    (fullres / only.name).write_bytes(b"")
+    convert(conv, tree, tmp_path / "full")
+    split = split_of(tmp_path / "full")
+    empty = "test" if split["dm0"] == "train" else "train"
+    with pytest.raises(SystemExit, match=f"full-res subset left the {empty} split empty.*--test-frac"):
+        convert(conv, tree, tmp_path / "ds", "--fullres-root", str(tmp_path / "fullres"))
+
+
+def test_fullres_root_with_shuffle_actions_is_a_usage_error(conv, tree, tmp_path, capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        convert(conv, tree, tmp_path / "ds", "--fullres-root", str(tmp_path), "--shuffle-actions")
+    assert exc.value.code == 2
+    assert "upsampler ignores actions" in capsys.readouterr().err
+    assert not (tmp_path / "ds").exists()
+
+
 # Derangement and shuffled actions
 
 
