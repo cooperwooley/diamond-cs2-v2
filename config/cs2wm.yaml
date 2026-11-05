@@ -133,9 +133,9 @@ generate:
 render:
   # mirv_tick = demo_tick + tick_offset (applied by segment when it writes the plan). The #14 muzzle-flash estimate is +7 ticks
   # (a frame shows the state ~7 ticks before its nominal tick). Camera rotation on render2 gave +4.6 ticks (r 0.94, see
-  # docs/HLAE_NOTES.md), but the second kept render could not confirm it, so the value stays 0 until a second render agrees
-  # within 2 ticks (candidate: +5).
-  tick_offset: 0
+  # docs/HLAE_NOTES.md); its two spectated bots agree (+5 and +4). Set to +5; the pilot run (#19) re-checks it on a render
+  # with a known schedule.
+  tick_offset: 5
   timeout_factor: 3.0               # x demo length (demo_end_tick / tickrate)
   startup_s: 60                     # CS2 launch + demo load, added to the timeout (the demo plays ~13 s after launch)
   # tga | ffmpeg. tga (afxClassic): ~94 fps (5.9x realtime), 2.76 MB/frame at 1280x720 (~159 GB per rendered hour at 16 fps),

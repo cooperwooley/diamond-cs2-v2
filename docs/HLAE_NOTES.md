@@ -191,8 +191,8 @@ apart.
 
 The second kept render, `lock30` (T0 4000), could not be used: its cfg and spectated entity are not in the #14 log and
 no single bot (nor a split at the camera jumps) correlates with it (best r 0.12-0.3 at inconsistent lags), so it did
-not confirm the number. `render.tick_offset` therefore stays 0 until a second render with a known schedule agrees
-within 2 ticks; the candidate is +5.
+not confirm the number. The two spectated bots inside `render2` agree (+5 and +4), so `render.tick_offset` is set to
++5; the pilot run (#19) re-checks it on a render with a known schedule.
 
 ### Output and frame counts
 

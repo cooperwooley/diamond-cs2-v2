@@ -293,7 +293,9 @@ def test_schedule_orders_end_before_switch_before_start_on_one_tick() -> None:
 
 def test_switch_is_at_spawn_plus_spec_delay_and_record_start_at_spawn_plus_settle() -> None:
     for delay in (1, 4, 9):
-        cfg = load_config(overrides=[f"segment.settle_ticks={SETTLE}", f"segment.spec_delay_ticks={delay}"])
+        cfg = load_config(
+            overrides=[f"segment.settle_ticks={SETTLE}", f"segment.spec_delay_ticks={delay}", "render.tick_offset=0"]
+        )
         segs = plan_spectate([life(1, 500, 9000)], "longest_remaining", cfg, rng())
         plan = segment.build_render_plan("d", segs, split_episodes(segs, "d", "dm", cfg), cfg, {})
         (seg,) = plan["segments"]
