@@ -66,12 +66,14 @@ Netcon sequence per session (`generate.chunking: gotv`, the default):
 1. Launch with the cfg; wait for the port (`netcon_connect_timeout_s`, 60).
 2. Wait for the map (`map_load_wait_s`, 10; `record` first works ~6 s after `map`).
 3. `jointeam 1` while the player is still Unassigned (worked ~6-8 s after `map`), then wait `team_settle_s` (5).
-4. Per chunk: `sv_cheats 1; tv_record <name>`; after `chunk_min`: `tv_stoprecord`; then the next chunk's `tv_record`.
-5. A chunk is closed once its file size is stable for `close_stable_s` (5; it was final within 2 s). Kill and
+4. `mp_restartgame 1` (`generate.restart_after_join`, default on), then wait `restart_wait_s` (6). This is the tested
+   recipe; the `human` profile skips steps 3 and 4.
+5. Per chunk: `sv_cheats 1; tv_record <name>`; after `chunk_min`: `tv_stoprecord`; then the next chunk's `tv_record`.
+6. A chunk is closed once its file size is stable for `close_stable_s` (5; it was final within 2 s). Kill and
    relaunch on exit or when no demo grew for `hang_timeout_min`.
 
-`chunking: netcon` is the same with `sv_cheats 1; record <name>` / `stop`. The `human` profile does not send
-`jointeam 1`: the human stays on a team.
+`chunking: netcon` is the same with `sv_cheats 1; record <name>` / `stop`. The `human` profile sends neither
+`jointeam 1` nor `mp_restartgame 1`: the human stays on a team.
 
 - `record` is **cheat-protected** (`SV: Cheat command 'record' ignored.`); `sv_cheats 1` goes on the same line (it
   seems to need re-sending after each map load). Offline and `-insecure` only ("Achievements disabled" is printed).
@@ -91,9 +93,8 @@ neither ever becomes a target.
 
 5 of 6 GOTV recordings **stalled** after ~12-16 s of match time. Probable cause: the human joined a team (auto-join
 and game restart) *after* `tv_record` had started. The recipe that gave a full 194 s demo (11.3 MB, ~57 KB/s, no
-stall): `jointeam 1` as soon as the player is in game, wait ~5 s (the #14 run also sent the cvars and
-`mp_restartgame 1` here, then waited ~6 s), and only then `tv_record`. The pipeline follows the order (spectate first,
-settle, record); `mp_restartgame` is not sent. If stalls reappear in the pilot, add it after `jointeam 1`.
+stall): `jointeam 1` as soon as the player is in game, wait ~5 s, send the cvars and `mp_restartgame 1`, wait ~6 s,
+and only then `tv_record`. The pipeline follows this order; the bot cvars come from the cfg and are not re-sent.
 
 After a **second `map`** over netcon the player stayed Unassigned on the team-select screen and the client demo was
 never written; relaunch CS2 instead of reloading the map.
@@ -140,9 +141,8 @@ Spectating:
   `spec_player 3` -> userid 2, `spec_player 10` -> userid 9. It is not the pawn id (~159+). The plan's
   `target.entity_id` must therefore be exactly the controller entity id (#72 provides it).
 - A dead target is **silently ignored**: the camera stays on the previous one. Switch only while the bot is alive,
-  after its spawn. The plan schedules the switch `settle_ticks` before the record start, and the record start is at
-  least spawn + `settle_ticks`, so a switch can land on the spawn tick itself. #14 saw a switch 3 ticks after a spawn
-  work; check the first pilot demo for a missed switch.
+  after its spawn. The plan schedules the switch at spawn + `segment.spec_delay_ticks` (4; #14 saw a switch 3 ticks
+  after a spawn work), never before the previous recording ended; recording starts at spawn + `settle_ticks`.
   `mirv_script_spec_lock` does not exist in this HLAE.
 - A switch scheduled at tick T shows from the **next frame** (T0+640 showed in frame 161, not 160): a hard cut with no
   transition frames. Keep a margin of at least 1-2 frames (`segment.settle_ticks`).

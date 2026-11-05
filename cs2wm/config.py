@@ -108,6 +108,7 @@ def _check_generate(gen: DictConfig, problems: list[str]) -> None:
         "min_chunk_s",
         "map_load_wait_s",
         "team_settle_s",
+        "restart_wait_s",
         "netcon_connect_timeout_s",
         "netconport",
     ):
@@ -122,12 +123,20 @@ def _check_generate(gen: DictConfig, problems: list[str]) -> None:
         problems.append(f"generate.netconport must be in [1024, 65535], got {nums['netconport']}")
     if {"close_stable_s", "close_timeout_s"} <= nums.keys() and nums["close_stable_s"] >= nums["close_timeout_s"]:
         problems.append("generate.close_stable_s must be < generate.close_timeout_s")
-    startup_keys = {"netcon_connect_timeout_s", "map_load_wait_s", "team_settle_s", "hang_timeout_min"}
+    if not isinstance(gen.get("restart_after_join"), bool):
+        problems.append(f"generate.restart_after_join must be true or false, got {gen.get('restart_after_join')!r}")
+    startup_keys = {
+        "netcon_connect_timeout_s",
+        "map_load_wait_s",
+        "team_settle_s",
+        "restart_wait_s",
+        "hang_timeout_min",
+    }
     if startup_keys <= nums.keys():
-        startup = nums["netcon_connect_timeout_s"] + nums["map_load_wait_s"] + nums["team_settle_s"]
+        startup = sum(nums[k] for k in startup_keys - {"hang_timeout_min"})
         if startup >= nums["hang_timeout_min"] * 60:
             problems.append(
-                "generate.netcon_connect_timeout_s + map_load_wait_s + team_settle_s must be < hang_timeout_min * 60 "
+                "generate startup waits (netcon_connect_timeout_s + map_load_wait_s + team_settle_s + restart_wait_s) must be < hang_timeout_min * 60 "
                 f"(the watchdog grace period starts at launch), got {startup} s"
             )
 
@@ -200,6 +209,12 @@ def validate_config(cfg: DictConfig) -> None:
         if problem:
             problems.append(f"{section}.launch_options: {problem}")
     _check_generate(cfg.generate, problems)
+    seg = cfg.segment
+    if not 0 <= seg.spec_delay_ticks < seg.settle_ticks:
+        problems.append(
+            f"segment.spec_delay_ticks must be in [0, settle_ticks), got {seg.spec_delay_ticks} "
+            f"(settle_ticks {seg.settle_ticks})"
+        )
 
     for key, value in cfg.qa.items():
         if (key.endswith("_frac") or key == "min_fire_recall") and not 0 <= value <= 1:

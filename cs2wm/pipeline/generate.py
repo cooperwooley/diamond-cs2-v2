@@ -12,7 +12,8 @@ How it works:
   copied to ``<cs2_dir>/game/csgo/cfg/generate_<profile>.cfg`` and run with ``+exec generate_<profile>``. Its sha256
   goes into every sidecar.
 * Both chunking modes are driven over ``-netconport``. After the map has loaded the local player joins the spectators
-  (``jointeam 1``, lost if sent from the cfg because the client is not connected yet); then, every chunk, ``gotv``
+  (``jointeam 1``, lost if sent from the cfg because the client is not connected yet), optionally followed by
+  ``mp_restartgame 1`` (``generate.restart_after_join``); then, every chunk, ``gotv``
   (default) sends ``sv_cheats 1; tv_record <demo_id>`` / ``tv_stoprecord`` and ``netcon`` sends
   ``sv_cheats 1; record <demo_id>`` / ``stop``. ``tv_autorecord`` is not used: it writes ``replays/auto-*.dem`` with
   uncontrolled names. Both ``record`` and ``tv_record`` write ``game/csgo/<demo_id>.dem``.
@@ -815,6 +816,10 @@ class Generator:
                 client.send("jointeam 1")
                 if self._watch(proc, float(self.g.team_settle_s)) != "running":
                     raise ConnectionError("CS2 died while joining the spectators")
+                if self.g.restart_after_join:  # the recipe that gave a full GOTV demo (#14)
+                    client.send("mp_restartgame 1")
+                    if self._watch(proc, float(self.g.restart_wait_s)) != "running":
+                        raise ConnectionError("CS2 died while restarting the game")
             while self.generated_s < self.target_s and self._publish_failures < self.g.max_failures:
                 self._guard()
                 demo_id = make_demo_id(self.profile, self.started, self._index)

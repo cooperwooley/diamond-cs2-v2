@@ -41,6 +41,7 @@ def _cfg(tmp_path: Path, *overrides: str) -> DictConfig:
             "generate.expected_build=null",
             "generate.map_load_wait_s=10",
             "generate.team_settle_s=1",
+            "generate.restart_wait_s=2",
             "generate.netcon_connect_timeout_s=10",
             "generate.close_stable_s=2",
             "generate.close_timeout_s=10",
@@ -483,7 +484,7 @@ def test_patch_guard_passes_with_matching_build(tmp_path: Path) -> None:
 
 
 def _chunk_commands(world: FakeWorld) -> list[str]:
-    return [c for _, c in world.commands if c != "jointeam 1"]
+    return [c for _, c in world.commands if c not in ("jointeam 1", "mp_restartgame 1")]
 
 
 def test_gotv_session_sequence(tmp_path: Path) -> None:
@@ -496,10 +497,11 @@ def test_gotv_session_sequence(tmp_path: Path) -> None:
     expected = []
     for name in names:
         expected += [f"sv_cheats 1; tv_record {name}", "tv_stoprecord"]
-    assert [c for _, c in world.commands] == ["jointeam 1", *expected]
-    (t_join, _), (t_first, _) = world.commands[:2]
+    assert [c for _, c in world.commands] == ["jointeam 1", "mp_restartgame 1", *expected]
+    (t_join, _), (t_restart, _), (t_first, _) = world.commands[:3]
     assert t_join == 10  # after map_load_wait_s
-    assert t_first == t_join + 1  # after team_settle_s: joining a team after tv_record stalls the demo
+    assert t_restart == t_join + 1  # after team_settle_s
+    assert t_first == t_restart + 2  # after restart_wait_s: joining a team after tv_record stalls the demo
     sides = [json.loads(p.with_suffix(".json").read_text()) for p in kept]
     assert all(s["chunking"] == "gotv" and not s["truncated"] for s in sides)
     assert list(world.csgo.glob("*.dem")) == []  # GOTV demos land in game/csgo like client demos
@@ -511,7 +513,7 @@ def test_stoprecord_comes_before_the_next_tv_record(tmp_path: Path) -> None:
     cmds = _chunk_commands(world)
     assert cmds[1::2] == ["tv_stoprecord"] * 3
     assert all(c.startswith("sv_cheats 1; tv_record ") for c in cmds[0::2])
-    times = [t for t, c in world.commands if c != "jointeam 1"]
+    times = [t for t, _ in world.commands]
     assert times == sorted(times)
 
 
@@ -519,14 +521,22 @@ def test_netcon_chunking_records_client_demos(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.09, "generate.chunking=netcon")
     kept = gen.run()
     expected = [c for p in kept for c in (f"sv_cheats 1; record {p.stem}", "stop")]
-    assert [c for _, c in world.commands] == ["jointeam 1", *expected]
+    assert [c for _, c in world.commands] == ["jointeam 1", "mp_restartgame 1", *expected]
     assert all(json.loads(p.with_suffix(".json").read_text())["chunking"] == "netcon" for p in kept)
+
+
+def test_restart_after_join_can_be_turned_off(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.04, "generate.restart_after_join=false", chunk_min=1)
+    gen.run()
+    cmds = [c for _, c in world.commands]
+    assert cmds[0] == "jointeam 1" and cmds[1].startswith("sv_cheats 1; tv_record ")
+    assert "mp_restartgame 1" not in cmds
 
 
 def test_human_session_stays_on_a_team(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.04, profile="human", chunk_min=1)
     gen.run()
-    assert "jointeam 1" not in [c for _, c in world.commands]
+    assert not {"jointeam 1", "mp_restartgame 1"} & {c for _, c in world.commands}
     assert world.commands[0][1].startswith("sv_cheats 1; tv_record human_")
 
 
@@ -574,6 +584,19 @@ def test_parse_error_keeps_a_demo_that_ends_early_but_has_ticks(
     assert generate._parse_error(f) == "unexpected end of demo"
     monkeypatch.setattr(generate.demo, "inspect", lambda p: {**cut, "truncated": False})
     assert generate._parse_error(f) == "unexpected end of demo"
+
+
+def test_parse_error_accepts_both_truncated_signals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#72 reports a demo that ends early via is_parseable() True and/or inspect()['truncated'] with ticks."""
+    f = tmp_path / "a.dem"
+    cut = {"ok": False, "truncated": True, "last_tick": 1, "error": "unexpected end of demo"}
+    monkeypatch.setattr(generate.demo, "inspect", lambda p: cut)
+    monkeypatch.setattr(generate.demo, "is_parseable", lambda p: True, raising=False)
+    assert generate._parse_error(f) is None  # signal 1: is_parseable()
+    monkeypatch.setattr(generate.demo, "is_parseable", None, raising=False)
+    assert generate._parse_error(f) is None  # signal 2: inspect() with truncated + one tick
+    monkeypatch.setattr(generate.demo, "inspect", lambda p: {**cut, "last_tick": None})
+    assert generate._parse_error(f) == "unexpected end of demo"  # no tick at all: rejected
 
 
 def test_other_tools_demos_in_the_csgo_dir_are_left_alone(tmp_path: Path) -> None:

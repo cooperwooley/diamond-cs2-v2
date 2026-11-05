@@ -15,7 +15,8 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
    `demos/<kind>/<demo_id>.dem` with a JSON sidecar. A watchdog restarts crashed or hung runs. The setup commands
    come from `config/cs2/generate_*.cfg`; the chunks are driven over `-netconport` (`generate.chunking`):
    - `gotv` (default): GOTV demos, which hold every bot. After the map has loaded generate sends `jointeam 1` (the local
-     player spectates; it is lost if exec'd from the cfg), waits `team_settle_s`, then per chunk
+     player spectates; it is lost if exec'd from the cfg), waits `team_settle_s`, sends `mp_restartgame 1` and waits
+     `restart_wait_s` (`restart_after_join`; the tested recipe), then per chunk
      `sv_cheats 1; tv_record <demo_id>` and, after `chunk_min`, `tv_stoprecord`. The cfg enables GOTV *before* `map`
      (`tv_enable 1; tv_transmitall 1; tv_record_immediate 1`).
    - `netcon`: the local client's demo (`sv_cheats 1; record <demo_id>` / `stop`), which only holds what the
