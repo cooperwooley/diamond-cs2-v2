@@ -180,7 +180,35 @@ The 51-dim space has keys `1`, `2`, `3` and no slot-4 key (this is the v1/P&Z la
 - slot `2`: the listed pistols (`actions.slots."2"`);
 - anything else maps to `actions.slots.default = "3"`, which therefore means "slot 3 and above": the knife and every utility item, including smoke, flash, HE, decoy, molotov, the bomb and the taser. The smoke grenade is therefore indistinguishable from the knife in the action space, which matters for the `smoke` kind and H2.
 
-`TBD(#14): the exact CS2 weapon strings seen in the demos, and any weapon that falls into the wrong slot` (the config marks the slot lists as unconfirmed until #14).
+The weapon strings demoinfocs returns, and the slot every one of them gets, are listed in section 4.5.
+
+### 4.5 Demo parser conventions (demoinfocs, #72)
+
+Demos are parsed by `tools/demodump` (demoinfocs-golang v6.0.0-rc.1) and served through `cs2wm/demodump.py` under the demoparser2 column names, because demoparser2 0.42.1 cannot read current CS2 demos (patch_version 14196). `demo.backend: demoparser2` still selects the old parser. What was checked, on `dcs2_test-cas-client.dem` (the one demo where demoparser2 returns ticks; 8058 rows of 4 players matched on tick and name):
+
+| Convention | Result |
+|---|---|
+| `tick` | The demo tick (`IngameTick`), the one `mirv_cmd addAtTick` uses. `CurrentFrame()` runs 32-35 higher and is not used. Repeated ticks are collapsed (the last frame wins), a tick that goes backwards is skipped. |
+| `yaw`, `pitch` | Degrees, same sign and range as demoparser2: yaw in [-180, 180], pitch in [-90, 90], positive pitch looks down. Correlation with demoparser2 over the overlap: yaw 0.9999999, pitch 0.99999. 99% of rows agree within 0.05 degrees; the largest difference (0.7 degrees) is one-tick sampling jitter, not an offset. Section 4.3's signs apply unchanged. |
+| `X`, `Y`, `Z`, `duck_amount` | Source units; `duck_amount` is the pawn property `m_pMovementServices.m_flDuckAmount` (0 standing, 1 ducked). 99% of positions agree within 0.05 units. At tick 0 of a demo all positions are the placeholder (0, 0, -1612.47). |
+| `active_weapon_name` | Display name, e.g. `AK-47`, `M4A1`, `Glock-18`, `Knife`, `Smoke Grenade`; empty when the player holds nothing. demoparser2 0.42.1 returns no `active_weapon_name` column on these demos, so the strings were not diffed against it. Instead every name demoinfocs can return was run through `actions.slot_for_weapon`: all rifles, SMGs, shotguns and snipers give slot 1, all pistols slot 2, and the knife, taser, bomb and utility slot 3 (`tests/test_demodump.py`). |
+| `entity_id` | The player **controller** entity index (e.g. 3 for the first bot; equal to `user_id + 1` in these demos). demoparser2 reports the **pawn** entity index instead (e.g. 342 where demodump has `entity_id` 11 and `pawn_entity_id` 342). The dump has both. |
+| `user_id` | The in-demo user id that game events use (`userid`); the key every caller joins on. |
+| Buttons | GOTV demos carry none, so `FORWARD`, `FIRE`, `buttons`... are never returned; `extract_actions` labels from state and skips the cross-check. |
+
+**What `spec_player` takes is still #14 D2.** The plan's `target.entity_id` is now the controller index (3), where demoparser2 would have given the pawn index (339-ish). If the game rejects it, the candidates are `user_id` (2, equal to the slot here: `render.spec_player_field=user_id`) or the pawn index from `pawn_entity_id`.
+
+**Derived events.** GOTV demos have no `player_jump`, `weapon_reload`, `weapon_zoom` or `grenade_thrown` game events, so the exporter reconstructs them from the tick data and flags them `derived=true`. A derived event is written only when the demo has no raw event of that name. Thresholds are constants in `tools/demodump/derive.go`:
+
+| Event | Rule | Constant |
+|---|---|---|
+| `player_jump` | The airborne flag rises and Z climbs at least 2 units above the last grounded Z within 4 ticks; stamped at the take-off tick. Walking off a ledge never rises, so it is not a jump. | `jumpMinRise = 2.0`, `jumpWindowTicks = 4` |
+| `weapon_reload` | The active weapon's `m_bInReload` rises, or (a demo without the flag) the magazine refills on the same weapon; a refill within 320 ticks of a reload is the same reload. | `reloadDebounceTicks = 320` |
+| `weapon_zoom` | The active weapon's zoom level changes on the same weapon, except the automatic unscope within 2 ticks of a shot. | `zoomUnscopeAfterShotTicks = 2` |
+| any | A Z jump above 64 units between two samples, or a death or respawn, resets the detectors. | `teleportRise = 64.0` |
+| `grenade_thrown` | Emitted from the projectile-created event of demoinfocs. | |
+
+On `dcs2_test-gotv.dem` the exporter finds 104 jumps and 23 reloads (the same 23 as the `m_bInReload` flag edges). The demo has no scoped weapon in use, so `weapon_zoom` is untested on real data; its unit tests are synthetic.
 
 ## 5. QA
 
@@ -343,7 +371,7 @@ File attrs (Python scalars; `read_episode` returns them as plain Python values):
 | `player` | str | Spectated player |
 | `start_tick` | int | `T0`, the tick of frame 0 |
 | `cs2_build` | str or int | CS2 build ID |
-| `demoparser2_version` | str | demoparser2 version used for the labels |
+| `demoparser2_version` | str | parser version used for the labels: `demodump <n> (demoinfocs <version>)`, or the demoparser2 version with `demo.backend: demoparser2` (the attr keeps its old name) |
 | `cs2wm_git_sha` | str | cs2wm commit used for the labels |
 
 The caller may pass further scalar (str, int, float, bool or None) meta keys, which are written as attrs too (None becomes the empty string); keys that collide with the writer's own attrs are rejected. `jpeg_quality` appears in the full-res file only.

@@ -58,6 +58,19 @@ C:\dcs2\venv\Scripts\pip install -e C:\dcs2\diamond-cs2-v2
 HLAE comes from the release zip at https://github.com/advancedfx/advancedfx/releases, extracted to `C:\hlae` and
 unblocked (`Get-ChildItem -Recurse C:\hlae | Unblock-File`).
 
+## Demo exporter (`demodump`)
+
+Demos are parsed by `demodump`, a Go program built from `tools/demodump` (#72), not by demoparser2. Build it in WSL
+(needs Go; the PC never needs it):
+```bash
+scripts/build_demodump.sh        # writes bin/demodump (Linux) and bin/demodump.exe (Windows), both git-ignored
+cp bin/demodump.exe /mnt/c/dcs2/bin/demodump.exe
+```
+and point Windows at it: `setx DCS2_DEMODUMP C:\dcs2\bin\demodump.exe`. The lookup order is env `DCS2_DEMODUMP`, then
+`demo.demodump` in `cs2wm.yaml`, then `bin\demodump.exe` in the repo, then `PATH`. A missing binary fails with the
+build script's name. Each demo is parsed once and the tables are cached in `<DCS2_ROOT>\demo_cache` (keyed by path, size
+and mtime; safe to delete). `demo.backend: demoparser2` switches back to the old parser.
+
 ## Syncing to the Mill without a key
 
 There is no SSH key for the Mill, so nothing syncs unattended. `sync.auto` and `sync.batch_mode` are both `false`
