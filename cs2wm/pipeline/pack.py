@@ -23,9 +23,8 @@ import cv2
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as TF
 
 from cs2wm import demo
 from cs2wm.actions import ACTION_DIM
@@ -96,9 +95,14 @@ def _check_frames(frames_bgr: np.ndarray) -> None:
 def to_low_res(frames_bgr: np.ndarray, size: tuple[int, int] = (30, 56)) -> np.ndarray:
     """Downscale like v1 ``build_dataset.py::create_low_res_dataset``, with the uint8 cast clamped.
 
-    Steps: BGR to RGB, scale to [-1, 1], torchvision bicubic (antialiased) resize to ``size``,
+    Steps: BGR to RGB, scale to [-1, 1], bicubic (antialiased) resize to ``size``,
     ``add(1).div(2).mul(255)``, clamp to [0, 255], uint8, back to BGR. The clamp is the only intentional difference
     from v1, whose ``.byte()`` wraps bicubic overshoot at hard edges (257.5 becomes 1).
+
+    The resize calls ``torch.nn.functional.interpolate`` directly. That is exactly what v1's
+    ``torchvision.transforms.functional.resize`` does for a float tensor (bicubic, ``align_corners=False``, antialias,
+    no clamp or cast), and it avoids importing torchvision, whose compiled extension Windows Smart App Control blocks
+    on the render PC ("An Application Control policy has blocked this file").
 
     Args:
         frames_bgr: ``uint8[n, H, W, 3]`` frames.
@@ -115,7 +119,7 @@ def to_low_res(frames_bgr: np.ndarray, size: tuple[int, int] = (30, 56)) -> np.n
     for start in range(0, len(frames_bgr), _CHUNK):
         chunk = torch.from_numpy(np.ascontiguousarray(frames_bgr[start : start + _CHUNK]))
         x = chunk.flip(3).permute(0, 3, 1, 2).float().div(255).mul(2).sub(1)
-        y = TF.resize(x, list(size), interpolation=InterpolationMode.BICUBIC, antialias=True)
+        y = F.interpolate(x, size=list(size), mode="bicubic", align_corners=False, antialias=True)
         y = y.add(1).div(2).mul(255).clamp(0, 255).byte()
         out[start : start + _CHUNK] = y.flip(1).permute(0, 2, 3, 1).numpy()
     return out
