@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/markus-wa/demoinfocs-golang/v6/pkg/demoinfocs/common"
 	"github.com/markus-wa/demoinfocs-golang/v6/pkg/demoinfocs/events"
 	"github.com/markus-wa/demoinfocs-golang/v6/pkg/demoinfocs/msg"
 )
@@ -103,12 +104,19 @@ func (e *eventTables) addRaw(tick int, ev events.GenericGameEvent) {
 		}
 		row[k] = eventValue(v)
 	}
+	// weapon is the raw string ("weapon_ak47"); weapon_name is the display name ("AK-47") that
+	// active_weapon_name uses, on raw and derived events alike.
+	if w, ok := row["weapon"]; ok {
+		if eq := common.MapEquipment(w); eq != common.EqUnknown {
+			row["weapon_name"] = eq.String()
+		}
+	}
 	tableFor(e.raw, ev.Name).add(row)
 }
 
 func (e *eventTables) addDerived(tick int, name string, userID int, weapon string) {
 	tableFor(e.derived, name).add(map[string]string{
-		"tick": strconv.Itoa(tick), "derived": "true", "user_id": strconv.Itoa(userID), "weapon": weapon,
+		"tick": strconv.Itoa(tick), "derived": "true", "user_id": strconv.Itoa(userID), "weapon_name": weapon,
 	})
 }
 

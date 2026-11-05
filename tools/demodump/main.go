@@ -5,7 +5,7 @@
 // Files written to outdir (gzip-compressed CSV, one header row; see cs2wm/demo.py for how they are read):
 //
 //	header.json       map, patch version, tick rate, first and last tick, tool versions
-//	players.csv       one row per player: user_id, entity_id, name, steamid, is_bot, team, first/last tick
+//	players.csv       one row per player and user_id occupancy: user_id, entity_id, name, steamid, ..., first/last tick
 //	ticks.csv.gz      one row per (tick, player); ticks are demo ticks (IngameTick), de-duplicated
 //	events/<name>.csv.gz  every game event, one table per event name, plus the derived events (derived=true)
 //	grenades.csv.gz   grenade trajectories, one row per (grenade, tick)
@@ -31,6 +31,11 @@ import (
 // version is the demodump output format version. Bump it when a column or its meaning changes: it is part of the
 // cache key on the Python side.
 const version = "1"
+
+// behaviorVersion identifies what the tables contain for a given demo: the derived-event rules and constants in
+// derive.go and the table logic. Bump it whenever either changes; the Python cache key includes it. The pinned hash
+// in behavior_test.go fails until you do.
+const behaviorVersion = "1"
 
 const (
 	demoinfocsModule = "github.com/markus-wa/demoinfocs-golang/v6"
@@ -65,7 +70,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "print the demodump and demoinfocs versions and exit")
 	flag.Parse()
 	if *showVersion {
-		fmt.Printf("demodump %s demoinfocs %s\n", version, demoinfocsVersion())
+		fmt.Printf("demodump %s demoinfocs %s behavior %s\n", version, demoinfocsVersion(), behaviorVersion)
 		return
 	}
 	if flag.NArg() != 2 {
@@ -78,7 +83,9 @@ func main() {
 	}
 }
 
-type playerInfo struct {
+// occupancy is one player holding a user_id for a span of ticks. A user_id that is reused by someone else gets a
+// second occupancy, so events can be joined to the right name by tick.
+type occupancy struct {
 	userID, entityID, pawnID, team, first, last int
 	name                                        string
 	steamID                                     uint64
@@ -96,8 +103,8 @@ type dumper struct {
 	ticks, grenades *csvFile
 	events          *eventTables
 	detectors       map[int]*detector
-	players         map[int]*playerInfo
-	playerOrder     []int
+	roster          []*occupancy
+	current         map[int]*occupancy
 
 	pending     []frameRow
 	pendingTick int
@@ -125,7 +132,7 @@ func dump(demoPath, outDir string) error {
 	d := &dumper{
 		events:     newEventTables(),
 		detectors:  map[int]*detector{},
-		players:    map[int]*playerInfo{},
+		current:    map[int]*occupancy{},
 		grenadeIDs: map[*common.GrenadeProjectile]int{},
 		header:     map[string]any{},
 	}
@@ -158,9 +165,16 @@ func dump(demoPath, outDir string) error {
 		d.frame(gs.IngameTick(), gs.Participants().Playing())
 	})
 
+	// A demo cut short (CS2 killed mid-recording) is still a usable partial dump: everything up to the cut is kept
+	// and header.json says truncated. Any other error is a failure and nothing is kept.
 	parseErr := p.ParseToEnd(context.Background())
-	if parseErr != nil {
+	truncated := errors.Is(parseErr, demoinfocs.ErrUnexpectedEndOfDemo)
+	if parseErr != nil && !truncated {
 		return fmt.Errorf("parse %s: %w", demoPath, errors.Join(parseErr, d.close()))
+	}
+	d.header["truncated"] = truncated
+	if truncated {
+		fmt.Fprintf(os.Stderr, "demodump: %s ends unexpectedly, writing a partial dump\n", demoPath)
 	}
 	d.flush()
 	for _, gp := range p.GameState().GrenadeProjectiles() {
@@ -208,20 +222,25 @@ func (d *dumper) frame(tick int, playing []*common.Player) {
 func (d *dumper) row(tick int, pl *common.Player) frameRow {
 	pos := pl.Position()
 	pawn := pl.PlayerPawnEntity()
-	pawnID, duck := 0, 0.0
+	st := playerState{
+		Tick: tick, UserID: pl.UserID, EntityID: pl.EntityID, Team: int(pl.Team), Health: pl.Health(),
+		Name: pl.Name, SteamID: pl.SteamID64, HasPawn: pawn != nil, Alive: pl.IsAlive(),
+		X: pos.X, Y: pos.Y, Z: pos.Z, Yaw: float64(pl.ViewDirectionX()), Pitch: float64(pl.ViewDirectionY()),
+		Airborne: pl.IsAirborne(), Walking: pl.IsWalking(), Scoped: pl.IsScoped(),
+	}
+	if pl.Entity != nil {
+		st.EntityID = pl.Entity.ID()
+	}
+	s := sample{Tick: tick, Z: pos.Z, Airborne: st.Airborne, Clip: -1}
 	if pawn != nil {
-		pawnID = pawn.ID()
+		st.PawnID = pawn.ID()
 		if v, ok := pawn.PropertyValue(duckProp); ok && v.Any != nil {
-			duck = float64(v.Float())
+			st.Duck = float64(v.Float())
 		}
 	}
-	entityID := pl.EntityID
-	if pl.Entity != nil {
-		entityID = pl.Entity.ID()
-	}
-	s := sample{Tick: tick, Alive: pl.IsAlive(), Z: pos.Z, Airborne: pl.IsAirborne(), Clip: -1}
 	if w := pl.ActiveWeapon(); w != nil {
-		s.WeapName, s.Clip, s.Zoom = w.String(), w.AmmoInMagazine(), int(w.ZoomLevel())
+		st.Weapon = w.String()
+		s.WeapName, s.Clip, s.Zoom = st.Weapon, w.AmmoInMagazine(), int(w.ZoomLevel())
 		if w.Entity != nil {
 			s.Weapon = w.Entity.ID()
 			if v, ok := w.Entity.PropertyValue(reloadProp); ok && v.Any != nil {
@@ -229,25 +248,21 @@ func (d *dumper) row(tick int, pl *common.Player) frameRow {
 			}
 		}
 	}
-	info := d.players[pl.UserID]
-	if info == nil {
-		info = &playerInfo{userID: pl.UserID, first: tick}
-		d.players[pl.UserID] = info
-		d.playerOrder = append(d.playerOrder, pl.UserID)
-	}
-	info.entityID, info.pawnID, info.team, info.last = entityID, pawnID, int(pl.Team), tick
-	info.name, info.steamID, info.bot = pl.Name, pl.SteamID64, pl.IsBot
+	s.Alive = st.alive() && st.validPose() // a row without a pose resets the derived-event detectors
+	d.occupy(st, pl.IsBot)
+	return frameRow{userID: pl.UserID, cells: st.cells(), s: s}
+}
 
-	cells := []string{
-		strconv.Itoa(tick), strconv.Itoa(pl.UserID), strconv.Itoa(entityID), strconv.Itoa(pawnID), pl.Name,
-		strconv.FormatUint(pl.SteamID64, 10), strconv.Itoa(int(pl.Team)), strconv.FormatBool(s.Alive),
-		strconv.Itoa(pl.Health()),
-		fmtFloat(pos.X, 3), fmtFloat(pos.Y, 3), fmtFloat(pos.Z, 3),
-		fmtFloat(float64(pl.ViewDirectionX()), 4), fmtFloat(float64(pl.ViewDirectionY()), 4),
-		strconv.FormatBool(s.Airborne), fmtFloat(duck, 4), s.WeapName,
-		strconv.FormatBool(pl.IsWalking()), strconv.FormatBool(pl.IsScoped()),
+// occupy records who holds the user_id at this tick, opening a new occupancy when the player changed.
+func (d *dumper) occupy(st playerState, bot bool) {
+	cur := d.current[st.UserID]
+	if cur == nil || cur.name != st.Name || cur.steamID != st.SteamID || cur.entityID != st.EntityID {
+		cur = &occupancy{userID: st.UserID, first: st.Tick, bot: bot}
+		d.current[st.UserID] = cur
+		d.roster = append(d.roster, cur)
 	}
-	return frameRow{userID: pl.UserID, cells: cells, s: s}
+	cur.entityID, cur.pawnID, cur.team, cur.last = st.EntityID, st.PawnID, st.Team, st.Tick
+	cur.name, cur.steamID = st.Name, st.SteamID
 }
 
 // flush writes the pending tick and runs the derived-event detectors on it.
@@ -304,8 +319,7 @@ func (d *dumper) writePlayers(path string) error {
 	if err != nil {
 		return err
 	}
-	for _, uid := range d.playerOrder {
-		p := d.players[uid]
+	for _, p := range d.roster {
 		out.Write([]string{
 			strconv.Itoa(p.userID), strconv.Itoa(p.entityID), strconv.Itoa(p.pawnID), p.name,
 			strconv.FormatUint(p.steamID, 10), strconv.FormatBool(p.bot), strconv.Itoa(p.team),
@@ -318,7 +332,7 @@ func (d *dumper) writePlayers(path string) error {
 func (d *dumper) writeHeader(path, demoPath string) error {
 	d.header["first_tick"] = d.firstTick
 	d.header["last_tick"] = d.lastTick
-	d.header["n_players"] = len(d.players)
+	d.header["n_players"] = len(d.current)
 	d.header["demo_file"] = filepath.Base(demoPath)
 	d.header["demodump_version"] = version
 	d.header["demoinfocs_version"] = demoinfocsVersion()
