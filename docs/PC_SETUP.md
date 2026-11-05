@@ -71,6 +71,19 @@ and point Windows at it: `setx DCS2_DEMODUMP C:\dcs2\bin\demodump.exe`. The look
 build script's name. Each demo is parsed once and the tables are cached in `<DCS2_ROOT>\demo_cache` (keyed by path, size
 and mtime; safe to delete). `demo.backend: demoparser2` switches back to the old parser.
 
+## Windows Smart App Control blocks torchvision
+
+On this PC, Windows Smart App Control (WinError 4551, "An Application Control policy has blocked this file") blocks
+torchvision's compiled extension `torchvision\_C_stable.pyd`, so `import torchvision` fails in `C:\dcs2\venv` with
+`operator torchvision::nms does not exist`. torch itself, h5py, OpenCV, demoparser2 and `demodump.exe` load fine.
+
+- The Windows pipeline stages don't import torchvision: `pack` resizes with `torch.nn.functional.interpolate`, which is
+  what v1's torchvision resize does for float tensors (bit-identical; `tests/test_pack.py` checks it against
+  torchvision on Linux).
+- Anything that needs torchvision, such as the LPIPS evals (#27, #33, via the `lpips` package), runs in WSL or on the
+  Mill instead.
+- Don't turn Smart App Control off to work around this: it can't be turned back on without reinstalling Windows.
+
 ## Syncing to the Mill without a key
 
 There is no SSH key for the Mill, so nothing syncs unattended. `sync.auto` and `sync.batch_mode` are both `false`

@@ -153,6 +153,17 @@ def _expand_cfg(name: str, stack: tuple[str, ...], cfg_dir: Path | None) -> list
     return out
 
 
+def cvar_value(name: str, reply: str) -> str | None:
+    """The value of cvar ``name`` in a console reply, or None if the reply has no line for it.
+
+    CS2 answers a bare cvar query with ``bot_difficulty = 2`` (checked on the PC, Nov 5); the CS:GO-style
+    ``"bot_difficulty" = "2" ( def. "1" )`` is accepted too. The reply may carry unrelated log lines.
+    """
+    pattern = rf'(?m)^[ \t]*"?{re.escape(name)}"?[ \t]*=[ \t]*"?([^"\r\n]*?)"?(?:[ \t]+\(.*)?[ \t]*\r?$'
+    matches = re.findall(pattern, reply)
+    return matches[-1].strip() if matches else None
+
+
 def post_load_commands(profile: str, cfg_dir: Path | None = None) -> list[str]:
     """The commands of ``generate_<profile>_post.cfg``: cvars that the map load resets and generate sends over netcon.
 
@@ -890,12 +901,9 @@ class Generator:
             if len(parts) != 2:
                 continue
             name, want = parts
-            reply = client.send(name)
-            m = re.search(rf'"{re.escape(name)}"\s*=\s*"([^"]*)"', reply)
-            if m is None or m.group(1) != want:
-                log.warning(
-                    "%s did not stick after the map load: wanted %s, read back %s", name, want, m and m.group(1)
-                )
+            got = cvar_value(name, client.send(name))
+            if got != want:
+                log.warning("%s did not stick after the map load: wanted %s, read back %s", name, want, got)
 
     def _await_demo_data(self, proc: CS2Process, src: Path) -> None:
         """Wait up to ``record_check_s`` for the demo file to hold data (fail fast, not after the hang timeout)."""

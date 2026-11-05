@@ -353,7 +353,7 @@ class FakeWorld:
                 if " " not in cmd and cmd not in ("stop", "tv_stoprecord"):  # a cvar read-back
                     world.queries.append(cmd)
                     value = world.cvar_value if cmd == "bot_difficulty" else world.cvars.get(cmd, "")
-                    return f'"{cmd}" = "{value}" ( def. "1" )\n'
+                    return f"Named camera 'cam_default' not found\n{cmd} = {value}\n"  # CS2's format (PC, Nov 5)
                 for part in cmd.split(";"):
                     words = part.split()
                     if len(words) == 2 and words[0] != "jointeam":
@@ -1020,3 +1020,20 @@ def test_connect_and_secure_options_are_refused(tmp_path: Path, opts: list[str])
     with pytest.raises(ValueError, match="not allowed"), proc:
         pass
     assert FakePopen.instances == []
+
+
+@pytest.mark.parametrize(
+    ("name", "reply", "want"),
+    [
+        ("bot_difficulty", "bot_difficulty = 2\r\n", "2"),
+        ("bot_difficulty", "Saved user config file\r\nbot_difficulty = 2\r\nother line\r\n", "2"),
+        ("bot_difficulty", '"bot_difficulty" = "1" ( def. "1" ) min. 0.000000 max. 3.000000\n', "1"),
+        ("mp_t_default_primary", "mp_t_default_primary = \r\nCLocalize::CompileString failed\r\n", ""),
+        ("sv_cheats", "sv_cheats = false\r\n", "false"),
+        ("bot_difficulty", "Failed to load image data from https://x/y.webm\r\n", None),
+        ("bot_difficulty", "bot_difficulty_extra = 3\r\n", None),
+    ],
+)
+def test_cvar_value_parses_cs2_replies(name: str, reply: str, want: str | None) -> None:
+    """Replies as CS2 sends them over netcon (probed on the PC, Nov 5), plus the CS:GO-style quoted form."""
+    assert generate.cvar_value(name, reply) == want
