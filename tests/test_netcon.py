@@ -10,7 +10,7 @@ import pytest
 import requests
 
 from cs2wm.pipeline import ntfy
-from cs2wm.pipeline.netcon import NetconClient
+from cs2wm.pipeline.netcon import MAX_LINE_CHARS, NetconClient, split_lines
 
 
 class _Server(socketserver.ThreadingTCPServer):
@@ -93,6 +93,63 @@ def test_send_returns_when_server_closes() -> None:
         assert NetconClient(port=srv.port, idle_s=2, timeout_s=5).send("status") == "console: status\n"
     finally:
         srv.stop()
+
+
+def test_split_lines_keeps_short_commands_on_one_line() -> None:
+    assert split_lines("sv_cheats 1; tv_record x") == ["sv_cheats 1; tv_record x"]
+    assert split_lines("a;b ;; c") == ["a; b; c"]
+
+
+def test_split_lines_splits_long_command_lists_in_order() -> None:
+    cmds = [f"cvar_{i:03d} {'v' * 30}" for i in range(40)]  # ~1.5 kB, far over the limit
+    lines = split_lines("; ".join(cmds))
+    assert len(lines) > 1
+    assert all(len(line) <= MAX_LINE_CHARS for line in lines)
+    assert "; ".join(lines) == "; ".join(cmds)  # nothing lost, reordered or cut in the middle
+
+
+def test_split_lines_ignores_semicolons_in_quotes() -> None:
+    assert split_lines('echo "a; b"; echo c', limit=14) == ['echo "a; b"', "echo c"]
+
+
+def test_split_lines_refuses_one_command_over_the_limit() -> None:
+    with pytest.raises(ValueError, match="over the 400 limit"):
+        split_lines("echo " + "x" * 400)
+    with pytest.raises(ValueError, match="newline"):
+        split_lines("echo a\necho b")
+
+
+def test_send_splits_long_line_on_one_connection() -> None:
+    received: list[bytes] = []
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(1)
+            try:
+                while data := conn.recv(65536):
+                    received.append(data)
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    cmds = [f"mp_cvar_{i:02d} {'v' * 40}" for i in range(20)]
+    NetconClient(port=listener.getsockname()[1], idle_s=0.2, timeout_s=3).send("; ".join(cmds))
+    thread.join(3)
+    listener.close()
+    sent = b"".join(received).decode().splitlines()
+    assert len(sent) > 1 and all(len(line) <= MAX_LINE_CHARS for line in sent)
+    assert "; ".join(sent) == "; ".join(cmds)
+
+
+def test_send_refuses_an_oversized_command_without_connecting() -> None:
+    client = NetconClient(port=_free_port(), connect_retries=0)
+    with pytest.raises(ValueError):  # not a ConnectionError: the port is closed, so this was raised before connecting
+        client.send("echo " + "x" * 500)
 
 
 def test_connect_retries_with_exponential_backoff() -> None:

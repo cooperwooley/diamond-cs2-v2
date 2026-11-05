@@ -79,10 +79,12 @@ qa:
 
 segment:
   policy: longest_remaining         # bots; human sessions use fixed_player
-  settle_ticks: 32                  # dropped after spawn and before death (camera transitions); tuned in #14
+  settle_ticks: 32                  # dropped after spawn and before death (camera transitions); recording starts at spawn + this
                                     # also the gap between two segments (camera switch)
+  spec_delay_ticks: 4               # spec_player is sent at spawn + this (a dead target ignores it); must be < settle_ticks
   seed: 0                           # plan RNG seed (ties in the spectate policy); mixed with the demo id
-  event_player_props: [user_id]     # player props requested with spawn/death events; add entity_id once #14 confirms it
+  event_player_props: [user_id]     # player props requested with spawn/death events. Lives come from spawn events only, so the
+                                    # SourceTV bot slot and the local spectator (which never spawn) are never spectated
 
 demo:
   backend: demoinfocs               # demoinfocs (Go exporter tools/demodump, #72) | demoparser2 (kept for comparison)
@@ -99,40 +101,55 @@ generate:
   bots: 10
   chunk_min: 10
   hang_timeout_min: 5
-  expected_build: null              # CS2 buildid from appmanifest_730.acf; set after #14
+  expected_build: 26445667          # CS2 buildid from appmanifest_730.acf (the #14 session ran on this build)
   # Launch: plain cs2.exe (NOT HLAE; HLAE is for render only) started directly rather than via `steam -applaunch 730`,
   # because steam.exe returns at once, which would leave nothing to watch, kill or restart.
-  # -steam makes a directly started cs2.exe attach to the running Steam client.   CONFIRM(#14)
+  # -steam makes a directly started cs2.exe attach to the running Steam client (no prompts when Steam is running).
   # -insecure is mandatory: the launcher and the config validator both refuse to run without it.
   launch_options: [-insecure, -steam, -novid, -console, -sw, -w, "1280", -h, "720"]
   cs2_exe: game/bin/win64/cs2.exe   # relative to paths.cs2_dir
-  # Chunking: netcon = send `stop; record <name>` over -netconport every chunk_min (works for client demos);
-  # gotv = tv_enable/tv_autorecord with mp_timelimit=chunk_min, one demo per map cycle.
-  # CONFIRM(#14): #14 picks one (GOTV only if it records every bot).
-  chunking: netcon
-  netconport: 2121                  # used only when chunking = netcon
-  netcon_connect_timeout_s: 180     # CS2 takes a while to open the port.   CONFIRM(#14)
-  map_load_wait_s: 45               # wait after the netcon port opens, before the first `record`.   CONFIRM(#14)
+  # Chunking, both driven over -netconport every chunk_min (see docs/HLAE_NOTES.md):
+  #   gotv   = `tv_record <name>` / `tv_stoprecord`: a GOTV demo with every bot (default). The client demo only holds
+  #            what the spectating client sees, which is incomplete.
+  #   netcon = client `record <name>` / `stop`.
+  # Both write game/csgo/<name>.dem. `tv_autorecord` is not used: it writes game/csgo/replays/auto-*.dem.
+  chunking: gotv
+  netconport: 2121
+  netcon_connect_timeout_s: 60      # the port opens in under 1 s plain, in 3-7 s via HLAE
+  map_load_timeout_s: 90            # poll `status` until the map shows and the local client is connected, at most this long
+  map_load_wait_s: 10               # extra wait once `status` shows the map, before `jointeam 1` (`record` works ~6 s after `map`)
+  jointeam_retries: 3               # extra `jointeam 1` attempts until the server logs the team change
+  record_check_s: 30                # fail the session if the demo has no data this long after the start command
+  verify_netcon_replies: true       # check the reply texts of `jointeam 1` and tv_record/record (from the #14 log); false: only check files
+  team_settle_s: 5                  # wait after `jointeam 1` before the first chunk: joining a team after `tv_record` stalls the demo
+  restart_after_join: true          # send `mp_restartgame 1` after `jointeam 1` (the #14 recipe that gave a full GOTV demo); skipped for the human profile
+  restart_wait_s: 6                 # wait after `mp_restartgame 1` before the first chunk
   poll_s: 5                         # watchdog polling interval
-  close_stable_s: 5                 # a demo is closed once its size has not changed for this long.   CONFIRM(#14)
+  close_stable_s: 5                 # a demo is closed once its size has not changed for this long (the size is final within 2 s)
   close_timeout_s: 60               # give up waiting for a demo to close after this long
   min_chunk_s: 30                   # a truncated chunk shorter than this is kept but is not progress for max_failures
   max_failures: 3                   # give up after this many sessions (or publishes) in a row without a usable chunk
 
 render:
-  tick_offset: 0                    # measured in #14
+  # mirv_tick = demo_tick + tick_offset (applied by segment when it writes the plan). The #14 muzzle-flash estimate is +7 ticks
+  # (a frame shows the state ~7 ticks before its nominal tick). Camera rotation on render2 gave +4.6 ticks (r 0.94, see
+  # docs/HLAE_NOTES.md); its two spectated bots agree (+5 and +4). Set to +5; the pilot run (#19) re-checks it on a render
+  # with a known schedule.
+  tick_offset: 5
   timeout_factor: 3.0               # x demo length (demo_end_tick / tickrate)
-  startup_s: 180                    # CS2 launch + demo load, added to the timeout.   CONFIRM(#14)
-  output_format: tga                # tga | ffmpeg; decided in #14
-  ffmpeg_preset: afxFfmpegLosslessBest  # used when output_format = ffmpeg; must be lossless.   CONFIRM(#14)
-  retries: 1                        # a crash, timeout or frame-count mismatch is retried this often, then the demo fails
+  startup_s: 60                     # CS2 launch + demo load, added to the timeout (the demo plays ~13 s after launch)
+  # tga | ffmpeg. tga (afxClassic): ~94 fps (5.9x realtime), 2.76 MB/frame at 1280x720 (~159 GB per rendered hour at 16 fps),
+  # so supervisor.max_working_gb must cover the takes in flight. ffmpeg needs C:\hlae\ffmpeg\ffmpeg.exe, which is not installed.
+  output_format: tga
+  ffmpeg_preset: afxFfmpegLosslessBest  # used when output_format = ffmpeg; must be lossless. Untested: no ffmpeg.exe on the render PC
+  retries: 1                        # a crash, timeout, 0-frame take or frame-count mismatch is retried this often, then the demo fails
   poll_s: 2                         # polling interval while waiting for HLAE / cs2.exe
   quit_delay_ticks: 8               # `quit` is scheduled this many ticks after the last record end (capped at demo end)
-  stream_name: dcs2                 # `mirv_streams add normal <name>`; also the capture sub-folder.   CONFIRM(#14)
-  # In-eye spectator mode for `spec_mode <n>`.   CONFIRM(#14): 2 is the candidate, try 1 if not first person.
+  stream_name: dcs2                 # `mirv_streams add normal <name>`; also the capture sub-folder (<record name>/take0000/dcs2/00000.tga)
+  # In-eye spectator mode for `spec_mode <n>`: 2 is first person with the viewmodel (confirmed in #14).
   spec_mode: 2
-  # Which plan target field `spec_player` takes: entity_id | user_id | slot | name.   CONFIRM(#14)
-  # `slot` is a 1-based index that the plan does not carry, so it fails clearly until #14 defines how to map it.
+  # Which plan target field `spec_player` takes: entity_id | user_id | name. #14 confirmed entity_id, the CONTROLLER entity
+  # id (user_id + 1 for bots); the demo parser (#72) must expose exactly that as `entity_id`. `slot` is not supported.
   spec_player_field: entity_id
   hlae_exe: HLAE.exe                # relative to paths.hlae_dir
   hook_dll: x64/AfxHookSource2.dll  # relative to paths.hlae_dir

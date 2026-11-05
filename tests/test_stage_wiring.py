@@ -46,6 +46,7 @@ def cfg(tmp_path: Path, remote: Path, monkeypatch: pytest.MonkeyPatch):
             "paths.hlae_dir=C:/hlae",
             "segment.settle_ticks=10",
             "render.tick_offset=0",
+            "generate.expected_build=null",  # plans fall back to it when CS2 is not installed
             "episodes.min_frames=4",
             "episodes.max_frames=20",
             "pack.fullres_mod=1",

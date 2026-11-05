@@ -64,7 +64,16 @@ def _bad(tmp_path: Path, overrides: list[str]) -> str:
         (["generate.close_stable_s=70"], "close_stable_s"),
         (["generate.hang_timeout_min=null"], "must be a number"),
         (["generate.netconport=null"], "must be a number"),
-        (["generate.hang_timeout_min=2"], "hang_timeout_min"),
+        (["generate.hang_timeout_min=1"], "hang_timeout_min"),
+        (["generate.team_settle_s=0"], "team_settle_s"),
+        (["generate.restart_wait_s=0"], "restart_wait_s"),
+        (["generate.map_load_timeout_s=0"], "map_load_timeout_s"),
+        (["generate.record_check_s=0"], "record_check_s"),
+        (["generate.jointeam_retries=-1"], "jointeam_retries"),
+        (["generate.verify_netcon_replies=maybe"], "verify_netcon_replies"),
+        (["generate.restart_after_join=maybe"], "restart_after_join"),
+        (["segment.spec_delay_ticks=32"], "spec_delay_ticks"),
+        (["segment.spec_delay_ticks=-1"], "spec_delay_ticks"),
         (["generate.min_chunk_s=0"], "min_chunk_s"),
         (["generate.launch_options=[-insecure,-secure]"], "not allowed"),
         (["generate.launch_options=[-insecure,+connect,1.2.3.4]"], "not allowed"),
@@ -132,7 +141,7 @@ def test_num_actions_matches_env_config(cfg, repo_root) -> None:
     assert env.num_actions == ActionSpec.from_config(cfg).dim
 
 
-def test_netcon_timing_check_is_skipped_for_gotv(tmp_path: Path) -> None:
-    assert "grace period" in _bad(tmp_path, ["generate.hang_timeout_min=2"])
-    cfg = load_config(overrides=["generate.hang_timeout_min=2", "generate.chunking=gotv"])
-    assert cfg.generate.chunking == "gotv"
+@pytest.mark.parametrize("chunking", ["gotv", "netcon"])
+def test_startup_must_fit_in_the_hang_grace_period(tmp_path: Path, chunking: str) -> None:
+    # both chunking modes are driven over netcon, so both start with port + map + team-join waits
+    assert "grace period" in _bad(tmp_path, ["generate.hang_timeout_min=1", f"generate.chunking={chunking}"])

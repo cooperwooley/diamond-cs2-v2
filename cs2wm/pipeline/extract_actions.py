@@ -372,7 +372,8 @@ def _load_ticks(demo_path: Path) -> pd.DataFrame:
     try:
         return demo.load_ticks(demo_path, [*required, *OPTIONAL_TICK_COLUMNS])
     except Exception:
-        # CONFIRM(#14): a button prop this demoparser2 build does not know. They only feed the non-gating cross-check.
+        # A backend that rejects the optional button props (demoparser2); demodump just leaves out the ones it lacks
+        # (GOTV demos have no button state). They only feed the non-gating cross-check.
         log.warning(
             "parse_ticks rejected the optional columns; labelling without the button cross-check", exc_info=True
         )

@@ -259,7 +259,7 @@ def test_plan_has_everything_render_needs(tmp_path: Path) -> None:
 
     start, end = eps[0].start_tick, eps[-1].end_tick
     assert plan["mirv_cmd_schedule"] == [
-        {"mirv_tick": max(start - SETTLE, 0) + 2, "demo_tick": max(start - SETTLE, 0), "action": "spec",
+        {"mirv_tick": 100 + 4 + 2, "demo_tick": 100 + 4, "action": "spec",
          "segment_idx": s["segment_idx"], "target": s["target"]},
         {"mirv_tick": start + 2, "demo_tick": start, "action": "record_start", "segment_idx": s["segment_idx"]},
         {"mirv_tick": end + 2, "demo_tick": end, "action": "record_end", "segment_idx": s["segment_idx"]},
@@ -289,6 +289,28 @@ def test_schedule_orders_end_before_switch_before_start_on_one_tick() -> None:
     second_spec = [e for e in sched if e["action"] == "spec"][1]
     assert second_spec["mirv_tick"] >= first_end["mirv_tick"]  # never switches while still recording
     assert sched.index(first_end) < sched.index(second_spec)
+
+
+def test_switch_is_at_spawn_plus_spec_delay_and_record_start_at_spawn_plus_settle() -> None:
+    for delay in (1, 4, 9):
+        cfg = load_config(
+            overrides=[f"segment.settle_ticks={SETTLE}", f"segment.spec_delay_ticks={delay}", "render.tick_offset=0"]
+        )
+        segs = plan_spectate([life(1, 500, 9000)], "longest_remaining", cfg, rng())
+        plan = segment.build_render_plan("d", segs, split_episodes(segs, "d", "dm", cfg), cfg, {})
+        (seg,) = plan["segments"]
+        assert seg["mirv_spec_tick"] == 500 + delay and plan["spec_delay_ticks"] == delay
+        assert seg["record_start_tick"] == 500 + SETTLE
+
+
+def test_switch_waits_for_the_previous_recording_to_end() -> None:
+    lives = [life(1, 0, 4000), life(2, 100, 9000)]  # B spawned long before A's recording ends
+    segs = plan_spectate(lives, "longest_remaining", CFG, rng())
+    sched = segment.build_render_plan("d", segs, split_episodes(segs, "d", "dm", CFG), CFG, {})["mirv_cmd_schedule"]
+    spec = [e for e in sched if e["action"] == "spec"]
+    ends = [e for e in sched if e["action"] == "record_end"]
+    assert len(spec) == 2
+    assert spec[1]["demo_tick"] == ends[0]["demo_tick"] > 100 + 4  # not at spawn + delay: still recording A
 
 
 def test_negative_mirv_tick_is_rejected() -> None:
@@ -375,12 +397,29 @@ def test_run_writes_plan_for_a_demo(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_run_fixed_player_marks_episodes_human(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = load_config(overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}"])
+    cfg = load_config(
+        overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}", "generate.expected_build=null"]
+    )
     monkeypatch.setattr(demo, "_make_parser", lambda path: fake_demo_parser())
     plan = segment.read_render_plan(segment.run(tmp_path / "d1.dem", cfg, "fixed_player", "A"))
     assert plan["meta"]["kind"] == "human" and plan["meta"]["player"] == "A"
     assert plan["cs2_build"] is None  # no manifest and generate.expected_build is null
     assert {s["target"]["name"] for s in plan["segments"]} == {"A"}
+
+
+def test_sourcetv_and_the_local_spectator_are_never_spectated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SourceTV (a bot slot) and the local spectator are in the tick table but never spawn, so they have no life."""
+    parser = fake_demo_parser()
+    extra = pd.DataFrame(
+        {"tick": [0, 6000, 0, 6000], "user_id": [3, 3, 4, 4], "name": ["SourceTV", "SourceTV", "me", "me"],
+         "steamid": [0, 0, 1, 1], "entity_id": [13, 13, 14, 14]}
+    )  # fmt: skip
+    parser._ticks = pd.concat([parser._ticks, extra], ignore_index=True)
+    cfg = load_config(overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}"])
+    monkeypatch.setattr(demo, "_make_parser", lambda path: parser)
+    plan = segment.read_render_plan(segment.run(tmp_path / "d1.dem", cfg))
+    assert {s["target"]["name"] for s in plan["segments"]} <= {"A", "B"}
+    assert plan["segments"]
 
 
 def test_cli_segment_single_demo_and_all_pending(

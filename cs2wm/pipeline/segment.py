@@ -29,18 +29,19 @@ is ``demo tick + tick_offset`` and is the tick to pass to ``mirv_cmd addAtTick``
       "demo_end_tick": 90000,                 # last tick of the demo (render timeout, final quit)
       "tick_offset": 0,                       # render.tick_offset
       "settle_ticks": 32,
+      "spec_delay_ticks": 4,                  # segment.spec_delay_ticks: the switch is at spawn + this
       "timing": {"tickrate": 64, "fps": 16, "ticks_per_frame": 4},
       "meta": {"policy": "longest_remaining", "player": null, "seed": 0, "kind": "dm",
                "diagnostics": {"duplicate_spawns": 0, "deaths_without_spawn": 0}},
       "segments": [{
         "segment_idx": 0,
         "target": {"name": "Bot A", "user_id": 3, "steamid": 0, "entity_id": 7 | null},
-                                              # entity_id: the player's tick-table value at/after spawn (CONFIRM(#14));
-                                              # null if the demo gives none; the likely spec_player argument
+                                              # entity_id: the controller entity id (user_id + 1 for bots) from the tick
+                                              # table at/after spawn; null if the demo gives none; the spec_player argument
         "life": {"spawn_tick": 1000, "death_tick": 9000},
         "record_start_tick": 1032,            # T0 of the first episode (frame 0)
         "record_end_tick": 5032,              # tick of the extra frame of the last episode
-        "mirv_record_start_tick": 1032, "mirv_record_end_tick": 5032, "mirv_spec_tick": 1000,
+        "mirv_record_start_tick": 1032, "mirv_record_end_tick": 5032, "mirv_spec_tick": 1004,
         "labeled_frames": 1000,               # sum of the episodes' n_frames
         "rendered_frames": 1001,              # labeled_frames + 1
         "episodes": [{
@@ -50,7 +51,7 @@ is ``demo tick + tick_offset`` and is the tick to pass to ``mirv_cmd addAtTick``
         }]
       }],
       "mirv_cmd_schedule": [                  # execution order: record_end, then spec, then record_start per tick
-        {"mirv_tick": 1000, "demo_tick": 1000, "action": "spec", "segment_idx": 0,
+        {"mirv_tick": 1004, "demo_tick": 1004, "action": "spec", "segment_idx": 0,
          "target": {"name": ..., "user_id": ..., "steamid": ..., "entity_id": ...}},
         {"mirv_tick": 1032, "demo_tick": 1032, "action": "record_start", "segment_idx": 0},
         {"mirv_tick": 5032, "demo_tick": 5032, "action": "record_end", "segment_idx": 0}
@@ -59,7 +60,8 @@ is ``demo tick + tick_offset`` and is the tick to pass to ``mirv_cmd addAtTick``
     }
 
 ``render_plan.json`` is enough to write the HLAE cfg and to rebuild the ``EpisodeSpec`` list (``episodes_from_plan``)
-without parsing the demo again. Whether the frame at ``record_end_tick`` is captured is measured in #14.
+without parsing the demo again. The frame at ``record_end_tick`` is captured (n + 1 frames per n labeled ones, #14); the schedule applies
+``render.tick_offset`` as ``mirv_tick = demo_tick + tick_offset``.
 """
 
 from __future__ import annotations
@@ -102,7 +104,8 @@ class Life:
         steamid: Steamid (may be 0 or small for bots).
         spawn_tick: Tick of the spawn.
         death_tick: Tick of the death, or the demo end if still alive.
-        entity_id: Entity/slot id of the player when the demo provides it (CONFIRM(#14)), else None.
+        entity_id: The controller entity id (``spec_player`` argument, ``user_id + 1`` for bots) when the demo provides
+            it, else None.
     """
 
     player_name: str
@@ -389,8 +392,9 @@ def build_render_plan(
     """Build the ``render_plan.json`` content (see the module docstring for the schema).
 
     Only segments that kept at least one episode are rendered. The recording of a segment runs from its first
-    episode's ``start_tick`` to its last episode's ``end_tick``; the target is switched ``settle_ticks`` before the
-    recording starts, but never before the previous recording ended.
+    episode's ``start_tick`` to its last episode's ``end_tick``. The target is switched ``spec_delay_ticks`` after
+    its spawn (a dead target ignores ``spec_player``, so never on the spawn tick itself), but never before the previous
+    recording ended; the recording starts at the earliest ``settle_ticks`` after the spawn.
 
     Args:
         demo_id: Demo id.
@@ -410,6 +414,7 @@ def build_render_plan(
     """
     tpf = ticks_per_frame(cfg)
     offset, settle = int(cfg.render.tick_offset), int(cfg.segment.settle_ticks)
+    spec_delay = int(cfg.segment.spec_delay_ticks)
     meta = dict(meta or {})
     by_segment: dict[int, list[EpisodeSpec]] = {}
     for ep in episodes:
@@ -423,7 +428,7 @@ def build_render_plan(
         if not eps:
             continue
         rec_start, rec_end = eps[0].start_tick, eps[-1].end_tick
-        spec_tick = max(rec_start - settle, prev_end)
+        spec_tick = max(seg.target.spawn_tick + spec_delay, prev_end)
         labeled = sum(e.n_frames for e in eps)
         plan_segments.append(
             {
@@ -477,6 +482,7 @@ def build_render_plan(
         "header": dict(header),
         "tick_offset": offset,
         "settle_ticks": settle,
+        "spec_delay_ticks": spec_delay,
         "timing": {"tickrate": int(cfg.timing.tickrate), "fps": int(cfg.timing.fps), "ticks_per_frame": tpf},
         "meta": meta,
         "segments": plan_segments,
@@ -618,7 +624,7 @@ def run(demo_path: Path, cfg: DictConfig, policy: str | None = None, player: str
     except KeyError:
         log.warning("player_disconnect has no user_id column; disconnects are not used to close lives")
         disconnects = None
-    # One tick-table parse gives the demo end and the targets' entity ids (CONFIRM(#14): entity_id as a tick prop).
+    # One tick-table parse gives the demo end and the targets' entity ids (``entity_id`` is the controller entity id, which the demo parser must expose as such).
     try:
         ticks = demo.load_ticks(demo_path, [demo.TICK_ENTITY_ID])
     except Exception:

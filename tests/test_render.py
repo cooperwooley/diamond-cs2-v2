@@ -457,6 +457,10 @@ class FakeLauncher:
             _fake_takes(raw, [counts[0] - 2, *counts[1:]])
         elif behaviour == "one_short":
             _fake_takes(raw, [c - 1 for c in counts])
+        elif behaviour == "empty":  # HLAE started the takes but wrote no frames (e.g. ffmpeg.exe is missing)
+            _fake_takes(raw, [0 for _ in counts])
+        elif behaviour == "nothing":
+            raw.mkdir(parents=True, exist_ok=True)
         elif behaviour == "timeout":
             _fake_takes(raw, [1])
             return LaunchResult(None, True)
@@ -497,7 +501,7 @@ def test_run_success_writes_frames_manifest_and_installs_cfg(tmp_path: Path) -> 
     installed = Path(cfg.paths.cs2_dir) / "game/csgo/cfg" / f"render_{DEMO}.cfg"
     assert installed.read_text() == render.build_render_cfg(plan, cfg)
     assert launcher.args[0][0] == f"render_{DEMO}"
-    assert launcher.args[0][1] == pytest.approx(3.0 * 1200 / 64 + 180)  # timeout_factor x demo length + startup
+    assert launcher.args[0][1] == pytest.approx(3.0 * 1200 / 64 + 60)  # timeout_factor x demo length + startup
     assert res.wall_s > 0 and res.realtime_factor == pytest.approx(n / 16 / res.wall_s)
 
 
@@ -535,7 +539,9 @@ def test_run_retries_once_after_a_mismatch_then_succeeds(tmp_path: Path) -> None
     ("behaviour", "reason"),
     [
         ("short", "frame-count mismatch"),
-        ("one_short", "end tick not captured"),
+        ("one_short", "exactly one frame short"),
+        ("empty", "0 frames captured for segment(s) [0]"),
+        ("nothing", "0 frames captured for segment(s) [0]"),
         ("timeout", "timeout"),
         ("crash", "(HLAE exit code 1)"),
         ("oserror", "start HLAE"),
@@ -550,6 +556,50 @@ def test_run_fails_after_exactly_one_retry_with_a_reason(tmp_path: Path, behavio
     assert not (Path(cfg.paths.frames) / DEMO).exists()  # no partial output
     assert not render.raw_dir(cfg, DEMO).exists()
     assert res.realtime_factor == 0
+
+
+def test_empty_takes_hint_at_a_missing_ffmpeg_for_the_ffmpeg_output(tmp_path: Path) -> None:
+    cfg, plan, demo = _setup(tmp_path, "render.output_format=ffmpeg")
+    res = render.run(demo, cfg, _hooks_clock(), FakeLauncher(plan, ["empty"]))
+    assert not res.ok and "ffmpeg.exe" in res.reason
+
+
+def test_one_empty_take_fails_even_if_the_others_have_frames(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    plan = _plan(cfg)
+    n = plan["segments"][0]["rendered_frames"]
+    plan["segments"].append({**plan["segments"][0], "segment_idx": 1})
+    _fake_takes(tmp_path / "raw", [n, 0])
+    cfg = _cfg(tmp_path, f"paths.raw={tmp_path / 'raw'}")
+    assert render.verify_frame_counts(plan, tmp_path / "raw", cfg) == {0: (n, n), 1: (n, 0)}
+
+
+def test_plan_expects_n_plus_one_frames_for_the_record_span(tmp_path: Path) -> None:
+    """#14: record start T0 to end T0 + 4n gives n + 1 frames (481 for 1920 ticks)."""
+    cfg = _cfg(tmp_path)
+    (seg,) = _plan(cfg)["segments"]
+    ticks_per_frame = cfg.timing.tickrate // cfg.timing.fps
+    assert seg["rendered_frames"] == (seg["record_end_tick"] - seg["record_start_tick"]) // ticks_per_frame + 1
+
+
+@pytest.mark.parametrize("override", ["paths.raw", "demo"])
+def test_paths_with_spaces_fail_clearly_without_launching(tmp_path: Path, override: str) -> None:
+    spaced = tmp_path / "with space"
+    cfg, plan, demo = _setup(tmp_path, *([f"paths.raw={spaced}"] if override == "paths.raw" else []))
+    if override == "demo":
+        demo = spaced / "d.dem"
+    launcher = FakeLauncher(plan, ["ok"])
+    res = render.run(demo, cfg, _hooks_clock(), launcher)
+    assert not res.ok and launcher.calls == 0
+    assert "contains a space" in res.reason and "with space" in res.reason
+    with pytest.raises(RenderError, match="contains a space"):
+        render.build_hlae_command(cfg, spaced / "d.dem", "render_x")
+
+
+def test_cfg_only_refuses_a_raw_dir_with_spaces(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, f"paths.raw={tmp_path / 'a b'}")
+    with pytest.raises(RenderError, match="paths.raw"):
+        render.build_render_cfg(_plan(cfg), cfg)
 
 
 def test_run_retries_follow_config(tmp_path: Path) -> None:
@@ -647,11 +697,9 @@ def test_stream_name_is_validated(tmp_path: Path) -> None:
         render.build_render_cfg(_plan(_cfg(tmp_path)), raw)
 
 
-def test_cfg_quotes_a_raw_dir_with_spaces(tmp_path: Path) -> None:
-    cfg = _cfg(tmp_path, "paths.raw=C:/my data/raw")
-    assert r'mirv_streams record name "C:\my data\raw\dm-0001"' in render.build_render_cfg(_plan(cfg), cfg).splitlines()
-    cmd = render.build_hlae_command(_cfg(tmp_path), Path("/a b/x.dem"), "render_d")
-    assert '+playdemo "/a b/x.dem"' in cmd[-1]
+def test_console_quote_keeps_backslashes_and_drops_a_trailing_one() -> None:
+    assert render.console_quote(r"C:\dcs2\raw\dm-0001") == r'"C:\dcs2\raw\dm-0001"'
+    assert render.console_quote("C:\\dcs2\\raw\\") == r'"C:\dcs2\raw"'
 
 
 def test_cfg_only_writes_files_and_builds_the_command_without_a_demo(tmp_path: Path) -> None:
