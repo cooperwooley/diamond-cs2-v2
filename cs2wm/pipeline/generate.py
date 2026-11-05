@@ -11,15 +11,18 @@ How it works:
 * ``config/cs2/generate_<profile>.cfg`` is rendered (``exec generate_*`` includes inlined, chunking commands appended),
   copied to ``<cs2_dir>/game/csgo/cfg/generate_<profile>.cfg`` and run with ``+exec generate_<profile>``. Its sha256
   goes into every sidecar.
-* ``generate.chunking = netcon``: ``record <demo_id>`` / ``stop`` over ``-netconport`` every chunk. ``gotv``:
-  ``tv_autorecord`` with ``mp_timelimit`` and every new demo in the csgo dir is picked up once it is closed.
+* Both chunking modes are driven over ``-netconport``. After the map has loaded the local player joins the spectators
+  (``jointeam 1``, lost if sent from the cfg because the client is not connected yet); then, every chunk, ``gotv``
+  (default) sends ``sv_cheats 1; tv_record <demo_id>`` / ``tv_stoprecord`` and ``netcon`` sends
+  ``sv_cheats 1; record <demo_id>`` / ``stop``. ``tv_autorecord`` is not used: it writes ``replays/auto-*.dem`` with
+  uncontrolled names. Both ``record`` and ``tv_record`` write ``game/csgo/<demo_id>.dem``.
 * CS2 writes into its own ``game/csgo`` dir. A closed chunk is copied next to its destination and renamed into
   ``paths.demos/<kind>/`` atomically (sidecar first, so a ``.dem`` is never visible without it).
 * A watchdog restarts CS2 on exit or when no demo file grew for ``generate.hang_timeout_min``. A truncated chunk is
   kept only if ``cs2wm.demo.inspect`` parses it, else it goes to ``demos/_rejected/`` with a reason file.
 * The patch guard compares the installed CS2 buildid with ``generate.expected_build`` before each launch and chunk.
 
-Everything marked ``CONFIRM(#14)`` is an assumption about CS2 that the manual debug session must confirm.
+The CS2 facts behind this module (command order, timings, the netcon line limit) are in ``docs/HLAE_NOTES.md``.
 """
 
 from __future__ import annotations
@@ -52,6 +55,13 @@ from cs2wm.pipeline.netcon import NetconClient
 log = logging.getLogger(__name__)
 
 REJECTED_DIR = "_rejected"
+# Per chunking mode: (start, stop) console commands. `record` and `tv_record` are cheat-protected (offline only, with
+# -insecure) and both write game/csgo/<name>.dem; `sv_cheats 1` goes on the same line because it resets on a map load.
+CHUNK_COMMANDS = {
+    "gotv": ("sv_cheats 1; tv_record {name}", "tv_stoprecord"),
+    "netcon": ("sv_cheats 1; record {name}", "stop"),
+}
+SPECTATE_EXEMPT_PROFILE = "human"  # a human plays, so the local player must stay on a team
 _EXEC_RE = re.compile(r"^\s*exec\s+(generate_\w+)\s*(?://.*)?$")
 
 
@@ -78,7 +88,7 @@ def build_launch_command(cfg: DictConfig, profile: str, netconport: int | None =
     Args:
         cfg: A validated cs2wm config.
         profile: ``dm``, ``smoke`` or ``human``; selects ``config/cs2/generate_<profile>.cfg``.
-        netconport: Optional ``-netconport`` for option (B) chunking.
+        netconport: ``-netconport`` for the chunk commands.
 
     Returns:
         The argv list: ``cs2.exe``, the launch options, ``-netconport <port>`` if given and ``+exec generate_<profile>``.
@@ -93,7 +103,6 @@ def build_launch_command(cfg: DictConfig, profile: str, netconport: int | None =
     cmd = [str(Path(cfg.paths.cs2_dir) / cfg.generate.cs2_exe), *options]
     if netconport is not None:
         cmd += ["-netconport", str(int(netconport))]
-    # CONFIRM(#14): `+exec` on the command line runs the cfg after startup, before/while the map in it loads.
     cmd += ["+exec", f"generate_{profile}"]
     return cmd
 
@@ -105,8 +114,7 @@ def build_launch_command(cfg: DictConfig, profile: str, netconport: int | None =
 def render_cfg(profile: str, cfg: DictConfig, cfg_dir: Path | None = None) -> str:
     """Render ``generate_<profile>.cfg`` into the single file that is installed into CS2.
 
-    ``exec generate_*`` lines are replaced by the included file (``generate_smoke`` builds on ``generate_dm``). With
-    ``generate.chunking = gotv`` the GOTV autorecord commands are appended.
+    ``exec generate_*`` lines are replaced by the included file (``generate_smoke`` builds on ``generate_dm``).
 
     Args:
         profile: ``dm``, ``smoke`` or ``human``.
@@ -131,16 +139,7 @@ def render_cfg(profile: str, cfg: DictConfig, cfg_dir: Path | None = None) -> st
             out += expand(m.group(1), (*stack, name)) if m else [line]
         return out
 
-    lines = expand(f"generate_{profile}", ())
-    if cfg.generate.chunking == "gotv":
-        # CONFIRM(#14): one demo per map cycle; GOTV may need `map` again after `tv_enable`; mp_timelimit takes minutes.
-        lines += [
-            "// ---- chunking: gotv (generate.chunking)",
-            "tv_enable 1",
-            "tv_autorecord 1",
-            f"mp_timelimit {cfg.generate.chunk_min:g}",
-        ]
-    return "\n".join(lines) + "\n"
+    return "\n".join(expand(f"generate_{profile}", ())) + "\n"
 
 
 def install_cfg(text: str, profile: str, cs2_dir: Path) -> tuple[Path, str]:
@@ -349,7 +348,7 @@ class CS2Process:
         """Kill the process tree (``taskkill /T /F`` on Windows). Safe to call twice.
 
         On Windows ``taskkill`` also runs when the main process already exited, because a crash handler or child of
-        ``cs2.exe`` may still be alive (CONFIRM(#14)).
+        ``cs2.exe`` may still be alive.
         """
         proc = self._proc
         if proc is None:
@@ -388,19 +387,25 @@ def _git_sha() -> str:
 
 
 def _parse_error(path: Path) -> str | None:
-    """Why ``path`` is not a parsable demo, or None if it parses (the single seam to ``cs2wm.demo``).
+    """Why ``path`` is not a usable demo, or None if it is (the single seam to ``cs2wm.demo``).
 
-    ``demo.inspect`` reports failures as ``ok: False`` plus ``error`` and ``demo.is_parseable`` is the boolean form;
-    either may be missing on older bases, and any exception also counts as unparsable.
+    A chunk cut short by a crash is usable: demoinfocs parses it up to its last flushed frame and reports
+    ``ErrUnexpectedEndOfDemo`` (#14). The interface expected from the parser backend (#72) is either
+    ``demo.is_parseable(path) -> bool`` (True for such a demo), or ``demo.inspect(path)`` returning ``ok``, ``error``
+    and, for a demo that ends early, ``truncated: True`` together with ``last_tick`` (the last tick it parsed). A
+    truncated demo with ticks counts as usable even if ``ok`` is False. Either may be missing on older bases, and any
+    exception also counts as unparsable.
     """
     try:
         is_parseable = getattr(demo, "is_parseable", None)
         if is_parseable is not None:
             return None if is_parseable(path) else "demo.is_parseable() is False"
         info = demo.inspect(path)
-        if not info.get("ok", info.get("last_tick") is not None):
-            return str(info.get("error") or "no ticks parsed")
-        return None
+        if info.get("ok", info.get("last_tick") is not None):
+            return None
+        if info.get("truncated") and (info.get("last_tick") or 0) > 0:
+            return None  # ended early but parsed up to there: keep it as a truncated chunk
+        return str(info.get("error") or "no ticks parsed")
     except Exception as exc:  # noqa: BLE001 - any parser failure means the chunk is unusable
         return repr(exc)
 
@@ -485,8 +490,6 @@ class Generator:
         self._index = 0  # chunk counter, continues across CS2 restarts
         self._progress = 0  # chunks published in the current session (truncated ones only if >= generate.min_chunk_s)
         self._publish_failures = 0  # publishes that failed since the last success
-        self._ignore: set[Path] = set()  # gotv: demos that were present before the run or are published/rejected
-        self._stranded: set[Path] = set()  # gotv: demos whose publishing failed; retried in the next session
         self._pending_unlink: list[Path] = []  # published sources CS2 still holds open; deleted again later
         self._published_sources: set[Path] = set()  # every source published or rejected in this run (never re-adopted)
         self._unpublished: set[Path] = set()  # sources whose publishing failed and that are still waiting
@@ -756,7 +759,7 @@ class Generator:
         sources a sidecar of an earlier run lists (same name, size and sha256; those are just deleted). The rest is
         parse-checked like a truncated chunk (kept or rejected) and gets ``"adopted": true``, ``duration_s`` 0 (it does
         not count toward ``--hours``) and ``start_time`` null with the file's mtime as ``end_time``, since its start is
-        unknown. GOTV's own ``auto*.dem`` names are never adopted.
+        unknown.
         """
         for path in sorted(self.csgo_dir.glob("*.dem")):
             if not self._ours.match(path.name) or path in self._published_sources or path in self._pending_unlink:
@@ -798,31 +801,36 @@ class Generator:
         return min(self.chunk_min * 60.0, max(self.target_s - self.generated_s, 0.0))
 
     def _session_netcon(self, proc: CS2Process) -> None:
-        """Record chunks with ``record``/``stop`` over netcon until the target or a failure."""
+        """Record chunks over netcon until the target or a failure (``gotv`` and ``netcon`` chunking)."""
         client = self.h.netcon(port=int(self.g.netconport), clock=self.h.clock, sleep=self.h.sleep)
+        start_cmd, stop_cmd = CHUNK_COMMANDS[str(self.g.chunking)]
         active: tuple[str, datetime, float] | None = None
         end: float | None = None  # when recording really ended: before the close wait, and before a hang's idle tail
         try:
             client.wait_ready(float(self.g.netcon_connect_timeout_s))
             if self._watch(proc, float(self.g.map_load_wait_s)) != "running":
                 raise ConnectionError("CS2 died while loading")
+            if self.profile != SPECTATE_EXEMPT_PROFILE:
+                # Joining a team after `tv_record` started stalled the GOTV demo, so spectate first and let it settle.
+                client.send("jointeam 1")
+                if self._watch(proc, float(self.g.team_settle_s)) != "running":
+                    raise ConnectionError("CS2 died while joining the spectators")
             while self.generated_s < self.target_s and self._publish_failures < self.g.max_failures:
                 self._guard()
                 demo_id = make_demo_id(self.profile, self.started, self._index)
                 self._index += 1
                 started, t0 = self.h.wall(), self.h.clock()
                 length_s = self._next_chunk_s()
-                # CONFIRM(#14): `record` writes <csgo>/<name>.dem; a name with '-' needs no quotes; `stop` closes it.
-                client.send(f"record {demo_id}")
+                client.send(start_cmd.format(name=demo_id))
                 proc.rearm()
                 active, end = (demo_id, started, t0), None
                 verdict = self._watch(proc, length_s)
-                # CONFIRM(#14): wall time is a proxy for demo time (the listen server runs at 1x); segment uses the
-                # real tick counts downstream, so a small drift here only shifts how many chunks --hours produces.
+                # Wall time is a proxy for demo time (the listen server runs at 1x); segment uses the real tick counts
+                # downstream, so a small drift here only shifts how many chunks --hours produces.
                 end = proc.last_progress if verdict == "hung" else self.h.clock()
                 if verdict != "running":
                     raise ConnectionError(f"CS2 {verdict} while recording {demo_id}")
-                client.send("stop")
+                client.send(stop_cmd)
                 active = None
                 src = self.csgo_dir / f"{demo_id}.dem"
                 if self._wait_closed(src):
@@ -838,54 +846,12 @@ class Generator:
                 demo_id, started, t0 = active
                 self._salvage(self.csgo_dir / f"{demo_id}.dem", demo_id, started, max(end - t0, 0.0))
 
-    def _new_demos(self) -> list[Path]:
-        skip = self._ignore | self._stranded
-        return sorted(p for p in self.csgo_dir.glob("*.dem") if p not in skip and not self._ours.match(p.name))
-
-    def _session_gotv(self, proc: CS2Process) -> None:
-        """Pick up GOTV autorecord demos as they close, until the target or a failure."""
-        seen: dict[Path, list[float]] = {}  # path -> [size, first seen, last change]
-        while True:
-            self.h.sleep(float(self.g.poll_s))
-            verdict = proc.poll()
-            now = self.h.clock()
-            files = self._new_demos()
-            for p in files:
-                size = self.h.file_size(p) or 0
-                rec = seen.setdefault(p, [size, now, now])
-                if size != rec[0]:
-                    rec[0], rec[2] = size, now
-            # CONFIRM(#14): a demo is closed once a newer one exists and it stopped growing.
-            for p in files[:-1]:
-                if now - seen[p][2] >= self.g.close_stable_s:
-                    self._finish_gotv(p, seen.pop(p), truncated=False)
-            active = seen[files[-1]] if files and files[-1] in seen else None
-            over = active is not None and self.generated_s + (active[2] - active[1]) >= self.target_s
-            if verdict != "running" or over:
-                proc.kill()
-                for p in self._new_demos():
-                    if self._wait_closed(p):
-                        self._finish_gotv(p, seen.pop(p, [0, now, now]), truncated=True)
-                return
-            if self.generated_s >= self.target_s or self._publish_failures >= self.g.max_failures:
-                return
-
-    def _finish_gotv(self, path: Path, rec: list[float], truncated: bool) -> None:
-        demo_id = make_demo_id(self.profile, self.started, self._index)
-        # CONFIRM(#14): the start time is approximated by when the demo file was first seen.
-        started = self.h.wall() - timedelta(seconds=self.h.clock() - rec[1])
-        if self._publish(path, demo_id, started, max(rec[2] - rec[1], 0.0), truncated):
-            self._index += 1
-            self._ignore.add(path)  # only handled demos are ignored; a failed one is retried in the next session
-        else:
-            self._stranded.add(path)
-        if not truncated:
-            self._guard()  # the next map cycle has already started; stop it by leaving the session
+    def _leftover_demos(self) -> list[Path]:
+        """Demos this tool recorded (``<kind>_<stamp>_<nnn>.dem``) that are still in the csgo dir."""
+        return sorted(p for p in self.csgo_dir.glob("*.dem") if self._ours.match(p.name))
 
     def _session(self) -> None:
-        netcon = self.g.chunking == "netcon"
-        cmd = build_launch_command(self.cfg, self.profile, int(self.g.netconport) if netcon else None)
-        self._stranded.clear()
+        cmd = build_launch_command(self.cfg, self.profile, int(self.g.netconport))
         with CS2Process(
             cmd,
             self.csgo_dir,
@@ -895,10 +861,7 @@ class Generator:
             size_probe=self.h.dir_size,
             run=self.h.run,
         ) as proc:
-            if netcon:
-                self._session_netcon(proc)
-            else:
-                self._session_gotv(proc)
+            self._session_netcon(proc)
 
     # -- entry point ------------------------------------------------------------------------------------------------
 
@@ -941,7 +904,6 @@ class Generator:
         _, self.cfg_sha = install_cfg(rendered, self.profile, self.cs2_dir)
         self.git_sha = self.h.git_sha()
         self._fresh_start()
-        self._ignore = set(self.csgo_dir.glob("*.dem"))  # demos of other tools and runs are not ours
         failures = 0
         try:
             while self.generated_s < self.target_s and self._publish_failures < self.g.max_failures:
@@ -963,7 +925,7 @@ class Generator:
                     self.h.notify(msg, title="dcs2: generate failed", priority="high", tags=["rotating_light"])
                     raise GenerateError(msg)
         except PatchGuardError:
-            left = [p.name for p in self._new_demos()]
+            left = [p.name for p in self._leftover_demos()]
             if left:
                 log.error("stopped by the patch guard with unpublished demos in %s: %s", self.csgo_dir, left)
             raise

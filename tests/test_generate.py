@@ -38,7 +38,9 @@ def _cfg(tmp_path: Path, *overrides: str) -> DictConfig:
         overrides=[
             f"paths.root={tmp_path / 'data'}",
             f"paths.cs2_dir={tmp_path / 'steam/steamapps/common/CS'}",
+            "generate.expected_build=null",
             "generate.map_load_wait_s=10",
+            "generate.team_settle_s=1",
             "generate.netcon_connect_timeout_s=10",
             "generate.close_stable_s=2",
             "generate.close_timeout_s=10",
@@ -142,12 +144,38 @@ def test_render_cfg_inlines_exec_includes(tmp_path: Path) -> None:
     assert "exec generate_dm" not in text
     assert "bot_quota 10" in text  # from generate_dm.cfg
     assert "mp_ct_default_grenades weapon_smokegrenade" in text  # from generate_smoke.cfg
-    assert "\ntv_autorecord 1" not in text  # netcon is the default; the cfg only has it commented out
+    assert "\ntv_autorecord" not in text  # autorecord is never used
 
 
-def test_render_cfg_gotv_appends_autorecord(tmp_path: Path) -> None:
-    text = render_cfg("dm", _cfg(tmp_path, "generate.chunking=gotv", "generate.chunk_min=7.5"))
-    assert text.splitlines()[-3:] == ["tv_enable 1", "tv_autorecord 1", "mp_timelimit 7.5"]
+def _commands(text: str) -> list[str]:
+    return [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("//")]
+
+
+@pytest.mark.parametrize("profile", ["dm", "smoke", "human"])
+def test_cfg_sets_up_gotv_before_the_map(tmp_path: Path, profile: str) -> None:
+    cmds = _commands(render_cfg(profile, _cfg(tmp_path)))
+    assert cmds.index("tv_enable 1") < cmds.index("map de_dust2")
+    assert cmds.index("tv_transmitall 1") < cmds.index("map de_dust2")
+    assert cmds.index("tv_record_immediate 1") < cmds.index("map de_dust2")
+    assert cmds.index("game_type 1") < cmds.index("map de_dust2") and "game_mode 2" in cmds
+
+
+@pytest.mark.parametrize("profile", ["dm", "smoke", "human"])
+def test_cfg_leaves_jointeam_and_recording_to_netcon(tmp_path: Path, profile: str) -> None:
+    cmds = _commands(render_cfg(profile, _cfg(tmp_path)))
+    assert not any(c.startswith(("jointeam", "record", "tv_record ", "tv_autorecord")) for c in cmds)
+
+
+def test_cfgs_have_no_resolved_markers() -> None:
+    for name in ("generate_dm", "generate_human", "generate_smoke", "render_base"):
+        text = (generate.cs2wm_config.DEFAULT_CONFIG_PATH.parent / "cs2" / f"{name}.cfg").read_text()
+        assert "CONFIRM(#14)" not in text and "UNVERIFIED" not in text
+        assert "SAFETY: HLAE and CS2 are only ever run offline with -insecure" in text
+
+
+def test_render_base_cfg_turns_xray_off() -> None:
+    text = (generate.cs2wm_config.DEFAULT_CONFIG_PATH.parent / "cs2" / "render_base.cfg").read_text()
+    assert "\nspec_show_xray 0\n" in text
 
 
 def test_render_cfg_detects_exec_cycle(tmp_path: Path) -> None:
@@ -227,9 +255,9 @@ def test_process_poll_reports_hang(tmp_path: Path) -> None:
 class FakeWorld:
     """A fake CS2 plus clock. ``sleep`` advances time and lets the running process write its demo."""
 
-    def __init__(self, csgo: Path, *, chunking: str = "netcon") -> None:
+    def __init__(self, csgo: Path) -> None:
         self.csgo = csgo
-        self.chunking = chunking
+        self.commands: list[tuple[float, str]] = []  # (clock, netcon command), in the order received
         self.t = 0.0
         self.build = BUILD
         self.recording: Path | None = None
@@ -273,12 +301,7 @@ class FakeWorld:
                 self._grow(step)
 
     def _grow(self, step: float) -> None:
-        if self.chunking == "gotv":
-            n = int((self.t - self.launch_t) // 120)
-            path = self.csgo / f"auto{self.launch_t:.0f}-{n}.dem"
-            with path.open("ab") as f:
-                f.write(b"x" * int(step * 100))
-        elif self.recording is not None:
+        if self.recording is not None:
             with self.recording.open("ab") as f:
                 f.write(b"x" * int(step * 100))
 
@@ -304,10 +327,12 @@ class FakeWorld:
             def send(self, cmd: str, retries=None) -> str:
                 if not world.alive():
                     raise ConnectionError("refused")
-                if cmd.startswith("record "):
-                    world.recording = world.csgo / f"{cmd.split()[1]}.dem"
+                world.commands.append((world.t, cmd))
+                if cmd.startswith("sv_cheats 1; "):  # a chunk starts: `sv_cheats 1; record|tv_record <name>`
+                    name = cmd.split()[-1]
+                    world.recording = world.csgo / f"{name}.dem"
                     world.recording.touch()
-                elif cmd == "stop":
+                elif cmd in ("stop", "tv_stoprecord"):
                     world.recording = None
                 return ""
 
@@ -337,7 +362,7 @@ class FakeWorld:
 
 def _run(tmp_path: Path, hours: float = 0.1, *overrides: str, profile: str = "dm", chunk_min: float = 2):
     cfg = _cfg(tmp_path, "generate.hang_timeout_min=1", *overrides)
-    world = FakeWorld(Path(cfg.paths.cs2_dir) / "game/csgo", chunking=cfg.generate.chunking)
+    world = FakeWorld(Path(cfg.paths.cs2_dir) / "game/csgo")
     return cfg, world, Generator(cfg, profile, hours, chunk_min, world.hooks())
 
 
@@ -358,7 +383,7 @@ def test_run_records_all_chunks_with_sidecars(tmp_path: Path) -> None:
     assert side["demo_id"] == "dm_20261023-220000_001"
     assert side["profile"] == side["kind"] == "dm"
     assert side["chunk_min"] == 2.0
-    assert side["chunking"] == "netcon"
+    assert side["chunking"] == "gotv"
     assert side["cs2_build"] == BUILD
     assert side["cfg_sha256"] == cfg_sha
     assert side["cs2wm_git_sha"] == "deadbeef"
@@ -457,24 +482,61 @@ def test_patch_guard_passes_with_matching_build(tmp_path: Path) -> None:
     assert world.notified == []
 
 
-def test_gotv_mode_collects_autorecorded_demos(tmp_path: Path) -> None:
-    _, world, gen = _run(tmp_path, 0.09, "generate.chunking=gotv", "generate.poll_s=1")
+def _chunk_commands(world: FakeWorld) -> list[str]:
+    return [c for _, c in world.commands if c != "jointeam 1"]
+
+
+def test_gotv_session_sequence(tmp_path: Path) -> None:
+    """launch -> port -> map -> `jointeam 1` -> settle -> per chunk `sv_cheats 1; tv_record`, `tv_stoprecord`."""
+    _, world, gen = _run(tmp_path, 0.09)
     kept = gen.run()
     assert len(kept) == 3
-    assert "-netconport" not in world.launches[0].cmd
-    assert "tv_autorecord 1" in (world.csgo / "cfg/generate_dm.cfg").read_text()
+    assert "-netconport" in world.launches[0].cmd and "-insecure" in world.launches[0].cmd
+    names = [p.stem for p in kept]
+    expected = []
+    for name in names:
+        expected += [f"sv_cheats 1; tv_record {name}", "tv_stoprecord"]
+    assert [c for _, c in world.commands] == ["jointeam 1", *expected]
+    (t_join, _), (t_first, _) = world.commands[:2]
+    assert t_join == 10  # after map_load_wait_s
+    assert t_first == t_join + 1  # after team_settle_s: joining a team after tv_record stalls the demo
     sides = [json.loads(p.with_suffix(".json").read_text()) for p in kept]
-    assert [s["truncated"] for s in sides] == [False, False, True]
-    assert all(s["chunking"] == "gotv" for s in sides)
-    assert list(world.csgo.glob("*.dem")) == []
+    assert all(s["chunking"] == "gotv" and not s["truncated"] for s in sides)
+    assert list(world.csgo.glob("*.dem")) == []  # GOTV demos land in game/csgo like client demos
 
 
-def test_old_demos_in_csgo_dir_are_left_alone(tmp_path: Path) -> None:
-    _, world, gen = _run(tmp_path, 0.09, "generate.chunking=gotv", "generate.poll_s=1")
-    old = world.csgo / "mine.dem"
-    old.write_bytes(b"keep me")
+def test_stoprecord_comes_before_the_next_tv_record(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.09)
     gen.run()
-    assert old.read_bytes() == b"keep me"
+    cmds = _chunk_commands(world)
+    assert cmds[1::2] == ["tv_stoprecord"] * 3
+    assert all(c.startswith("sv_cheats 1; tv_record ") for c in cmds[0::2])
+    times = [t for t, c in world.commands if c != "jointeam 1"]
+    assert times == sorted(times)
+
+
+def test_netcon_chunking_records_client_demos(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.09, "generate.chunking=netcon")
+    kept = gen.run()
+    expected = [c for p in kept for c in (f"sv_cheats 1; record {p.stem}", "stop")]
+    assert [c for _, c in world.commands] == ["jointeam 1", *expected]
+    assert all(json.loads(p.with_suffix(".json").read_text())["chunking"] == "netcon" for p in kept)
+
+
+def test_human_session_stays_on_a_team(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.04, profile="human", chunk_min=1)
+    gen.run()
+    assert "jointeam 1" not in [c for _, c in world.commands]
+    assert world.commands[0][1].startswith("sv_cheats 1; tv_record human_")
+
+
+def test_crash_during_the_team_settle_wait_restarts_without_a_chunk(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.09)
+    world.crash_at = [10.5]  # right after `jointeam 1`, before the first tv_record
+    kept = gen.run()
+    assert len(world.launches) == 2 and len(kept) == 3
+    first_launch = [c for t, c in world.commands if t < 11]
+    assert first_launch == ["jointeam 1"]  # nothing was recorded by the dead session
 
 
 def test_human_profile_goes_to_its_own_dir(tmp_path: Path) -> None:
@@ -498,6 +560,28 @@ def test_parse_error_seam(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert generate._parse_error(f) is None
     monkeypatch.setattr(generate.demo, "inspect", lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
     assert "boom" in generate._parse_error(f)
+
+
+def test_parse_error_keeps_a_demo_that_ends_early_but_has_ticks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "a.dem"
+    monkeypatch.setattr(generate.demo, "is_parseable", None, raising=False)
+    cut = {"ok": False, "truncated": True, "last_tick": 2588, "error": "unexpected end of demo"}
+    monkeypatch.setattr(generate.demo, "inspect", lambda p: cut)
+    assert generate._parse_error(f) is None
+    monkeypatch.setattr(generate.demo, "inspect", lambda p: {**cut, "last_tick": 0})
+    assert generate._parse_error(f) == "unexpected end of demo"
+    monkeypatch.setattr(generate.demo, "inspect", lambda p: {**cut, "truncated": False})
+    assert generate._parse_error(f) == "unexpected end of demo"
+
+
+def test_other_tools_demos_in_the_csgo_dir_are_left_alone(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.09)
+    old = world.csgo / "mine.dem"
+    old.write_bytes(b"keep me")
+    gen.run()
+    assert old.read_bytes() == b"keep me"
 
 
 def test_crash_loop_with_only_rejected_chunks_gives_up(tmp_path: Path) -> None:
@@ -725,22 +809,14 @@ def test_failed_unlink_is_retried_at_the_end(tmp_path: Path, monkeypatch: pytest
     assert not src.exists()
 
 
-def test_patch_guard_in_gotv_logs_unpublished_demos(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    _, world, gen = _run(
-        tmp_path, 0.2, "generate.chunking=gotv", "generate.poll_s=1", f"generate.expected_build={BUILD}"
-    )
-    real = world.sleep
-
-    def sleep(s: float) -> None:
-        real(s)
-        if world.t > 150:
-            world.build = BUILD + 1
-
-    gen.h.sleep = sleep
+def test_patch_guard_logs_demos_left_in_the_csgo_dir(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    _, world, gen = _run(tmp_path, 0.2, "generate.expected_build=111")
+    left = world.csgo / "dm_20200101-000000_000.dem"
+    left.write_bytes(b"x")  # recorded by an earlier run, not yet published
     with caplog.at_level(logging.ERROR), pytest.raises(PatchGuardError):
         gen.run()
-    assert "unpublished demos" in caplog.text
-    assert list(world.csgo.glob("auto*.dem"))
+    assert "unpublished demos" in caplog.text and left.name in caplog.text
+    assert left.exists()
 
 
 @pytest.mark.parametrize("hours,chunk", [(0, 2), (-1, 2), (0.1, 0), (0.1, -3)])

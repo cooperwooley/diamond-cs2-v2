@@ -375,12 +375,29 @@ def test_run_writes_plan_for_a_demo(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_run_fixed_player_marks_episodes_human(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = load_config(overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}"])
+    cfg = load_config(
+        overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}", "generate.expected_build=null"]
+    )
     monkeypatch.setattr(demo, "_make_parser", lambda path: fake_demo_parser())
     plan = segment.read_render_plan(segment.run(tmp_path / "d1.dem", cfg, "fixed_player", "A"))
     assert plan["meta"]["kind"] == "human" and plan["meta"]["player"] == "A"
     assert plan["cs2_build"] is None  # no manifest and generate.expected_build is null
     assert {s["target"]["name"] for s in plan["segments"]} == {"A"}
+
+
+def test_sourcetv_and_the_local_spectator_are_never_spectated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SourceTV (a bot slot) and the local spectator are in the tick table but never spawn, so they have no life."""
+    parser = fake_demo_parser()
+    extra = pd.DataFrame(
+        {"tick": [0, 6000, 0, 6000], "user_id": [3, 3, 4, 4], "name": ["SourceTV", "SourceTV", "me", "me"],
+         "steamid": [0, 0, 1, 1], "entity_id": [13, 13, 14, 14]}
+    )  # fmt: skip
+    parser._ticks = pd.concat([parser._ticks, extra], ignore_index=True)
+    cfg = load_config(overrides=[f"paths.plans={tmp_path}", f"paths.cs2_dir={tmp_path / 'none'}"])
+    monkeypatch.setattr(demo, "_make_parser", lambda path: parser)
+    plan = segment.read_render_plan(segment.run(tmp_path / "d1.dem", cfg))
+    assert {s["target"]["name"] for s in plan["segments"]} <= {"A", "B"}
+    assert plan["segments"]
 
 
 def test_cli_segment_single_demo_and_all_pending(
