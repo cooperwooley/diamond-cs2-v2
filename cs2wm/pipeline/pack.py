@@ -179,7 +179,8 @@ def _write_h5(
 
 
 def _fsync_path(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    # Windows' fsync (_commit) needs a writable descriptor and fails with EBADF on an O_RDONLY one.
+    fd = os.open(path, os.O_RDWR if os.name == "nt" else os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:

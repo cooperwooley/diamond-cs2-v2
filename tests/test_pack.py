@@ -376,3 +376,16 @@ def test_append_manifest(tmp_path) -> None:
     assert lines[0] == '{"a": "x", "z": 1}'
     assert json.loads(lines[1]) == {"file": "e.hdf5", "frames": 3}
     assert len(lines) == 2
+
+
+@pytest.mark.parametrize(("os_name", "flag"), [("nt", os.O_RDWR), ("posix", os.O_RDONLY)])
+def test_fsync_path_opens_writable_on_windows(tmp_path, monkeypatch, os_name, flag) -> None:
+    # Windows' fsync needs a writable descriptor (EBADF on O_RDONLY), found on the render PC.
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"x")
+    seen = []
+    real_open = os.open
+    monkeypatch.setattr(pack.os, "name", os_name)
+    monkeypatch.setattr(pack.os, "open", lambda p, flags, *a: seen.append(flags) or real_open(p, flags, *a))
+    pack._fsync_path(path)
+    assert seen == [flag]
