@@ -37,16 +37,18 @@ log = logging.getLogger(__name__)
 # the cache key, so a bump re-parses every cached demo.
 DEMODUMP_FORMAT = "1"
 DEMOINFOCS_VERSION = "v6.0.0-rc.1"
+# ``behaviorVersion`` in tools/demodump/main.go: bumped whenever the derived-event rules or the table logic
+# change, so cached dumps made by older logic are not reused. Tested against the Go source.
+DEMODUMP_BEHAVIOR = "1"
 
 ENV_BINARY = "DCS2_DEMODUMP"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_SCRIPT = "scripts/build_demodump.sh"
 _TIMEOUT_S = 1800  # a 30 minute demo takes seconds; this only stops a hung process
-_VERSION_RE = re.compile(r"^demodump (\S+) demoinfocs (\S+)$")
+_VERSION_RE = re.compile(r"^demodump (\S+) demoinfocs (\S+) behavior (\S+)$")
 
 # Tick columns that exist in every dump; ``parse_ticks`` returns these plus the wanted ones the dump has.
 _TICK_ALWAYS = ("tick", "name", "steamid", "user_id")
-_PLAYER_ROLE_COLUMNS = {"user_id": "user_user_id", "name": "user_name", "steamid": "user_steamid"}
 
 
 class DemodumpNotFound(FileNotFoundError):
@@ -92,9 +94,9 @@ def find_binary(configured: str | os.PathLike | None = None) -> Path:
 
 
 def cache_key(demo_path: Path) -> str:
-    """Cache directory name: the demo's stem plus a hash of its absolute path, size, mtime and the dump format."""
+    """Cache directory name: the demo's stem plus a hash of its path, size, mtime and the exporter's versions."""
     st = demo_path.stat()
-    raw = f"{demo_path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{DEMODUMP_FORMAT}"
+    raw = f"{demo_path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{DEMODUMP_FORMAT}|{DEMOINFOCS_VERSION}|{DEMODUMP_BEHAVIOR}"
     return f"{demo_path.stem}-{hashlib.sha1(raw.encode()).hexdigest()[:16]}"
 
 
@@ -140,11 +142,11 @@ def dump_demo(demo_path: str | Path, cache_dir: str | Path, configured: str | os
     return target
 
 
-def check_version(exe: Path) -> tuple[str, str]:
-    """Return ``(format, demoinfocs version)`` of an exporter binary.
+def check_version(exe: Path) -> tuple[str, str, str]:
+    """Return ``(format, demoinfocs version, behavior version)`` of an exporter binary.
 
     Raises:
-        RuntimeError: If it cannot be run or its format is not ``DEMODUMP_FORMAT``.
+        RuntimeError: If it cannot be run or does not report the versions the cache key assumes.
     """
     try:
         out = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=60, check=False).stdout
@@ -152,12 +154,41 @@ def check_version(exe: Path) -> tuple[str, str]:
         raise RuntimeError(f"cannot run {exe}: {exc}") from exc
     match = _VERSION_RE.match(out.strip())
     if match is None:
-        raise RuntimeError(f"{exe} --version printed {out.strip()!r}, expected 'demodump <n> demoinfocs <version>'")
-    if match.group(1) != DEMODUMP_FORMAT:
         raise RuntimeError(
-            f"{exe} writes dump format {match.group(1)}, cs2wm needs {DEMODUMP_FORMAT}; rebuild with {BUILD_SCRIPT}"
+            f"{exe} --version printed {out.strip()!r}, expected 'demodump <n> demoinfocs <version> behavior <n>'"
         )
-    return match.group(1), match.group(2)
+    found = match.groups()
+    if found != (DEMODUMP_FORMAT, DEMOINFOCS_VERSION, DEMODUMP_BEHAVIOR):
+        raise RuntimeError(
+            f"{exe} is format {found[0]}, demoinfocs {found[1]}, behavior {found[2]}; cs2wm needs "
+            f"{DEMODUMP_FORMAT}, {DEMOINFOCS_VERSION}, {DEMODUMP_BEHAVIOR}. Rebuild with {BUILD_SCRIPT}"
+        )
+    return found
+
+
+def _occupant_at(tick: pd.Series, user_id: pd.Series, roster: pd.DataFrame) -> pd.DataFrame:
+    """Who held each event's ``user_id`` at its tick.
+
+    A ``user_id`` can be reused by another player, so the roster has one row per occupancy (``first_tick``,
+    ``last_tick``). Each event takes the latest occupancy that started at or before its tick, or the first one if it
+    precedes them all. Events without a ``user_id``, or with one the roster lacks, get NaN.
+
+    Returns:
+        A frame aligned with ``tick`` with ``name``, ``steamid`` and ``entity_id``.
+    """
+    cols = ["name", "steamid", "entity_id"]
+    left = pd.DataFrame({"tick": tick.to_numpy(dtype="int64"), "user_id": user_id.to_numpy(), "row": range(len(tick))})
+    known = left[left["user_id"].notna()].astype({"user_id": "int64"}).sort_values("tick", kind="stable")
+    right = roster.astype({"user_id": "int64", "first_tick": "int64"}).sort_values("first_tick")[
+        ["user_id", "first_tick", *cols]
+    ]
+    kwargs = {"left_on": "tick", "right_on": "first_tick", "by": "user_id"}
+    back = pd.merge_asof(known, right, direction="backward", **kwargs).set_index("row")
+    front = pd.merge_asof(known, right, direction="forward", **kwargs).set_index("row")
+    joined = back[cols].copy()
+    before_all = back["first_tick"].isna()
+    joined.loc[before_all, cols] = front.loc[before_all, cols]
+    return joined.reindex(range(len(tick))).reset_index(drop=True)
 
 
 class DemodumpParser:
@@ -183,7 +214,15 @@ class DemodumpParser:
 
     def parse_header(self) -> dict[str, Any]:
         """The demo header: ``map_name``, ``patch_version``, ``tick_rate``, ``first_tick``, ``last_tick``, ..."""
-        return json.loads((self.dir / "header.json").read_text(encoding="utf-8"))
+        header = json.loads((self.dir / "header.json").read_text(encoding="utf-8"))
+        if header.get("truncated"):
+            log.warning(
+                "%s is truncated: the demo ends early, the dump holds ticks %s..%s only",
+                header.get("demo_file"),
+                header.get("first_tick"),
+                header.get("last_tick"),
+            )
+        return header
 
     def parse_ticks(
         self,
@@ -234,7 +273,7 @@ class DemodumpParser:
             ``(name, table)`` pairs sorted by tick within each table. Raw columns keep their dump names
             (``userid`` is ``user_id``); ``derived`` is true for events reconstructed from tick data.
         """
-        roster = pd.read_csv(self.dir / "players.csv").set_index("user_id")
+        roster = pd.read_csv(self.dir / "players.csv")
         out: list[tuple[str, pd.DataFrame]] = []
         for name in names:
             path = self.dir / "events" / f"{name}.csv.gz"
@@ -242,10 +281,12 @@ class DemodumpParser:
                 continue
             df = pd.read_csv(path).sort_values("tick", kind="stable").reset_index(drop=True)
             uid = df["user_id"] if "user_id" in df.columns else pd.Series(float("nan"), index=df.index)
-            for src, dst in _PLAYER_ROLE_COLUMNS.items():  # an id missing from the roster (or null) gives NaN
-                df[dst] = uid if src == "user_id" else roster[src].reindex(uid).to_numpy()
+            who = _occupant_at(df["tick"], uid, roster)
+            df["user_user_id"] = uid
+            df["user_name"] = who["name"].to_numpy()
+            df["user_steamid"] = who["steamid"].to_numpy()
             if player is not None and "entity_id" in player:
-                df["user_entity_id"] = roster["entity_id"].reindex(uid).to_numpy()
+                df["user_entity_id"] = who["entity_id"].to_numpy()
             out.append((name, df))
         return out
 

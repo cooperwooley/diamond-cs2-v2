@@ -196,6 +196,14 @@ Demos are parsed by `tools/demodump` (demoinfocs-golang v6.0.0-rc.1) and served 
 | `user_id` | The in-demo user id that game events use (`userid`); the key every caller joins on. |
 | Buttons | GOTV demos carry none, so `FORWARD`, `FIRE`, `buttons`... are never returned; `extract_actions` labels from state and skips the cross-check. |
 
+**Rows without a pose.** A player with no pawn, or still at the tick-0 placeholder position (0, 0, -1612.47, which lasts until the first spawn), has empty `X`, `Y`, `Z`, `yaw`, `pitch`, `duck_amount` and `active_weapon_name` (NaN in pandas), and false `is_airborne`, `is_walking`, `is_scoped`; without a pawn `is_alive` is false as well. A dead player that still has a pawn keeps its last pose.
+
+**Truncated demos.** If CS2 is killed mid-recording the demo ends early. The exporter keeps everything up to the cut, writes `truncated: true` into `header.json` and exits 0 (any other parse error is a failure and caches nothing). `cs2wm.demo.inspect()` returns `truncated`, logs a warning when the dump is read, and `is_parseable()` stays true while the dump has at least one tick. The step-9 crash test demo (3.2 MB) gives ticks 0..2588 of 10 players.
+
+**Event columns.** Events join `user_name`, `user_steamid` and `user_entity_id` from the roster by tick: `players.csv` has one row per occupancy of a `user_id` (`first_tick`..`last_tick`), so a reused `user_id` maps to the right player. `weapon` is the raw string of the game event (`weapon_ak47`) and exists only on raw events; `weapon_name` is the display name (`AK-47`, the `active_weapon_name` convention) on raw and derived events alike.
+
+**Cache key.** A dump is reused only for the same demo path, size and mtime, dump format, demoinfocs version and `behaviorVersion`. `behaviorVersion` (`tools/demodump/main.go`, mirrored in `cs2wm/demodump.py`) must be bumped when `derive.go`, `rows.go` or `tables.go` change; a Go test pins a hash of those files so a change cannot go unnoticed.
+
 **What `spec_player` takes is still #14 D2.** The plan's `target.entity_id` is now the controller index (3), where demoparser2 would have given the pawn index (339-ish). If the game rejects it, the candidates are `user_id` (2, equal to the slot here: `render.spec_player_field=user_id`) or the pawn index from `pawn_entity_id`.
 
 **Derived events.** GOTV demos have no `player_jump`, `weapon_reload`, `weapon_zoom` or `grenade_thrown` game events, so the exporter reconstructs them from the tick data and flags them `derived=true`. A derived event is written only when the demo has no raw event of that name. Thresholds are constants in `tools/demodump/derive.go`:

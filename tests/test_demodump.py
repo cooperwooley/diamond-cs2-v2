@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 import os
 import re
 import shutil
 import stat
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from cs2wm import demo, demodump
@@ -37,6 +40,11 @@ def use_fixture(monkeypatch):
 def test_format_version_matches_the_go_exporter() -> None:
     main = (REPO / "tools" / "demodump" / "main.go").read_text(encoding="utf-8")
     assert re.search(rf'const version = "{demodump.DEMODUMP_FORMAT}"', main)
+
+
+def test_behavior_version_matches_the_go_exporter() -> None:
+    main = (REPO / "tools" / "demodump" / "main.go").read_text(encoding="utf-8")
+    assert re.search(rf'const behaviorVersion = "{demodump.DEMODUMP_BEHAVIOR}"', main)
 
 
 def test_demoinfocs_version_matches_go_mod() -> None:
@@ -93,18 +101,28 @@ def test_find_binary_error_names_the_build_script(lookup) -> None:
 pytestmark_posix = pytest.mark.skipif(os.name == "nt", reason="the fake exporter is a shell script")
 
 FAKE_EXPORTER = """#!/bin/sh
-if [ "$1" = "--version" ]; then echo "demodump {fmt} demoinfocs v0"; exit 0; fi
+if [ "$1" = "--version" ]; then echo "demodump {fmt} demoinfocs {infocs} behavior {behavior}"; exit 0; fi
 echo run >> "{counter}"
 if [ -n "{fail}" ]; then echo "boom: bad demo" >&2; exit 1; fi
 cp -r "{fixture}/." "$2"
 """
 
 
-def _fake_exporter(tmp_path: Path, fmt: str = demodump.DEMODUMP_FORMAT, fail: bool = False) -> tuple[Path, Path]:
+def _fake_exporter(
+    tmp_path: Path, fmt: str = demodump.DEMODUMP_FORMAT, fail: bool = False, behavior: str = demodump.DEMODUMP_BEHAVIOR
+) -> tuple[Path, Path]:
     counter = tmp_path / "runs.txt"
     exe = tmp_path / "fake_demodump"
     exe.write_text(
-        FAKE_EXPORTER.format(fmt=fmt, counter=counter, fail="1" if fail else "", fixture=FIXTURE), encoding="utf-8"
+        FAKE_EXPORTER.format(
+            fmt=fmt,
+            infocs=demodump.DEMOINFOCS_VERSION,
+            behavior=behavior,
+            counter=counter,
+            fail="1" if fail else "",
+            fixture=FIXTURE,
+        ),
+        encoding="utf-8",
     )
     exe.chmod(0o755)
     return exe, counter
@@ -151,9 +169,30 @@ def test_exporter_with_another_format_version_is_rejected(tmp_path) -> None:
     exe, counter = _fake_exporter(tmp_path, fmt="99")
     demo_file = tmp_path / "a.dem"
     demo_file.write_bytes(b"x")
-    with pytest.raises(RuntimeError, match=r"format 99.*build_demodump\.sh"):
+    with pytest.raises(RuntimeError, match=r"is format 99.*build_demodump\.sh"):
         demodump.dump_demo(demo_file, tmp_path / "cache", exe)
     assert _runs(counter) == 0
+
+
+@pytestmark_posix
+def test_exporter_with_another_behavior_version_is_rejected(tmp_path) -> None:
+    exe, counter = _fake_exporter(tmp_path, behavior="99")
+    demo_file = tmp_path / "a.dem"
+    demo_file.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match=r"behavior 99.*build_demodump\.sh"):
+        demodump.dump_demo(demo_file, tmp_path / "cache", exe)
+    assert _runs(counter) == 0
+
+
+def test_cache_key_changes_with_the_exporter_versions(tmp_path, monkeypatch) -> None:
+    demo_file = tmp_path / "a.dem"
+    demo_file.write_bytes(b"x")
+    keys = {demodump.cache_key(demo_file)}
+    for name in ("DEMODUMP_BEHAVIOR", "DEMODUMP_FORMAT", "DEMOINFOCS_VERSION"):
+        with monkeypatch.context() as m:
+            m.setattr(demodump, name, "changed")
+            keys.add(demodump.cache_key(demo_file))
+    assert len(keys) == 4
 
 
 def test_cached_dump_needs_no_binary(tmp_path, lookup) -> None:
@@ -315,6 +354,11 @@ def test_demoparser2_backend_returns_the_demoparser2_parser(restore_settings) ->
     assert type(demo._make_parser(FIXTURE / "header.json")).__name__ == "DemoParser"
 
 
+def test_cache_dir_must_be_configured(restore_settings) -> None:
+    with pytest.raises(RuntimeError, match="load_config"):
+        demo._cache_dir()
+
+
 def test_unknown_backend_is_rejected() -> None:
     with pytest.raises(ConfigError, match="demo.backend"):
         load_config(overrides=["demo.backend=nope"])
@@ -326,3 +370,127 @@ def test_make_parser_uses_the_demodump_shim_by_default(restore_settings, tmp_pat
     monkeypatch.setattr(demo, "_settings", demo._Settings(cache_dir=tmp_path / "cache"))
     shutil.copytree(FIXTURE, tmp_path / "cache" / demodump.cache_key(demo_file))
     assert isinstance(demo._make_parser(demo_file), demodump.DemodumpParser)
+
+
+# --- weapon columns ---
+
+
+def test_weapon_columns_raw_and_derived(parser) -> None:
+    [(_, fire)] = parser.parse_events(["weapon_fire"])
+    assert fire["weapon"].str.startswith("weapon_").all()  # raw string, as the game sends it
+    assert fire["weapon_name"].isin({"AK-47", "Glock-18", "Knife"}).all()  # display name, as active_weapon_name
+    [(_, reload_)] = parser.parse_events(["weapon_reload"])
+    assert "weapon" not in reload_.columns  # derived events have no raw string
+    assert reload_["weapon_name"].isin({"AK-47", "Glock-18", "Knife"}).all()
+
+
+# --- hand-made dumps: truncation, pawn-less rows, reused user ids ---
+
+
+@pytest.fixture
+def dump_copy(tmp_path):
+    dest = tmp_path / "dump"
+    shutil.copytree(FIXTURE, dest)
+    return dest
+
+
+def _use(monkeypatch, dump: Path) -> None:
+    monkeypatch.setattr(demo, "_make_parser", lambda path: demodump.DemodumpParser(path, dump, dump=dump))
+
+
+def _set_header(dump: Path, **fields) -> None:
+    path = dump / "header.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), **fields}), encoding="utf-8")
+
+
+def test_complete_demo_is_not_truncated(use_fixture) -> None:
+    assert demo.inspect("fixture.dem")["truncated"] is False
+
+
+def test_truncated_dump_is_parseable_and_flagged(dump_copy, monkeypatch, caplog) -> None:
+    _set_header(dump_copy, truncated=True, last_tick=2079)
+    _use(monkeypatch, dump_copy)
+    with caplog.at_level("WARNING", logger="cs2wm.demodump"):
+        info = demo.inspect("cut.dem")
+    assert info["ok"] and info["truncated"] is True and info["error"] is None
+    assert info["last_tick"] == 2079 and len(info["players"]) == 3
+    assert "truncated" in caplog.text
+    assert demo.is_parseable("cut.dem")
+
+
+def test_truncated_dump_without_ticks_is_not_parseable(dump_copy, monkeypatch) -> None:
+    _set_header(dump_copy, truncated=True)
+    (dump_copy / "ticks.csv.gz").write_bytes(gzip.compress(b"tick,user_id,name,steamid\n"))
+    _use(monkeypatch, dump_copy)
+    info = demo.inspect("cut.dem")
+    assert not info["ok"] and "no ticks" in info["error"] and info["truncated"] is True
+    assert not demo.is_parseable("cut.dem")
+
+
+def test_rows_without_a_pose_load_as_nan_and_dead(dump_copy) -> None:
+    path = dump_copy / "ticks.csv.gz"
+    df = pd.read_csv(path, dtype=str)
+    blank = ["X", "Y", "Z", "yaw", "pitch", "duck_amount", "active_weapon_name"]
+    first = df["tick"] == df["tick"].iloc[0]
+    df.loc[first, blank] = None
+    df.loc[first, ["is_alive", "is_airborne", "is_walking", "is_scoped"]] = "false"
+    df.to_csv(path, index=False)
+
+    out = demodump.DemodumpParser("x.dem", dump_copy, dump=dump_copy).parse_ticks(
+        ["X", "Z", "yaw", "pitch", "duck_amount", "active_weapon_name", "is_alive", "is_airborne"]
+    )
+    blank_rows = out[out["tick"] == out["tick"].min()]
+    assert len(blank_rows) == 3
+    assert blank_rows[["X", "Z", "yaw", "pitch", "duck_amount", "active_weapon_name"]].isna().all().all()
+    assert not blank_rows["is_alive"].any() and not blank_rows["is_airborne"].any()
+    assert out["is_alive"].dtype == bool and out["is_airborne"].dtype == bool  # still plain booleans
+    assert out.loc[out["tick"] > out["tick"].min(), ["X", "yaw"]].notna().all().all()
+
+
+def _roster_dump(dump: Path, rows: list[tuple]) -> demodump.DemodumpParser:
+    roster = pd.DataFrame(
+        rows,
+        columns=[
+            "user_id",
+            "entity_id",
+            "pawn_entity_id",
+            "name",
+            "steamid",
+            "is_bot",
+            "team",
+            "first_tick",
+            "last_tick",
+        ],
+    )
+    roster.to_csv(dump / "players.csv", index=False)
+    events = pd.DataFrame({"tick": [5, 150, 400, 900, 120], "derived": False, "user_id": [3, 3, 3, 3, 9]})
+    with gzip.open(dump / "events" / "player_jump.csv.gz", "wt") as f:
+        events.to_csv(f, index=False)
+    return demodump.DemodumpParser("x.dem", dump, dump=dump)
+
+
+def test_events_join_the_occupant_of_the_user_id_at_their_tick(dump_copy) -> None:
+    parser = _roster_dump(
+        dump_copy,
+        [
+            (3, 4, 339, "Ann", 111, True, 2, 100, 300),
+            (3, 20, 340, "Bob", 222, False, 3, 350, 800),  # user_id 3 reused by another player
+        ],
+    )
+    [(_, ev)] = parser.parse_events(["player_jump"], player=["user_id", "entity_id"])
+    by_tick = ev.set_index("tick")
+    assert by_tick.loc[5, "user_name"] == "Ann"  # before the first occupancy: the first one
+    assert by_tick.loc[150, "user_name"] == "Ann" and by_tick.loc[150, "user_entity_id"] == 4
+    assert by_tick.loc[400, "user_name"] == "Bob" and by_tick.loc[400, "user_steamid"] == 222
+    assert by_tick.loc[400, "user_entity_id"] == 20
+    assert by_tick.loc[900, "user_name"] == "Bob"  # after the last occupancy: the last one
+    assert pd.isna(by_tick.loc[120, "user_name"]) and by_tick.loc[120, "user_user_id"] == 9  # not in the roster
+
+
+def test_events_without_a_user_id_get_nan(dump_copy) -> None:
+    parser = _roster_dump(dump_copy, [(3, 4, 339, "Ann", 111, True, 2, 100, 300)])
+    frame = pd.DataFrame({"tick": [10, 20], "derived": False, "user_id": [None, 3.0]})
+    with gzip.open(dump_copy / "events" / "player_jump.csv.gz", "wt") as f:
+        frame.to_csv(f, index=False)
+    [(_, ev)] = parser.parse_events(["player_jump"])
+    assert pd.isna(ev.loc[0, "user_name"]) and ev.loc[1, "user_name"] == "Ann"

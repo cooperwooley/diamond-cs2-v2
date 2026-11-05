@@ -9,5 +9,6 @@
   "n_players": 3,
   "patch_version": 14196,
   "server_name": "kpr",
-  "tick_rate": 64
+  "tick_rate": 64,
+  "truncated": false
 }

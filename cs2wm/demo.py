@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import logging
-import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -87,8 +86,9 @@ def configure(cfg: Any) -> None:
 
 
 def _cache_dir() -> Path:
-    # The same default as the config (paths.root/demo_cache) for code that never loaded one.
-    return _settings.cache_dir or Path(os.environ.get("DCS2_ROOT", "./dcs2-data")) / "demo_cache"
+    if _settings.cache_dir is None:
+        raise RuntimeError("demo cache directory is not set: call cs2wm.config.load_config() first (demo.cache_dir)")
+    return _settings.cache_dir
 
 
 def _make_parser(demo_path: str | Path) -> Any:
@@ -347,7 +347,8 @@ def inspect(demo_path: str | Path) -> dict:
 
     Returns:
         JSON-serialisable summary with ``ok``, ``error``, ``demo``, ``parser_version``, ``header``, ``first_tick``,
-        ``last_tick``, ``players`` and ``events``; also used to decide whether a truncated chunk is kept.
+        ``last_tick``, ``players``, ``events`` and ``truncated`` (the demo ends early; ``ok`` stays true while ticks
+        remain, so a truncated chunk is kept); also used to decide whether a chunk is kept.
     """
     out: dict = {
         "demo": str(demo_path),
@@ -359,10 +360,12 @@ def inspect(demo_path: str | Path) -> dict:
         "last_tick": None,
         "players": [],
         "events": {},
+        "truncated": False,
     }
     try:
         out["parser_version"] = parser_version()
         out["header"] = header(demo_path)
+        out["truncated"] = out["header"].get("truncated") == "True"
         ticks = load_ticks(demo_path, ["steamid"])
         if ticks.empty:
             raise ValueError("demo has no ticks")
@@ -397,6 +400,6 @@ def is_parseable(demo_path: str | Path) -> bool:
         demo_path: Path to a ``.dem`` file.
 
     Returns:
-        ``inspect(demo_path)["ok"]``.
+        ``inspect(demo_path)["ok"]``, which is true for a truncated demo that still has ticks.
     """
     return bool(inspect(demo_path)["ok"])
