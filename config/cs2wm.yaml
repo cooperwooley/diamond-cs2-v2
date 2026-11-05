@@ -79,7 +79,8 @@ qa:
 
 segment:
   policy: longest_remaining         # bots; human sessions use fixed_player
-  settle_ticks: 32                  # dropped after spawn and before death (camera transitions); a dead target ignores spec_player
+  settle_ticks: 32                  # dropped after spawn and before death (camera transitions); recording starts at spawn + this
+  spec_delay_ticks: 4               # spec_player is sent at spawn + this (a dead target ignores it); must be < settle_ticks
                                     # also the gap between two segments (camera switch)
   seed: 0                           # plan RNG seed (ties in the spectate policy); mixed with the demo id
   event_player_props: [user_id]     # player props requested with spawn/death events. Lives come from spawn events only, so the
@@ -117,6 +118,8 @@ generate:
   netcon_connect_timeout_s: 60      # the port opens in under 1 s plain, in 3-7 s via HLAE
   map_load_wait_s: 10               # wait after the netcon port opens, before `jointeam 1`; `record` works ~6 s after `map`
   team_settle_s: 5                  # wait after `jointeam 1` before the first chunk: joining a team after `tv_record` stalls the demo
+  restart_after_join: true          # send `mp_restartgame 1` after `jointeam 1` (the #14 recipe that gave a full GOTV demo); skipped for the human profile
+  restart_wait_s: 6                 # wait after `mp_restartgame 1` before the first chunk
   poll_s: 5                         # watchdog polling interval
   close_stable_s: 5                 # a demo is closed once its size has not changed for this long (the size is final within 2 s)
   close_timeout_s: 60               # give up waiting for a demo to close after this long
