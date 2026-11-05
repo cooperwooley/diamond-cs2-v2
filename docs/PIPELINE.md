@@ -14,7 +14,10 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
    without it), plays a `de_dust2` bot deathmatch and records demos in N-minute chunks into
    `demos/<kind>/<demo_id>.dem` with a JSON sidecar. A watchdog restarts crashed or hung runs. The setup commands
    come from `config/cs2/generate_*.cfg`; the chunks are driven over `-netconport` (`generate.chunking`):
-   - `gotv` (default): GOTV demos, which hold every bot. After the map has loaded generate sends `jointeam 1` (the local
+   - `gotv` (default): GOTV demos, which hold every bot. Generate verifies each step instead of sleeping: it polls
+     `status` until the map is up, retries `jointeam 1` until the server logs it, reads back the post-load cvars
+     (`generate_<profile>_post.cfg`; the map load resets `bot_difficulty` and `mp_*`), and drops the session within
+     `record_check_s` if the start command gets no success reply or the demo stays empty. After the map has loaded it sends `jointeam 1` (the local
      player spectates; it is lost if exec'd from the cfg), waits `team_settle_s`, sends `mp_restartgame 1` and waits
      `restart_wait_s` (`restart_after_join`; the tested recipe), then per chunk
      `sv_cheats 1; tv_record <demo_id>` and, after `chunk_min`, `tv_stoprecord`. The cfg enables GOTV *before* `map`

@@ -80,8 +80,8 @@ qa:
 segment:
   policy: longest_remaining         # bots; human sessions use fixed_player
   settle_ticks: 32                  # dropped after spawn and before death (camera transitions); recording starts at spawn + this
-  spec_delay_ticks: 4               # spec_player is sent at spawn + this (a dead target ignores it); must be < settle_ticks
                                     # also the gap between two segments (camera switch)
+  spec_delay_ticks: 4               # spec_player is sent at spawn + this (a dead target ignores it); must be < settle_ticks
   seed: 0                           # plan RNG seed (ties in the spectate policy); mixed with the demo id
   event_player_props: [user_id]     # player props requested with spawn/death events. Lives come from spawn events only, so the
                                     # SourceTV bot slot and the local spectator (which never spawn) are never spectated
@@ -116,7 +116,11 @@ generate:
   chunking: gotv
   netconport: 2121
   netcon_connect_timeout_s: 60      # the port opens in under 1 s plain, in 3-7 s via HLAE
-  map_load_wait_s: 10               # wait after the netcon port opens, before `jointeam 1`; `record` works ~6 s after `map`
+  map_load_timeout_s: 90            # poll `status` until the map shows and the local client is connected, at most this long
+  map_load_wait_s: 10               # extra wait once `status` shows the map, before `jointeam 1` (`record` works ~6 s after `map`)
+  jointeam_retries: 3               # extra `jointeam 1` attempts until the server logs the team change
+  record_check_s: 30                # fail the session if the demo has no data this long after the start command
+  verify_netcon_replies: true       # check the reply texts of `jointeam 1` and tv_record/record (from the #14 log); false: only check files
   team_settle_s: 5                  # wait after `jointeam 1` before the first chunk: joining a team after `tv_record` stalls the demo
   restart_after_join: true          # send `mp_restartgame 1` after `jointeam 1` (the #14 recipe that gave a full GOTV demo); skipped for the human profile
   restart_wait_s: 6                 # wait after `mp_restartgame 1` before the first chunk
@@ -128,8 +132,9 @@ generate:
 
 render:
   # mirv_tick = demo_tick + tick_offset (applied by segment when it writes the plan). The #14 muzzle-flash estimate is +7 ticks
-  # (frames show the state ~7 ticks after their nominal tick), PROVISIONAL: the value stays 0 until it is measured from
-  # camera rotation (#73).
+  # (a frame shows the state ~7 ticks before its nominal tick). Camera rotation on render2 gave +4.6 ticks (r 0.94, see
+  # docs/HLAE_NOTES.md), but the second kept render could not confirm it, so the value stays 0 until a second render agrees
+  # within 2 ticks (candidate: +5).
   tick_offset: 0
   timeout_factor: 3.0               # x demo length (demo_end_tick / tickrate)
   startup_s: 60                     # CS2 launch + demo load, added to the timeout (the demo plays ~13 s after launch)
