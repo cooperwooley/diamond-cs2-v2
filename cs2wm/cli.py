@@ -391,6 +391,7 @@ def _dispatch(args: argparse.Namespace) -> int:
 
         from cs2wm import demo
 
+        _cfg(args)  # applies demo.backend and the dump cache location
         print(json.dumps(demo.inspect(args.demo), indent=2))
     elif cmd == "label-check":
         from cs2wm.eval import label_accuracy

@@ -22,3 +22,23 @@ jobs:
         run: ruff format --check cs2wm tests scripts
       - name: Test
         run: pytest -q
+
+  demodump:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/demodump
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/demodump/go.mod
+          cache-dependency-path: tools/demodump/go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Build
+        run: go build ./...
+      - name: Build for Windows
+        run: GOOS=windows GOARCH=amd64 go build -o /dev/null .

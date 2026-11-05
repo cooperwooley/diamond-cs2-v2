@@ -59,3 +59,6 @@ report/main.pdf
 Thumbs.db
 .vscode/
 .idea/
+
+# Built by scripts/build_demodump.sh (#72)
+/bin/

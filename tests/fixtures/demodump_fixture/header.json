@@ -1,0 +1,14 @@
+{
+  "client_name": "SourceTV Demo",
+  "demo_file": "fixture.dem",
+  "demodump_version": "1",
+  "demoinfocs_version": "v6.0.0-rc.1",
+  "first_tick": 2000,
+  "last_tick": 2079,
+  "map_name": "de_dust2",
+  "n_players": 3,
+  "patch_version": 14196,
+  "server_name": "kpr",
+  "tick_rate": 64,
+  "truncated": false
+}

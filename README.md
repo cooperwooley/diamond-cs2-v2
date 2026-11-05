@@ -324,7 +324,8 @@ cs2wm/                  the package (`cs2wm` command)
   config.py             load and validate config/cs2wm.yaml
   actions.py            51-dim action spec, encode/decode, mouse bins
   timeline.py           frame/tick convention, EpisodeSpec
-  demo.py               demoparser2 wrapper
+  demo.py               demo parser adapter (demodump exporter, or demoparser2)
+  demodump.py           runs tools/demodump, caches its tables, serves them as a DemoParser
   cli.py                argument parsing and dispatch
   pipeline/             generate, segment, render, extract_actions, pack, sync, supervisor, qa_summary, ntfy
   eval/                 rotation, H1, H2 and smoke masks, upsampler check, carried v1 evals, label accuracy
