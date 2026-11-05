@@ -109,6 +109,8 @@ def _check_generate(gen: DictConfig, problems: list[str]) -> None:
         "map_load_wait_s",
         "team_settle_s",
         "restart_wait_s",
+        "map_load_timeout_s",
+        "record_check_s",
         "netcon_connect_timeout_s",
         "netconport",
     ):
@@ -123,10 +125,15 @@ def _check_generate(gen: DictConfig, problems: list[str]) -> None:
         problems.append(f"generate.netconport must be in [1024, 65535], got {nums['netconport']}")
     if {"close_stable_s", "close_timeout_s"} <= nums.keys() and nums["close_stable_s"] >= nums["close_timeout_s"]:
         problems.append("generate.close_stable_s must be < generate.close_timeout_s")
-    if not isinstance(gen.get("restart_after_join"), bool):
-        problems.append(f"generate.restart_after_join must be true or false, got {gen.get('restart_after_join')!r}")
+    for key in ("restart_after_join", "verify_netcon_replies"):
+        if not isinstance(gen.get(key), bool):
+            problems.append(f"generate.{key} must be true or false, got {gen.get(key)!r}")
+    retries = gen.get("jointeam_retries")
+    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        problems.append(f"generate.jointeam_retries must be an integer >= 0, got {retries!r}")
     startup_keys = {
         "netcon_connect_timeout_s",
+        "map_load_timeout_s",
         "map_load_wait_s",
         "team_settle_s",
         "restart_wait_s",
@@ -136,7 +143,7 @@ def _check_generate(gen: DictConfig, problems: list[str]) -> None:
         startup = sum(nums[k] for k in startup_keys - {"hang_timeout_min"})
         if startup >= nums["hang_timeout_min"] * 60:
             problems.append(
-                "generate startup waits (netcon_connect_timeout_s + map_load_wait_s + team_settle_s + restart_wait_s) must be < hang_timeout_min * 60 "
+                "generate startup waits (connect + map load + team settle + restart waits) must be < hang_timeout_min * 60 "
                 f"(the watchdog grace period starts at launch), got {startup} s"
             )
 

@@ -42,6 +42,7 @@ def _cfg(tmp_path: Path, *overrides: str) -> DictConfig:
             "generate.map_load_wait_s=10",
             "generate.team_settle_s=1",
             "generate.restart_wait_s=2",
+            "generate.map_load_timeout_s=30",
             "generate.netcon_connect_timeout_s=10",
             "generate.close_stable_s=2",
             "generate.close_timeout_s=10",
@@ -144,7 +145,7 @@ def test_render_cfg_inlines_exec_includes(tmp_path: Path) -> None:
     text = render_cfg("smoke", _cfg(tmp_path))
     assert "exec generate_dm" not in text
     assert "bot_quota 10" in text  # from generate_dm.cfg
-    assert "mp_ct_default_grenades weapon_smokegrenade" in text  # from generate_smoke.cfg
+    assert "bot_allow_grenades 1" in text  # from generate_smoke.cfg
     assert "\ntv_autorecord" not in text  # autorecord is never used
 
 
@@ -168,7 +169,15 @@ def test_cfg_leaves_jointeam_and_recording_to_netcon(tmp_path: Path, profile: st
 
 
 def test_cfgs_have_no_resolved_markers() -> None:
-    for name in ("generate_dm", "generate_human", "generate_smoke", "render_base"):
+    for name in (
+        "generate_dm",
+        "generate_human",
+        "generate_smoke",
+        "generate_dm_post",
+        "generate_human_post",
+        "generate_smoke_post",
+        "render_base",
+    ):
         text = (generate.cs2wm_config.DEFAULT_CONFIG_PATH.parent / "cs2" / f"{name}.cfg").read_text()
         assert "CONFIRM(#14)" not in text and "UNVERIFIED" not in text
         assert "SAFETY: HLAE and CS2 are only ever run offline with -insecure" in text
@@ -259,6 +268,14 @@ class FakeWorld:
     def __init__(self, csgo: Path) -> None:
         self.csgo = csgo
         self.commands: list[tuple[float, str]] = []  # (clock, netcon command), in the order received
+        self.queries: list[str] = []  # status polls and cvar read-backs (not part of the command sequence)
+        self.map_ready_after = 3.0  # seconds after a launch until `status` shows the map
+        self.jointeam_failures = 0  # `jointeam 1` replies without the ChangeTeam line before one works
+        self.record_reply_ok = True  # the start command prints the success text
+        self.record_writes = True  # the start command creates the demo file
+        self.cvars: dict[str, str] = {}  # cvars set over netcon
+        self.cvar_value = "2"  # what `bot_difficulty` reads back as
+        self.demo_secs: float | None = None  # length of a salvaged demo according to its ticks
         self.t = 0.0
         self.build = BUILD
         self.recording: Path | None = None
@@ -328,12 +345,36 @@ class FakeWorld:
             def send(self, cmd: str, retries=None) -> str:
                 if not world.alive():
                     raise ConnectionError("refused")
+                if cmd == "status":
+                    world.queries.append(cmd)
+                    if world.t - world.launch_t >= world.map_ready_after:
+                        return "map     : de_dust2 at: 0 x, 0 y, 0 z\nplayers : 1 humans, 9 bots (0 max)\n"
+                    return "map     : <empty>\nplayers : 0 humans, 0 bots (0 max)\n"
+                if " " not in cmd and cmd not in ("stop", "tv_stoprecord"):  # a cvar read-back
+                    world.queries.append(cmd)
+                    value = world.cvar_value if cmd == "bot_difficulty" else world.cvars.get(cmd, "")
+                    return f'"{cmd}" = "{value}" ( def. "1" )\n'
+                for part in cmd.split(";"):
+                    words = part.split()
+                    if len(words) == 2 and words[0] != "jointeam":
+                        world.cvars[words[0]] = words[1]
                 world.commands.append((world.t, cmd))
+                if cmd == "jointeam 1":
+                    if world.jointeam_failures > 0:
+                        world.jointeam_failures -= 1
+                        return ""
+                    return "ChangeTeam() CTMDBG , team 0, req team 1 willSwitch 0\r\n"
                 if cmd.startswith("sv_cheats 1; "):  # a chunk starts: `sv_cheats 1; record|tv_record <name>`
                     name = cmd.split()[-1]
-                    world.recording = world.csgo / f"{name}.dem"
-                    world.recording.touch()
-                elif cmd in ("stop", "tv_stoprecord"):
+                    if world.record_writes:
+                        world.recording = world.csgo / f"{name}.dem"
+                        world.recording.touch()
+                    if not world.record_reply_ok:
+                        return ""
+                    if "tv_record" in cmd:
+                        return f"Recording SourceTV replay from HLTVServerAsync:\r\nplaydemo {name}.dem\r\n"
+                    return f"CDemoRecorder::StartRecording({name}.dem)\r\n"
+                if cmd in ("stop", "tv_stoprecord"):
                     world.recording = None
                 return ""
 
@@ -355,6 +396,7 @@ class FakeWorld:
             netcon=Netcon,
             build_id=lambda _: world.build,
             parse_error=parse_error,
+            demo_seconds=lambda path: world.demo_secs,
             copy=copy,
             notify=lambda msg, **kw: world.notified.append({"message": msg, **kw}),
             git_sha=lambda: "deadbeef",
@@ -484,27 +526,140 @@ def test_patch_guard_passes_with_matching_build(tmp_path: Path) -> None:
 
 
 def _chunk_commands(world: FakeWorld) -> list[str]:
-    return [c for _, c in world.commands if c not in ("jointeam 1", "mp_restartgame 1")]
+    return [c for _, c in world.commands if c.startswith(("sv_cheats", "tv_stoprecord", "stop"))]
 
 
 def test_gotv_session_sequence(tmp_path: Path) -> None:
-    """launch -> port -> map -> `jointeam 1` -> settle -> per chunk `sv_cheats 1; tv_record`, `tv_stoprecord`."""
+    """launch -> port -> map -> `jointeam 1` -> cvars -> restart -> per chunk `sv_cheats 1; tv_record`, `tv_stoprecord`."""
     _, world, gen = _run(tmp_path, 0.09)
     kept = gen.run()
     assert len(kept) == 3
     assert "-netconport" in world.launches[0].cmd and "-insecure" in world.launches[0].cmd
-    names = [p.stem for p in kept]
     expected = []
-    for name in names:
+    for name in [p.stem for p in kept]:
         expected += [f"sv_cheats 1; tv_record {name}", "tv_stoprecord"]
-    assert [c for _, c in world.commands] == ["jointeam 1", "mp_restartgame 1", *expected]
-    (t_join, _), (t_restart, _), (t_first, _) = world.commands[:3]
-    assert t_join == 10  # after map_load_wait_s
-    assert t_restart == t_join + 1  # after team_settle_s
+    assert [c for _, c in world.commands] == ["jointeam 1", "bot_difficulty 2", "mp_restartgame 1", *expected]
+    (t_join, _), (t_cvars, _), (t_restart, _), (t_first, _) = world.commands[:4]
+    assert t_join >= 3 + 10  # `status` showed the map (3 s), then map_load_wait_s
+    assert t_cvars == t_restart == t_join + 1  # after team_settle_s, before the restart
     assert t_first == t_restart + 2  # after restart_wait_s: joining a team after tv_record stalls the demo
     sides = [json.loads(p.with_suffix(".json").read_text()) for p in kept]
     assert all(s["chunking"] == "gotv" and not s["truncated"] for s in sides)
     assert list(world.csgo.glob("*.dem")) == []  # GOTV demos land in game/csgo like client demos
+    assert "bot_difficulty" in world.queries  # read back
+
+
+def test_waits_for_the_map_instead_of_sleeping(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.04, "generate.hang_timeout_min=3", "generate.map_load_timeout_s=90", chunk_min=1)
+    world.map_ready_after = 40.0  # a slow load: far later than map_load_wait_s
+    gen.run()
+    assert world.commands[0] == (world.commands[0][0], "jointeam 1")
+    assert world.commands[0][0] >= 40 + 10
+    assert world.queries.count("status") > 5
+
+
+def test_map_that_never_loads_fails_the_session_and_relaunches(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path, 0.04, "generate.map_load_timeout_s=20", chunk_min=1)
+    world.map_ready_after = 1e9
+    with pytest.raises(GenerateError):
+        gen.run()
+    assert len(world.launches) == cfg.generate.max_failures
+    assert world.commands == []  # nothing was sent to a game without a map
+    assert world.t < 3 * 40  # each session gave up after ~map_load_timeout_s, not after the hang timeout
+
+
+def test_jointeam_is_retried_until_the_team_change_is_logged(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.04, chunk_min=1)
+    world.jointeam_failures = 2
+    gen.run()
+    cmds = [c for _, c in world.commands]
+    assert cmds[:3] == ["jointeam 1"] * 3
+    assert cmds[3] == "bot_difficulty 2" and len(world.launches) == 1
+
+
+def test_jointeam_that_never_works_fails_the_session(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.04, "generate.jointeam_retries=2", chunk_min=1)
+    world.jointeam_failures = 10_000
+    with pytest.raises(GenerateError):
+        gen.run()
+    first_session = [c for _, c in world.commands][: 2 + 1]
+    assert first_session == ["jointeam 1"] * 3  # the first attempt plus two retries
+    assert not any(c.startswith("sv_cheats") for _, c in world.commands)  # never recorded in the wrong state
+
+
+def test_tv_record_without_the_success_text_fails_fast(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path, 0.04, chunk_min=1)
+    world.record_reply_ok = False
+    with pytest.raises(GenerateError):
+        gen.run()
+    assert len(world.launches) == cfg.generate.max_failures
+    assert world.t < 3 * 60  # each session was dropped at once, far from the 5 minute hang timeout (60 s here)
+
+
+def test_tv_record_that_writes_nothing_fails_after_record_check_s(tmp_path: Path) -> None:
+    cfg, world, gen = _run(tmp_path, 0.04, "generate.record_check_s=10", chunk_min=1)
+    world.record_writes = False
+    with pytest.raises(GenerateError):
+        gen.run()
+    assert len(world.launches) == cfg.generate.max_failures
+    assert world.t < 3 * (4 + 10 + 1 + 1 + 2 + 10 + 5)  # launch..record_check_s per session, not the hang timeout
+
+
+def test_reply_checks_can_be_turned_off(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.04, "generate.verify_netcon_replies=false", chunk_min=1)
+    world.record_reply_ok = False  # the file is still written
+    world.jointeam_failures = 10_000
+    assert gen.run()
+
+
+def test_post_load_cvars_follow_jointeam_and_precede_the_restart(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.04, profile="smoke", chunk_min=1)
+    gen.run()
+    cmds = [c for _, c in world.commands]
+    assert cmds[0] == "jointeam 1" and cmds[2] == "mp_restartgame 1"
+    assert cmds[1].startswith("bot_difficulty 2; mp_ct_default_grenades weapon_smokegrenade")  # dm block + smoke block
+
+
+def test_long_post_load_block_is_split_into_short_lines(tmp_path: Path) -> None:
+    cfg_dir = tmp_path / "cs2"
+    cfg_dir.mkdir()
+    (cfg_dir / "generate_dm_post.cfg").write_text("\n".join(f"mp_cvar_{i:03d} {'v' * 20}" for i in range(40)) + "\n")
+    cmds = generate.post_load_commands("dm", cfg_dir)
+    assert len(cmds) == 40
+    from cs2wm.pipeline.netcon import MAX_LINE_CHARS, split_lines
+
+    lines = split_lines("; ".join(cmds))
+    assert len(lines) > 1 and all(len(line) <= MAX_LINE_CHARS for line in lines)
+
+
+def test_post_load_commands_expand_includes_and_drop_comments() -> None:
+    assert generate.post_load_commands("dm") == ["bot_difficulty 2"]
+    assert generate.post_load_commands("smoke")[0] == "bot_difficulty 2"
+    assert generate.post_load_commands("nope") == []
+
+
+def test_a_cvar_that_did_not_stick_is_warned_about(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    _, world, gen = _run(tmp_path, 0.04, chunk_min=1)
+    world.cvar_value = "1"  # the gamemode cfg won
+    with caplog.at_level(logging.WARNING):
+        gen.run()
+    assert "bot_difficulty did not stick" in caplog.text
+
+
+def test_salvaged_chunk_is_judged_by_the_ticks_it_holds(tmp_path: Path) -> None:
+    """A crashed chunk lost its last ~30 s to tv_delay: wall time says 100 s, the demo says 20 s (< min_chunk_s)."""
+    cfg, world, gen = _run(tmp_path, 0.1, "generate.max_failures=3")
+    world.crash_at = [17 + 120 + 100]  # 100 s into the second chunk
+    world.demo_secs = 20.0
+    kept = gen.run()
+    cut = [
+        json.loads(p.with_suffix(".json").read_text())
+        for p in kept
+        if 'truncated": true' in p.with_suffix(".json").read_text()
+    ]
+    assert len(cut) == 1 and cut[0]["duration_s"] == 20.0 and cut[0]["truncated"] is True
+    assert cfg.generate.min_chunk_s == 30  # so this chunk was kept but did not count as progress
+    assert gen.generated_s >= 20.0
 
 
 def test_stoprecord_comes_before_the_next_tv_record(tmp_path: Path) -> None:
@@ -521,7 +676,7 @@ def test_netcon_chunking_records_client_demos(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.09, "generate.chunking=netcon")
     kept = gen.run()
     expected = [c for p in kept for c in (f"sv_cheats 1; record {p.stem}", "stop")]
-    assert [c for _, c in world.commands] == ["jointeam 1", "mp_restartgame 1", *expected]
+    assert [c for _, c in world.commands] == ["jointeam 1", "bot_difficulty 2", "mp_restartgame 1", *expected]
     assert all(json.loads(p.with_suffix(".json").read_text())["chunking"] == "netcon" for p in kept)
 
 
@@ -529,7 +684,7 @@ def test_restart_after_join_can_be_turned_off(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.04, "generate.restart_after_join=false", chunk_min=1)
     gen.run()
     cmds = [c for _, c in world.commands]
-    assert cmds[0] == "jointeam 1" and cmds[1].startswith("sv_cheats 1; tv_record ")
+    assert cmds[:2] == ["jointeam 1", "bot_difficulty 2"] and cmds[2].startswith("sv_cheats 1; tv_record ")
     assert "mp_restartgame 1" not in cmds
 
 
@@ -537,15 +692,16 @@ def test_human_session_stays_on_a_team(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.04, profile="human", chunk_min=1)
     gen.run()
     assert not {"jointeam 1", "mp_restartgame 1"} & {c for _, c in world.commands}
-    assert world.commands[0][1].startswith("sv_cheats 1; tv_record human_")
+    assert world.commands[0][1] == "bot_difficulty 2"  # post-load cvars still apply
+    assert world.commands[1][1].startswith("sv_cheats 1; tv_record human_")
 
 
 def test_crash_during_the_team_settle_wait_restarts_without_a_chunk(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.09)
-    world.crash_at = [10.5]  # right after `jointeam 1`, before the first tv_record
+    world.crash_at = [14.5]  # right after `jointeam 1` (map seen at 4 s, +10 s), before the first tv_record
     kept = gen.run()
     assert len(world.launches) == 2 and len(kept) == 3
-    first_launch = [c for t, c in world.commands if t < 11]
+    first_launch = [c for t, c in world.commands if t < 15]
     assert first_launch == ["jointeam 1"]  # nothing was recorded by the dead session
 
 
