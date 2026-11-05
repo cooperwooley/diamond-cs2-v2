@@ -12,8 +12,19 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
 
 1. **generate** (#13, `cs2wm.pipeline.generate`). Launches offline CS2 with `-insecure` (the launcher refuses to start
    without it), plays a `de_dust2` bot deathmatch and records demos in N-minute chunks into
-   `demos/<kind>/<demo_id>.dem` with a JSON sidecar. A watchdog restarts crashed or hung runs. The console commands
-   come from `config/cs2/generate_*.cfg` (validated in #14).
+   `demos/<kind>/<demo_id>.dem` with a JSON sidecar. A watchdog restarts crashed or hung runs. The setup commands
+   come from `config/cs2/generate_*.cfg`; the chunks are driven over `-netconport` (`generate.chunking`):
+   - `gotv` (default): GOTV demos, which hold every bot. After the map has loaded generate sends `jointeam 1` (the local
+     player spectates; it is lost if exec'd from the cfg), waits `team_settle_s`, then per chunk
+     `sv_cheats 1; tv_record <demo_id>` and, after `chunk_min`, `tv_stoprecord`. The cfg enables GOTV *before* `map`
+     (`tv_enable 1; tv_transmitall 1; tv_record_immediate 1`).
+   - `netcon`: the local client's demo (`sv_cheats 1; record <demo_id>` / `stop`), which only holds what the
+     spectating client sees.
+
+   `tv_autorecord` is not used. Both commands write `game/csgo/<demo_id>.dem`. A closed chunk is published once its
+   size was stable for `close_stable_s`. A chunk cut short by a crash or hang is kept as a truncated chunk if the
+   parser can read it up to its end (`min_chunk_s` decides whether it counts as progress). Details and evidence:
+   [HLAE_NOTES.md](HLAE_NOTES.md).
 2. **segment** (#10, `cs2wm.pipeline.segment`). Turns `player_spawn`/`player_death` events into lives, picks whom to
    spectate (one in-eye point of view at a time, switching only at a death), and splits the view segments into
    episodes of at most 1000 frames. Writes `plans/<demo_id>/render_plan.json`.
@@ -83,7 +94,10 @@ Defined once, in `cs2wm.timeline`; no other module may re-derive it.
 - An event at tick `t` belongs to frame `ceil((t - T0) / 4) - 1`.
 - Labeling the last frame `n - 1` needs the state at `T_n`, so every episode renders one extra frame (`end_tick` is
   the tick of frame `n`).
-- `render.tick_offset` in the config corrects any measured render-to-demo offset (measured in #14).
+- `render.tick_offset` corrects the render-to-demo offset: the plan schedules `mirv_cmd` at
+  `mirv_tick = demo_tick + tick_offset`. The #14 muzzle-flash estimate is +7 ticks (provisional; the config value
+  stays 0 until it is measured, #73).
+- HLAE writes `n + 1` frames for a record span of `4n` ticks (start `T0`, end `T0 + 4n`), which is the extra frame above.
 
 Examples with `T0 = 0`: an event at tick 4 is in frame 0 (window `(0, 4]`); an event at tick 5 is in frame 1
 (window `(4, 8]`); an event at tick 0 would fall before frame 0 and belongs to no frame.

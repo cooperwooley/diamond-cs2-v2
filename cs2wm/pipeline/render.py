@@ -9,11 +9,14 @@ How it works:
 
 * The cfg is installed as ``<cs2_dir>/game/csgo/cfg/render_<demo_id>.cfg`` and run with ``+exec`` on the command line,
   next to ``+playdemo <demo>``. ``mirv_cmd addAtTick`` ticks are demo ticks, so the schedule only needs to be
-  registered before playback reaches them; it does not matter that the exec runs while the demo is still loading.
-  CONFIRM(#14): HLAE keeps the ``mirv_cmd`` schedule across the demo load. If #14 shows it is dropped, switch to an
-  ``exec`` over ``-netconport`` (``generate.NetconClient``) once the demo is loaded and paused.
+  registered before playback reaches them; it does not matter that the exec runs while the demo is still loading
+  (#14 confirmed that HLAE keeps the ``mirv_cmd`` schedule across the demo load).
 * HLAE writes one take per ``record start``: ``<raw>/<demo_id>/take0000/<stream>/00000.tga`` (TGA) or a video file
-  (FFmpeg output). Takes are mapped to segments in schedule order. CONFIRM(#14): the layout and file names.
+  (FFmpeg output). Takes are mapped to segments in schedule order. A segment from record start T0 to record end
+  T0 + 4n ticks has n + 1 frames (the frame at the end tick is captured), which is ``rendered_frames`` in the plan.
+* A take with 0 frames is a failure (retried, then the demo fails): with an FFmpeg preset and no ``ffmpeg.exe`` HLAE
+  writes nothing and CS2 still exits normally.
+* The paths handed to HLAE and the console (``paths.raw`` and the demo) must not contain spaces: that was not tested.
 * Every segment is downscaled into ``segNNN.tmp/`` and renamed to ``segNNN/`` only when complete, so a crash never
   leaves a half-written segment that looks finished. ``frames/<demo_id>/render.json`` is written last.
 * Frames are stored as PNG, not ``.npy``: a 150x280x3 frame is 126 kB raw but ~50-70 kB as PNG, so 1000-frame
@@ -21,7 +24,7 @@ How it works:
   is directly viewable by the label-check tool (#18). Compression level 1 is nearly as small as the default 3 at a
   fraction of the CPU time, which matters at >= 3x realtime.
 
-Everything marked ``CONFIRM(#14)`` is an assumption about HLAE/CS2 that the manual debug session must confirm.
+The HLAE and CS2 facts behind this module are in ``docs/HLAE_NOTES.md``.
 """
 
 from __future__ import annotations
@@ -65,8 +68,8 @@ class LaunchResult:
     """How one HLAE launch ended.
 
     Attributes:
-        returncode: Exit code of HLAE.exe (``None`` if it never exited, i.e. a timeout). CONFIRM(#14): HLAE may
-            exit with 0 while cs2.exe keeps running, and the code of ``quit`` is unknown, so it is informational.
+        returncode: Exit code of HLAE.exe (``None`` if it never exited, i.e. a timeout). HLAE exits with 0 after a
+            few seconds while cs2.exe keeps running, so it is informational.
         timed_out: The timeout elapsed and the process tree was killed.
     """
 
@@ -127,7 +130,8 @@ def console_quote(text: str) -> str:
     """Quote ``text`` as one CS2 console argument.
 
     Backslashes and spaces survive inside double quotes; a trailing backslash is dropped because it would sit
-    next to the closing quote. CONFIRM(#14): backslashes in quoted console arguments (the #14 step 4 form).
+    next to the closing quote. Backslashes in a quoted console argument work (#14); spaces were not tested, so
+    ``check_space_free`` keeps them out of the paths that get here.
 
     Args:
         text: A path or name.
@@ -141,6 +145,14 @@ def console_quote(text: str) -> str:
     if any(c in text for c in '";\r\n'):
         raise RenderError(f"cannot quote {text!r} for the CS2 console (quote, semicolon or newline)")
     return f'"{text.rstrip(chr(92))}"'
+
+
+def check_space_free(what: str, path: str | Path) -> None:
+    """Raise ``RenderError`` if ``path`` holds a space (paths with spaces were not tested with HLAE and ``playdemo``)."""
+    if " " in str(path):
+        raise RenderError(
+            f"{what} {str(path)!r} contains a space; render paths must be free of spaces (see HLAE_NOTES)"
+        )
 
 
 def raw_dir(cfg: DictConfig, demo_id: str) -> Path:
@@ -159,9 +171,12 @@ def _check_safe_name(what: str, value: str) -> None:
 
 
 def _spec_player_arg(target: Mapping, field_name: str, segment_idx: int) -> str:
-    """The ``spec_player`` argument for a target, per ``render.spec_player_field`` (CONFIRM(#14))."""
+    """The ``spec_player`` argument for a target, per ``render.spec_player_field``.
+
+    ``spec_player`` takes the controller entity id (``user_id + 1`` for bots; #14), so the default is ``entity_id``.
+    """
     if field_name == "slot":
-        raise RenderError("render.spec_player_field=slot is not supported: the plan has no slot (decide in #14)")
+        raise RenderError("render.spec_player_field=slot is not supported: the plan has no slot (use entity_id)")
     value = target.get(field_name)
     if value is None or value == "":
         raise RenderError(f"segment {segment_idx}: target {target.get('name')!r} has no {field_name}")
@@ -186,11 +201,12 @@ def build_render_cfg(plan: Mapping, cfg: DictConfig) -> str:
         The cfg file content.
 
     Raises:
-        RenderError: If the plan has nothing to render, the demo id or stream name is unusable, or a target lacks the field that
-            ``render.spec_player_field`` selects.
+        RenderError: If the plan has nothing to render, the demo id or stream name is unusable, ``paths.raw`` holds a
+            space, or a target lacks the field that ``render.spec_player_field`` selects.
     """
     demo_id = plan["demo_id"]
     _check_safe_name("demo id", demo_id)
+    check_space_free("paths.raw", cfg.paths.raw)
     _check_safe_name("render.stream_name", str(cfg.render.stream_name))
     schedule = plan["mirv_cmd_schedule"]
     if not schedule:
@@ -242,13 +258,13 @@ def install_cfg(text: str, demo_id: str, cs2_dir: str | Path) -> Path:
 
 
 def build_hlae_command(cfg: DictConfig, demo_path: Path, cfg_name: str) -> list[str]:
-    """Build the HLAE custom-loader argv (#14 step 1).
+    """Build the HLAE custom-loader argv (the working launch line of #14).
 
     ``HLAE.exe -customLoader -noGui -autoStart -hookDllPath <dll> -programPath <cs2.exe> -cmdLine "<cs2 args>"``
 
     Args:
         cfg: A validated cs2wm config.
-        demo_path: Demo to play back (absolute path; CONFIRM(#14): ``playdemo`` accepts one outside ``game/csgo``).
+        demo_path: Demo to play back (absolute, no spaces; ``playdemo`` accepts a path outside ``game/csgo``).
         cfg_name: Installed cfg name without extension, e.g. ``render_dm-0001``.
 
     Returns:
@@ -256,7 +272,9 @@ def build_hlae_command(cfg: DictConfig, demo_path: Path, cfg_name: str) -> list[
 
     Raises:
         ValueError: If ``-insecure`` is missing from the command line.
+        RenderError: If the demo path holds a space.
     """
+    check_space_free("demo path", Path(demo_path).absolute())
     height, width = (int(v) for v in cfg.resolution.capture)
     cs2_args = [
         *(str(o) for o in cfg.render.launch_options),
@@ -303,7 +321,7 @@ def launch_hlae(
 ) -> LaunchResult:
     """Launch CS2 through the HLAE custom loader and wait for HLAE and cs2.exe to exit.
 
-    CONFIRM(#14): HLAE.exe may exit while cs2.exe keeps running (or the other way round), so the wait ends when
+    HLAE.exe exits after a few seconds while cs2.exe keeps running (#14), so the wait ends when
     HLAE has exited AND no cs2.exe image is left (polled with ``tasklist``). On timeout the HLAE process tree is
     killed with ``taskkill /T /F`` and so is every ``cs2.exe`` image (the game may not be a child of HLAE).
 
@@ -390,8 +408,8 @@ def _image_files(directory: Path) -> list[Path]:
 def capture_source(take: Path, cfg: DictConfig) -> Path | None:
     """Where a take holds its frames: the stream directory (TGA) or the video file (FFmpeg).
 
-    CONFIRM(#14): ``<take>/<stream>/00000.tga`` for TGA; for FFmpeg a video file in ``<take>/<stream>/`` or named
-    ``<take>/<stream>.<ext>``. Lossless codecs are expected (``render.ffmpeg_preset``).
+    ``<take>/<stream>/00000.tga`` for TGA (confirmed in #14); for FFmpeg a video file in ``<take>/<stream>/`` or named
+    ``<take>/<stream>.<ext>`` (untested: there is no ``ffmpeg.exe`` on the render PC). Lossless codecs are expected (``render.ffmpeg_preset``).
 
     Args:
         take: A ``takeNNNN`` directory.
@@ -472,7 +490,7 @@ def verify_frame_counts(plan: Mapping, raw: Path, cfg: DictConfig) -> dict[int, 
     """Compare captured frame counts with the plan.
 
     The i-th take belongs to the i-th segment in schedule order. The expected count is the segment's
-    ``rendered_frames`` (``labeled_frames + 1``). CONFIRM(#14): the frame at ``record_end_tick`` is captured.
+    ``rendered_frames`` (``labeled_frames + 1``): the frame at ``record_end_tick`` is captured (n + 1 frames, #14).
 
     Args:
         plan: Parsed ``render_plan.json``.
@@ -604,13 +622,24 @@ def _attempt(
 
     counts = verify_frame_counts(plan, raw, cfg)
     n_takes = len(list_takes(raw))
+    code = "" if launched.returncode in (0, None) else f" (HLAE exit code {launched.returncode})"
+    empty = sorted(i for i, (_, a) in counts.items() if a == 0)
+    if empty:
+        hint = (
+            f"; is {cfg.paths.hlae_dir}/ffmpeg/ffmpeg.exe missing? HLAE then writes nothing and CS2 still exits normally"
+            if cfg.render.output_format == "ffmpeg"
+            else "; HLAE wrote nothing (was the demo played, did the schedule run?)"
+        )
+        return f"0 frames captured for segment(s) {empty}{hint}{code}", {}
     problems = [f"segment {i}: expected {e}, got {a} frames" for i, (e, a) in counts.items() if e != a]
     if n_takes != len(counts):
         problems.append(f"{n_takes} takes captured for {len(counts)} segments")
     if counts and all(a == e - 1 for e, a in counts.values()) and n_takes == len(counts):
-        return "every segment is exactly one frame short (end tick not captured? see CONFIRM(#14))", {}
+        return (
+            "every segment is exactly one frame short (the frame at the end tick should be captured: n + 1 frames)",
+            {},
+        )
     if problems:
-        code = "" if launched.returncode in (0, None) else f" (HLAE exit code {launched.returncode})"
         return "frame-count mismatch" + code + ": " + "; ".join(problems), {}
 
     frames: dict[int, int] = {}
@@ -655,6 +684,14 @@ def run(
     result = RenderResult(demo_id=demo_id, ok=False, out_dir=out_dir)
     t0 = hooks.clock()
     shutil.rmtree(out_dir.with_name(out_dir.name + ".deleting"), ignore_errors=True)  # a pack that died mid-cleanup
+
+    try:
+        check_space_free("paths.raw", cfg.paths.raw)
+        check_space_free("demo path", demo_path.absolute())
+    except RenderError as exc:
+        result.reason = str(exc)
+        log.error("%s: %s", demo_id, result.reason)
+        return result
 
     plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
     try:

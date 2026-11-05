@@ -35,8 +35,8 @@ is ``demo tick + tick_offset`` and is the tick to pass to ``mirv_cmd addAtTick``
       "segments": [{
         "segment_idx": 0,
         "target": {"name": "Bot A", "user_id": 3, "steamid": 0, "entity_id": 7 | null},
-                                              # entity_id: the player's tick-table value at/after spawn (CONFIRM(#14));
-                                              # null if the demo gives none; the likely spec_player argument
+                                              # entity_id: the controller entity id (user_id + 1 for bots) from the tick
+                                              # table at/after spawn; null if the demo gives none; the spec_player argument
         "life": {"spawn_tick": 1000, "death_tick": 9000},
         "record_start_tick": 1032,            # T0 of the first episode (frame 0)
         "record_end_tick": 5032,              # tick of the extra frame of the last episode
@@ -59,7 +59,8 @@ is ``demo tick + tick_offset`` and is the tick to pass to ``mirv_cmd addAtTick``
     }
 
 ``render_plan.json`` is enough to write the HLAE cfg and to rebuild the ``EpisodeSpec`` list (``episodes_from_plan``)
-without parsing the demo again. Whether the frame at ``record_end_tick`` is captured is measured in #14.
+without parsing the demo again. The frame at ``record_end_tick`` is captured (n + 1 frames per n labeled ones, #14); the schedule applies
+``render.tick_offset`` as ``mirv_tick = demo_tick + tick_offset``.
 """
 
 from __future__ import annotations
@@ -102,7 +103,8 @@ class Life:
         steamid: Steamid (may be 0 or small for bots).
         spawn_tick: Tick of the spawn.
         death_tick: Tick of the death, or the demo end if still alive.
-        entity_id: Entity/slot id of the player when the demo provides it (CONFIRM(#14)), else None.
+        entity_id: The controller entity id (``spec_player`` argument, ``user_id + 1`` for bots) when the demo provides
+            it, else None.
     """
 
     player_name: str
@@ -618,7 +620,7 @@ def run(demo_path: Path, cfg: DictConfig, policy: str | None = None, player: str
     except KeyError:
         log.warning("player_disconnect has no user_id column; disconnects are not used to close lives")
         disconnects = None
-    # One tick-table parse gives the demo end and the targets' entity ids (CONFIRM(#14): entity_id as a tick prop).
+    # One tick-table parse gives the demo end and the targets' entity ids (``entity_id`` is the controller entity id, which the demo parser must expose as such).
     try:
         ticks = demo.load_ticks(demo_path, [demo.TICK_ENTITY_ID])
     except Exception:
