@@ -1,8 +1,11 @@
-"""Thin wrapper around demoparser2 (#11). The only module that imports it, so other code stays unit-testable.
+"""Demo parsing adapter (#11, #72). The only module that picks a parser, so other code stays unit-testable.
 
 Everything that touches the parser goes through ``_make_parser``; tests monkeypatch it with a fake that has the same
 methods as ``demoparser2.DemoParser`` 0.42 (``parse_header``, ``parse_ticks``, ``list_game_events``,
 ``parse_events``, ``parse_grenades``). No real ``.dem`` file is needed to test the callers.
+
+Two backends (config ``demo.backend``): ``demoinfocs`` (default) runs the Go exporter ``tools/demodump`` through
+``cs2wm.demodump``, because demoparser2 cannot read current CS2 demos (#72); ``demoparser2`` is kept for comparison.
 
 Names marked ``CONFIRM(#14)`` are demoparser2 column or field names that are assumed from the 0.42 API and the step 3
 script of #14, not yet seen on a real CS2 demo. The #14 session must confirm or correct them.
@@ -12,13 +15,17 @@ from __future__ import annotations
 
 import importlib.metadata
 import logging
+import os
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from cs2wm import demodump
 
 log = logging.getLogger(__name__)
 
@@ -55,23 +62,56 @@ _APPMANIFEST = "appmanifest_730.acf"
 _INSPECT_EVENTS = ("player_spawn", "player_death", "weapon_fire")
 
 
+BACKENDS = ("demoinfocs", "demoparser2")
+
+
+@dataclass
+class _Settings:
+    backend: str = "demoinfocs"
+    demodump: str | None = None
+    cache_dir: Path | None = None
+
+
+_settings = _Settings()
+
+
+def configure(cfg: Any) -> None:
+    """Apply the ``demo`` section of a cs2wm config (called by ``load_config``).
+
+    Args:
+        cfg: A validated config with ``demo.backend``, ``demo.demodump`` and ``demo.cache_dir``.
+    """
+    _settings.backend = str(cfg.demo.backend)
+    _settings.demodump = None if cfg.demo.demodump is None else str(cfg.demo.demodump)
+    _settings.cache_dir = Path(str(cfg.demo.cache_dir))
+
+
+def _cache_dir() -> Path:
+    # The same default as the config (paths.root/demo_cache) for code that never loaded one.
+    return _settings.cache_dir or Path(os.environ.get("DCS2_ROOT", "./dcs2-data")) / "demo_cache"
+
+
 def _make_parser(demo_path: str | Path) -> Any:
-    """Create a ``demoparser2.DemoParser``; tests replace this with a fake.
+    """Create the configured parser for a demo; tests replace this with a fake.
 
     Args:
         demo_path: Path to a ``.dem`` file.
 
     Returns:
-        The parser object.
+        A ``demodump.DemodumpParser`` or a ``demoparser2.DemoParser``; both serve the same methods and columns.
     """
-    from demoparser2 import DemoParser
+    if _settings.backend == "demoparser2":
+        from demoparser2 import DemoParser
 
-    return DemoParser(str(demo_path))
+        return DemoParser(str(demo_path))
+    return demodump.DemodumpParser(demo_path, _cache_dir(), _settings.demodump)
 
 
 def parser_version() -> str:
-    """Return the installed demoparser2 version (stored in HDF5 attrs)."""
-    return importlib.metadata.version("demoparser2")
+    """Return the parser version (stored in HDF5 attrs and the render plan)."""
+    if _settings.backend == "demoparser2":
+        return importlib.metadata.version("demoparser2")
+    return f"demodump {demodump.DEMODUMP_FORMAT} (demoinfocs {demodump.DEMOINFOCS_VERSION})"
 
 
 def header(demo_path: str | Path) -> dict[str, str]:

@@ -1,0 +1,4 @@
+user_id,entity_id,pawn_entity_id,name,steamid,is_bot,team,first_tick,last_tick
+3,4,339,Wesley,0,True,2,0,11901
+4,5,330,Dashen,0,True,3,0,11901
+5,6,332,Waldo,0,True,2,0,11901

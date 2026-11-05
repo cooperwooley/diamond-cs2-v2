@@ -33,6 +33,8 @@ def load_config(path: str | Path | None = None, overrides: Sequence[str] = ()) -
         path: YAML file to load; defaults to ``DEFAULT_CONFIG_PATH``.
         overrides: OmegaConf dotlist overrides such as ``"timing.fps=8"``.
 
+    Also applies the ``demo`` section (parser backend, exporter binary, dump cache) to ``cs2wm.demo``.
+
     Returns:
         A resolved, read-only config.
 
@@ -44,6 +46,9 @@ def load_config(path: str | Path | None = None, overrides: Sequence[str] = ()) -
     OmegaConf.resolve(cfg)
     validate_config(cfg)
     OmegaConf.set_readonly(cfg, True)
+    from cs2wm import demo  # deferred: it imports pandas, which config consumers that never parse demos skip
+
+    demo.configure(cfg)
     return cfg
 
 
@@ -201,6 +206,9 @@ def validate_config(cfg: DictConfig) -> None:
 
     if cfg.qa.max_fill_ticks < 0:
         problems.append(f"qa.max_fill_ticks must be >= 0, got {cfg.qa.max_fill_ticks}")
+
+    if cfg.demo.backend not in ("demoinfocs", "demoparser2"):
+        problems.append(f"demo.backend must be demoinfocs or demoparser2, got {cfg.demo.backend!r}")
 
     _validate_render(cfg, problems)
     _validate_supervisor(cfg.supervisor, problems)

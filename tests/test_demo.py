@@ -62,8 +62,13 @@ def tick_table() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_parser_version_is_installed_version() -> None:
+def test_parser_version_is_installed_version_for_demoparser2(monkeypatch) -> None:
+    monkeypatch.setattr(demo, "_settings", demo._Settings(backend="demoparser2"))
     assert demo.parser_version().split(".")[0].isdigit()
+
+
+def test_parser_version_names_the_exporter_and_demoinfocs() -> None:
+    assert demo.parser_version() == "demodump 1 (demoinfocs v6.0.0-rc.1)"
 
 
 def test_header_values_are_strings(use_parser) -> None:

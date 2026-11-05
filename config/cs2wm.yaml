@@ -84,6 +84,11 @@ segment:
   seed: 0                           # plan RNG seed (ties in the spectate policy); mixed with the demo id
   event_player_props: [user_id]     # player props requested with spawn/death events; add entity_id once #14 confirms it
 
+demo:
+  backend: demoinfocs               # demoinfocs (Go exporter tools/demodump, #72) | demoparser2 (kept for comparison)
+  demodump: null                    # exporter binary; env DCS2_DEMODUMP wins, then this, then bin/demodump[.exe], then PATH
+  cache_dir: ${paths.root}/demo_cache  # one dump per demo, keyed by path, size and mtime; safe to delete
+
 pack:
   schema_version: 1
   fullres_mod: 10                   # episode in full-res subset iff int(sha1(id)[:8], 16) % fullres_mod == 0
