@@ -7,8 +7,8 @@ methods as ``demoparser2.DemoParser`` 0.42 (``parse_header``, ``parse_ticks``, `
 Two backends (config ``demo.backend``): ``demoinfocs`` (default) runs the Go exporter ``tools/demodump`` through
 ``cs2wm.demodump``, because demoparser2 cannot read current CS2 demos (#72); ``demoparser2`` is kept for comparison.
 
-Names marked ``CONFIRM(#14)`` are demoparser2 column or field names that are assumed from the 0.42 API and the step 3
-script of #14, not yet seen on a real CS2 demo. The #14 session must confirm or correct them.
+The column names below were confirmed on a real DM GOTV demo with the demoinfocs backend (#14, #72/#74). The smoke
+event fields are still unconfirmed (that demo has no grenades) and are marked ``CONFIRM(#14)``.
 """
 
 from __future__ import annotations
@@ -28,20 +28,18 @@ from cs2wm import demodump
 
 log = logging.getLogger(__name__)
 
-# CONFIRM(#14): per-tick table columns. ``user_id`` is a requested prop (step 3 of #14); ``name`` and ``steamid`` are
-# always returned by parse_ticks.
+# Per-tick table columns. ``name`` and ``steamid`` are always returned by parse_ticks.
 TICK_USER_ID = "user_id"
-# CONFIRM(#14): the entity id of the player pawn/controller; requested in step 3 of #14. It is what ``spec_player`` is
-# expected to take (or the user_id; #14 step 4 decides).
+# The player CONTROLLER entity id (``user_id + 1`` for bots). It is what ``spec_player`` takes (#14).
 TICK_ENTITY_ID = "entity_id"
-# CONFIRM(#14): event-table columns. A player prop ``P`` requested for the ``user`` role of an event arrives as
-# ``user_P`` (``user_name`` and ``user_steamid`` always). Candidates are tried in order; the first present wins.
+# Event-table columns. A player prop ``P`` requested for the ``user`` role of an event arrives as ``user_P``
+# (``user_name`` and ``user_steamid`` always). Candidates are tried in order; the first present wins.
 EVENT_USER_ID_COLUMNS = ("user_user_id", "user_userid", "userid", "user_id")
 EVENT_NAME_COLUMNS = ("user_name", "name")
 EVENT_STEAMID_COLUMNS = ("user_steamid", "steamid", "networkid")
 EVENT_ENTITY_ID_COLUMNS = ("user_entity_id",)
-# CONFIRM(#14): parse_grenades() columns. ``grenade_entity_id`` identifies one trajectory; without it throws are
-# split where a thrower's trajectory has a gap of more than ``_THROW_GAP_TICKS``.
+# parse_grenades() columns. ``grenade_entity_id`` identifies one trajectory (the demodump backend has it); without it
+# throws are split where a thrower's trajectory has a gap of more than ``_THROW_GAP_TICKS``.
 GRENADE_ENTITY_COLUMN = "grenade_entity_id"
 _THROW_GAP_TICKS = 64  # one second; a thrower cannot throw the same grenade type twice that fast
 
@@ -123,7 +121,7 @@ def header(demo_path: str | Path) -> dict[str, str]:
     Returns:
         Header fields as strings.
     """
-    # CONFIRM(#14): which header keys carry the map and the CS2 version (map_name, demo_version_name, client_name?).
+    # The demoinfocs backend gives map_name, patch_version, tick_rate, first_tick, last_tick and truncated.
     return {str(k): str(v) for k, v in _make_parser(demo_path).parse_header().items()}
 
 
@@ -173,7 +171,7 @@ def load_events(
         Mapping from event name to its table (empty frame when the demo has none).
     """
     parser = _make_parser(demo_path)
-    # CONFIRM(#14): list_game_events() lists only the events present in the demo (asking for an absent one may raise).
+    # list_game_events() lists only the events present in the demo, so absent ones are not requested.
     present = set(parser.list_game_events())
     out = {name: pd.DataFrame() for name in names}
     wanted = [n for n in dict.fromkeys(names) if n in present]
