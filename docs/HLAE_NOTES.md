@@ -73,9 +73,9 @@ Netcon sequence per session (`generate.chunking: gotv`, the default). Each step 
    wait `team_settle_s` (5).
 4. The post-load cvars (`config/cs2/generate_<profile>_post.cfg`, e.g. `bot_difficulty 2`) are sent over netcon, in
    lines of at most 400 characters, and single-value cvars are read back; a mismatch logs a warning.
-5. `mp_restartgame 1` (`generate.restart_after_join`, default on), then wait `restart_wait_s` (6). This is the tested
-   recipe.
-6. Per chunk: `sv_cheats 1; tv_record <name>`; after `chunk_min`: `tv_stoprecord`; then the next chunk's `tv_record`.
+5. Per chunk: `mp_restartgame 1` (`generate.restart_after_join`, default on) while NOT recording, then wait
+   `restart_wait_s` (6; not counted in the chunk's length). This is the tested recipe.
+6. Then `sv_cheats 1; tv_record <name>`; after `chunk_min`: `tv_stoprecord`; then the next chunk starts at 5.
 7. A chunk is closed once its file size is stable for `close_stable_s` (5; it was final within 2 s). Kill and
    relaunch on exit or when no demo grew for `hang_timeout_min`.
 
@@ -113,6 +113,12 @@ neither ever becomes a target.
 and game restart) *after* `tv_record` had started. The recipe that gave a full 194 s demo (11.3 MB, ~57 KB/s, no
 stall): `jointeam 1` as soon as the player is in game, wait ~5 s, send the cvars and `mp_restartgame 1`, wait ~6 s,
 and only then `tv_record`. The pipeline follows this order; the bot cvars come from the cfg and are not re-sent.
+
+**Round end stalls the next chunk (#79, night 1).** The DM round lasts `mp_roundtime 10` minutes, equal to the chunk
+length. Chunk 1's demo has `cs_win_panel_match` at tick 38146 of 38398, so the match ended ~4 s before the stop.
+Chunk 2 then recorded ~12 s of scoreboard (last tick 812) until the server changed level, which ends the GOTV
+recording; the file stopped growing and the hang watchdog relaunched CS2. Hence `mp_roundtime 60` in the post-load cfg
+(read back; a warning says if it was clamped) and `mp_restartgame 1` before every chunk, not only the first.
 
 After a **second `map`** over netcon the player stayed Unassigned on the team-select screen and the client demo was
 never written; relaunch CS2 instead of reloading the map.

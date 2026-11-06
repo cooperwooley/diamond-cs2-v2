@@ -122,8 +122,8 @@ generate:
   record_check_s: 30                # fail the session if the demo has no data this long after the start command
   verify_netcon_replies: true       # check the reply texts of `jointeam 1` and tv_record/record (from the #14 log); false: only check files
   team_settle_s: 5                  # wait after `jointeam 1` before the first chunk: joining a team after `tv_record` stalls the demo
-  restart_after_join: true          # send `mp_restartgame 1` after `jointeam 1` (the #14 recipe that gave a full GOTV demo); skipped for the human profile
-  restart_wait_s: 6                 # wait after `mp_restartgame 1` before the first chunk
+  restart_after_join: true          # send `mp_restartgame 1` before every chunk, never while recording (the #14 recipe that gave a full GOTV demo, #79); skipped for the human profile
+  restart_wait_s: 6                 # wait after `mp_restartgame 1` before each chunk (not counted in the chunk's length)
   poll_s: 5                         # watchdog polling interval
   close_stable_s: 5                 # a demo is closed once its size has not changed for this long (the size is final within 2 s)
   close_timeout_s: 60               # give up waiting for a demo to close after this long

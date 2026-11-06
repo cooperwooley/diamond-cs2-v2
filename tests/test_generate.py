@@ -31,6 +31,7 @@ from cs2wm.pipeline.generate import (
 
 BUILD = 20260101
 T0 = datetime(2026, 10, 23, 22, 0, 0)
+POST_LOAD = "bot_difficulty 2; mp_roundtime 60"  # config/cs2/generate_dm_post.cfg, sent as one line
 
 
 def _cfg(tmp_path: Path, *overrides: str) -> DictConfig:
@@ -530,15 +531,15 @@ def _chunk_commands(world: FakeWorld) -> list[str]:
 
 
 def test_gotv_session_sequence(tmp_path: Path) -> None:
-    """launch -> port -> map -> `jointeam 1` -> cvars -> restart -> per chunk `sv_cheats 1; tv_record`, `tv_stoprecord`."""
+    """launch -> port -> map -> `jointeam 1` -> cvars -> per chunk `mp_restartgame 1`, `sv_cheats 1; tv_record`, stop."""
     _, world, gen = _run(tmp_path, 0.09)
     kept = gen.run()
     assert len(kept) == 3
     assert "-netconport" in world.launches[0].cmd and "-insecure" in world.launches[0].cmd
     expected = []
     for name in [p.stem for p in kept]:
-        expected += [f"sv_cheats 1; tv_record {name}", "tv_stoprecord"]
-    assert [c for _, c in world.commands] == ["jointeam 1", "bot_difficulty 2", "mp_restartgame 1", *expected]
+        expected += ["mp_restartgame 1", f"sv_cheats 1; tv_record {name}", "tv_stoprecord"]
+    assert [c for _, c in world.commands] == ["jointeam 1", POST_LOAD, *expected]
     (t_join, _), (t_cvars, _), (t_restart, _), (t_first, _) = world.commands[:4]
     assert t_join >= 3 + 10  # `status` showed the map (3 s), then map_load_wait_s
     assert t_cvars == t_restart == t_join + 1  # after team_settle_s, before the restart
@@ -547,6 +548,45 @@ def test_gotv_session_sequence(tmp_path: Path) -> None:
     assert all(s["chunking"] == "gotv" and not s["truncated"] for s in sides)
     assert list(world.csgo.glob("*.dem")) == []  # GOTV demos land in game/csgo like client demos
     assert "bot_difficulty" in world.queries  # read back
+
+
+def test_every_chunk_is_preceded_by_a_restart_after_the_previous_stop(tmp_path: Path) -> None:
+    """#79: the 10-minute DM round must not end inside a chunk, so the game restarts while not recording."""
+    _, world, gen = _run(tmp_path, 0.09)
+    kept = gen.run()
+    chunk_cmds = [c for _, c in world.commands if c.startswith(("mp_restartgame", "sv_cheats", "tv_stoprecord"))]
+    assert len(kept) == 3
+    assert chunk_cmds[0::3] == ["mp_restartgame 1"] * 3
+    assert all(c.startswith("sv_cheats 1; tv_record ") for c in chunk_cmds[1::3])
+    assert chunk_cmds[2::3] == ["tv_stoprecord"] * 3
+    times = {}
+    for t, c in world.commands:
+        times.setdefault(c.split(";")[-1].strip().split()[0], []).append(t)
+    restarts, records, stops = times["mp_restartgame"], times["tv_record"], times["tv_stoprecord"]
+    assert all(r > s for r, s in zip(restarts[1:], stops, strict=False))  # after the previous stop
+    assert all(rec == r + 2 for r, rec in zip(restarts, records, strict=True))  # restart_wait_s apart
+
+
+def test_the_restart_wait_is_not_part_of_a_chunks_length(tmp_path: Path) -> None:
+    _, _world, gen = _run(tmp_path, 0.09, "generate.restart_wait_s=20", "generate.hang_timeout_min=3")
+    kept = gen.run()
+    for p in kept[:2]:  # the last chunk is the remainder of the target
+        assert 119 <= json.loads(p.with_suffix(".json").read_text())["duration_s"] <= 125
+
+
+def test_crash_during_a_between_chunk_restart_has_nothing_to_salvage(tmp_path: Path) -> None:
+    _, world, gen = _run(tmp_path, 0.09, "generate.restart_wait_s=20", "generate.hang_timeout_min=3")
+    # first chunk: restart at ~14 s, record at ~34 s, stop at ~154 s; the next restart wait runs from ~160 s
+    world.crash_at = [170.0]
+    kept = gen.run()
+    assert len(world.launches) == 2 and len(kept) == 3
+    first_launch = [c for t, c in world.commands if t < 171]
+    assert first_launch[-2:] == ["tv_stoprecord", "mp_restartgame 1"]  # died right after the restart, not recording
+    assert len(first_launch) == first_launch.index("tv_stoprecord") + 2
+    assert not any(
+        "truncated" in p.with_suffix(".json").read_text() and '"truncated": true' in p.with_suffix(".json").read_text()
+        for p in kept
+    )
 
 
 def test_waits_for_the_map_instead_of_sleeping(tmp_path: Path) -> None:
@@ -574,7 +614,7 @@ def test_jointeam_is_retried_until_the_team_change_is_logged(tmp_path: Path) -> 
     gen.run()
     cmds = [c for _, c in world.commands]
     assert cmds[:3] == ["jointeam 1"] * 3
-    assert cmds[3] == "bot_difficulty 2" and len(world.launches) == 1
+    assert cmds[3] == POST_LOAD and len(world.launches) == 1
 
 
 def test_jointeam_that_never_works_fails_the_session(tmp_path: Path) -> None:
@@ -617,7 +657,9 @@ def test_post_load_cvars_follow_jointeam_and_precede_the_restart(tmp_path: Path)
     gen.run()
     cmds = [c for _, c in world.commands]
     assert cmds[0] == "jointeam 1" and cmds[2] == "mp_restartgame 1"
-    assert cmds[1].startswith("bot_difficulty 2; mp_ct_default_grenades weapon_smokegrenade")  # dm block + smoke block
+    assert cmds[1].startswith(
+        "bot_difficulty 2; mp_roundtime 60; mp_ct_default_grenades weapon_smokegrenade"
+    )  # dm block + smoke block
 
 
 def test_long_post_load_block_is_split_into_short_lines(tmp_path: Path) -> None:
@@ -633,7 +675,7 @@ def test_long_post_load_block_is_split_into_short_lines(tmp_path: Path) -> None:
 
 
 def test_post_load_commands_expand_includes_and_drop_comments() -> None:
-    assert generate.post_load_commands("dm") == ["bot_difficulty 2"]
+    assert generate.post_load_commands("dm") == ["bot_difficulty 2", "mp_roundtime 60"]
     assert generate.post_load_commands("smoke")[0] == "bot_difficulty 2"
     assert generate.post_load_commands("nope") == []
 
@@ -675,8 +717,8 @@ def test_stoprecord_comes_before_the_next_tv_record(tmp_path: Path) -> None:
 def test_netcon_chunking_records_client_demos(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.09, "generate.chunking=netcon")
     kept = gen.run()
-    expected = [c for p in kept for c in (f"sv_cheats 1; record {p.stem}", "stop")]
-    assert [c for _, c in world.commands] == ["jointeam 1", "bot_difficulty 2", "mp_restartgame 1", *expected]
+    expected = [c for p in kept for c in ("mp_restartgame 1", f"sv_cheats 1; record {p.stem}", "stop")]
+    assert [c for _, c in world.commands] == ["jointeam 1", POST_LOAD, *expected]
     assert all(json.loads(p.with_suffix(".json").read_text())["chunking"] == "netcon" for p in kept)
 
 
@@ -684,7 +726,7 @@ def test_restart_after_join_can_be_turned_off(tmp_path: Path) -> None:
     _, world, gen = _run(tmp_path, 0.04, "generate.restart_after_join=false", chunk_min=1)
     gen.run()
     cmds = [c for _, c in world.commands]
-    assert cmds[:2] == ["jointeam 1", "bot_difficulty 2"] and cmds[2].startswith("sv_cheats 1; tv_record ")
+    assert cmds[:2] == ["jointeam 1", POST_LOAD] and cmds[2].startswith("sv_cheats 1; tv_record ")
     assert "mp_restartgame 1" not in cmds
 
 
