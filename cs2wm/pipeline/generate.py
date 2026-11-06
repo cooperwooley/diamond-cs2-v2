@@ -13,7 +13,8 @@ How it works:
   goes into every sidecar.
 * Both chunking modes are driven over ``-netconport``. After the map has loaded the local player joins the spectators
   (``jointeam 1``, lost if sent from the cfg because the client is not connected yet), optionally followed by
-  ``mp_restartgame 1`` (``generate.restart_after_join``); then, every chunk, ``gotv``
+  ``mp_restartgame 1`` (``generate.restart_after_join``, repeated before EVERY chunk, never while recording: the
+  10-minute DM round would otherwise end inside a chunk and the level change ends the GOTV recording, #79); every chunk, ``gotv``
   (default) sends ``sv_cheats 1; tv_record <demo_id>`` / ``tv_stoprecord`` and ``netcon`` sends
   ``sv_cheats 1; record <demo_id>`` / ``stop``. ``tv_autorecord`` is not used: it writes ``replays/auto-*.dem`` with
   uncontrolled names. Both ``record`` and ``tv_record`` write ``game/csgo/<demo_id>.dem``.
@@ -928,12 +929,14 @@ class Generator:
                 # Joining a team after `tv_record` started stalled the GOTV demo, so spectate first and let it settle.
                 self._join_spectators(client, proc)
             self._send_post_load(client)
-            if spectate and self.g.restart_after_join:  # the recipe that gave a full GOTV demo (#14)
-                client.send("mp_restartgame 1")
-                if self._watch(proc, float(self.g.restart_wait_s)) != "running":
-                    raise ConnectionError("CS2 died while restarting the game")
             while self.generated_s < self.target_s and self._publish_failures < self.g.max_failures:
                 self._guard()
+                if spectate and self.g.restart_after_join:
+                    # The recipe that gave a full GOTV demo (#14), before every chunk and never while recording: a round
+                    # that ends inside a chunk changes level and ends the GOTV recording (#79).
+                    client.send("mp_restartgame 1")
+                    if self._watch(proc, float(self.g.restart_wait_s)) != "running":
+                        raise ConnectionError("CS2 died while restarting the game")
                 demo_id = make_demo_id(self.profile, self.started, self._index)
                 self._index += 1
                 started, t0 = self.h.wall(), self.h.clock()
