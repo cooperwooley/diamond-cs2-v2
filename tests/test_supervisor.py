@@ -20,7 +20,7 @@ import pytest
 import requests
 from omegaconf import DictConfig, OmegaConf
 
-from cs2wm import cli
+from cs2wm import cli, demodump
 from cs2wm.config import ConfigError, load_config
 from cs2wm.pipeline import ntfy, render, segment
 from cs2wm.pipeline.generate import GenerateError, PatchGuardError
@@ -71,6 +71,7 @@ class World:
         self.sync_failures = 0
         self.smoke_result: str | None = None
         self.smoke_calls = 0
+        self.preflight_error: Exception | None = None
         self.synced_working_gb = 0.0  # working set freed per synced demo
         self.render_working_gb = 0.0  # working set added per rendered demo
         self.free_on_sync: float | None = None  # free GB after the first successful sync
@@ -157,6 +158,7 @@ class World:
             notify=self.notify,
             disk=self.disk,
             build_id=lambda cs2_dir: self.build,
+            preflight=self.preflight,
             generate=self.generate,
             sync=lambda: self.sync(sup_ref[0]),
             smoke=self.smoke,
@@ -168,6 +170,10 @@ class World:
     def disk(self, cfg: DictConfig, exclude: Any = ()) -> tuple[float, float]:
         self.excluded = list(exclude)
         return self.working, self.free
+
+    def preflight(self, cfg: DictConfig) -> None:
+        if self.preflight_error:
+            raise self.preflight_error
 
     def smoke(self) -> str | None:
         self.smoke_calls += 1
@@ -301,6 +307,30 @@ def test_demos_go_through_every_stage_in_order_and_the_night_is_reported(cfg: Di
     for rec in sup.state.demos.values():
         assert set(rec["stages"]) == {"segment", "render", "extract", "pack", "sync"}
     assert PipelineState.load(sup.state.path).demos == sup.state.demos  # saved
+
+
+def test_failing_preflight_alerts_and_raises_before_anything_is_generated(cfg: DictConfig) -> None:
+    sup, world = make(cfg)
+    world.preflight_error = RuntimeError("demodump.exe was blocked")
+    with pytest.raises(RuntimeError, match="blocked"):
+        sup.run_until("07:30", target_hours=1)
+    assert world.generate_hours == [] and world.stage_events("segment") == []
+    alerts = world.by_title("supervisor stopped")
+    assert alerts and "demodump.exe was blocked" in alerts[0]["body"]
+    assert not world.by_title("start")
+
+
+def test_default_preflight_checks_the_exporter_only_for_the_demoinfocs_backend(monkeypatch) -> None:
+    seen: list[tuple] = []
+    monkeypatch.setattr(demodump, "preflight", lambda *a: seen.append(a))
+
+    def cfg_with(backend: str) -> Any:
+        return SimpleNamespace(demo=SimpleNamespace(backend=backend, demodump="/x/d", demodump_wsl="/home/u/d"))
+
+    Supervisor.check_exporter(cfg_with("demoinfocs"))
+    assert seen == [("/x/d", "/home/u/d")]
+    Supervisor.check_exporter(cfg_with("demoparser2"))
+    assert len(seen) == 1
 
 
 def test_target_hours_stops_generation_and_the_loop(cfg: DictConfig) -> None:

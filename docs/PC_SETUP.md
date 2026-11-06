@@ -60,22 +60,34 @@ unblocked (`Get-ChildItem -Recurse C:\hlae | Unblock-File`).
 
 ## Demo exporter (`demodump`)
 
-Demos are parsed by `demodump`, a Go program built from `tools/demodump` (#72), not by demoparser2. Build it in WSL
-(needs Go; the PC never needs it):
+Demos are parsed by `demodump`, a Go program built from `tools/demodump` (#72), not by demoparser2. Smart App Control
+blocks a self-built `demodump.exe` too (see the next section), so on this PC the exporter runs as the Linux build inside
+WSL, started by the Windows pipeline through `wsl.exe`. Build it in WSL (needs Go; the PC never needs the `.exe`):
 ```bash
 scripts/build_demodump.sh        # writes bin/demodump (Linux) and bin/demodump.exe (Windows), both git-ignored
-cp bin/demodump.exe /mnt/c/dcs2/bin/demodump.exe
+mkdir -p ~/.local/bin && cp bin/demodump ~/.local/bin/demodump
 ```
-and point Windows at it: `setx DCS2_DEMODUMP C:\dcs2\bin\demodump.exe`. The lookup order is env `DCS2_DEMODUMP`, then
-`demo.demodump` in `cs2wm.yaml`, then `bin\demodump.exe` in the repo, then `PATH`. A missing binary fails with the
-build script's name. Each demo is parsed once and the tables are cached in `<DCS2_ROOT>\demo_cache` (keyed by path, size
-and mtime; safe to delete). `demo.backend: demoparser2` switches back to the old parser.
+Then tell Windows where it is (PowerShell; use your WSL user name) and drop the old `DCS2_DEMODUMP`:
+```powershell
+[Environment]::SetEnvironmentVariable('DCS2_DEMODUMP_WSL', '/home/<user>/.local/bin/demodump', 'User')
+[Environment]::SetEnvironmentVariable('DCS2_DEMODUMP', $null, 'User')
+wsl.exe -e /home/<user>/.local/bin/demodump --version    # demodump 1 demoinfocs v6.0.0-rc.1 behavior 1
+```
+Open a new shell afterwards so the variables take effect. With `DCS2_DEMODUMP_WSL` (or `demo.demodump_wsl` in
+`cs2wm.yaml`) set on Windows, every demo is dumped by `wsl.exe -e <that path> <demo> <output dir>`, with the Windows
+paths translated to `/mnt/c/...` (the default automount root, in the default WSL distro). It wins over all the other
+sources; on Linux it is ignored. Without it the lookup order is env `DCS2_DEMODUMP`, then `demo.demodump` in
+`cs2wm.yaml`, then `bin\demodump.exe` in the repo, then `PATH`. A missing binary fails with the build script's name.
+`cs2wm supervise` runs `--version` on the exporter at startup and stops with an alert if it cannot run, instead of
+finding out hours later. Each demo is parsed once and the tables are cached in `<DCS2_ROOT>\demo_cache` (keyed by path,
+size and mtime; safe to delete). `demo.backend: demoparser2` switches back to the old parser.
 
 ## Windows Smart App Control blocks torchvision
 
 On this PC, Windows Smart App Control (WinError 4551, "An Application Control policy has blocked this file") blocks
 torchvision's compiled extension `torchvision\_C_stable.pyd`, so `import torchvision` fails in `C:\dcs2\venv` with
-`operator torchvision::nms does not exist`. torch itself, h5py, OpenCV, demoparser2 and `demodump.exe` load fine.
+`operator torchvision::nms does not exist`. torch itself, h5py, OpenCV and demoparser2 load fine. A self-built, unsigned `demodump.exe` is blocked the same
+way (`OSError: [WinError 4551]`), which is why the exporter runs through WSL.
 
 - The Windows pipeline stages don't import torchvision: `pack` resizes with `torch.nn.functional.interpolate`, which is
   what v1's torchvision resize does for float tensors (bit-identical; `tests/test_pack.py` checks it against

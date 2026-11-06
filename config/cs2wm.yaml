@@ -89,6 +89,9 @@ segment:
 demo:
   backend: demoinfocs               # demoinfocs (Go exporter tools/demodump, #72) | demoparser2 (kept for comparison)
   demodump: null                    # exporter binary; env DCS2_DEMODUMP wins, then this, then bin/demodump[.exe], then PATH
+  demodump_wsl: null                # Linux path of the exporter, run through wsl.exe on Windows, where Smart App Control blocks the
+                                    # .exe (docs/PC_SETUP.md). Env DCS2_DEMODUMP_WSL wins; when either is set it beats everything above
+                                    # and is ignored off Windows
   cache_dir: ${paths.root}/demo_cache  # one dump per demo, keyed by path, size and mtime; safe to delete
 
 pack:

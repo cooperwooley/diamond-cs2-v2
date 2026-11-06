@@ -66,6 +66,7 @@ BACKENDS = ("demoinfocs", "demoparser2")
 class _Settings:
     backend: str = "demoinfocs"
     demodump: str | None = None
+    demodump_wsl: str | None = None
     cache_dir: Path | None = None
 
 
@@ -76,10 +77,11 @@ def configure(cfg: Any) -> None:
     """Apply the ``demo`` section of a cs2wm config (called by ``load_config``).
 
     Args:
-        cfg: A validated config with ``demo.backend``, ``demo.demodump`` and ``demo.cache_dir``.
+        cfg: A validated config with ``demo.backend``, ``demo.demodump``, ``demo.demodump_wsl`` and ``demo.cache_dir``.
     """
     _settings.backend = str(cfg.demo.backend)
     _settings.demodump = None if cfg.demo.demodump is None else str(cfg.demo.demodump)
+    _settings.demodump_wsl = None if cfg.demo.demodump_wsl is None else str(cfg.demo.demodump_wsl)
     _settings.cache_dir = Path(str(cfg.demo.cache_dir))
 
 
@@ -102,7 +104,7 @@ def _make_parser(demo_path: str | Path) -> Any:
         from demoparser2 import DemoParser
 
         return DemoParser(str(demo_path))
-    return demodump.DemodumpParser(demo_path, _cache_dir(), _settings.demodump)
+    return demodump.DemodumpParser(demo_path, _cache_dir(), _settings.demodump, _settings.demodump_wsl)
 
 
 def parser_version() -> str:
