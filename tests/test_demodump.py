@@ -245,10 +245,10 @@ def test_dump_demo_through_wsl_translates_the_paths_and_keeps_the_cache_key(tmp_
     assert target.name == key_before and (target / "header.json").is_file()
 
 
-def test_dump_demo_through_wsl_rejects_a_relative_demo_path_before_running_anything(
+def test_dump_demo_through_wsl_refuses_a_path_without_a_drive_after_the_version_check(
     tmp_path, windows, monkeypatch
 ) -> None:
-    # Path.resolve() makes it absolute, but on Linux that is still not a drive path: the translation refuses it
+    # tmp_path is a Linux path (no drive letter), so the translation refuses it; only --version has run by then
     demo_file = tmp_path / "a.dem"
     demo_file.write_bytes(b"x")
     fake = FakeRun()
@@ -256,6 +256,13 @@ def test_dump_demo_through_wsl_rejects_a_relative_demo_path_before_running_anyth
     with pytest.raises(ValueError, match="cannot translate"):
         demodump.dump_demo(demo_file, tmp_path / "cache", None, LINUX_EXE)
     assert fake.calls == [["wsl.exe", "-e", LINUX_EXE, "--version"]]
+
+
+@pytest.mark.parametrize("value", ["~/.local/bin/demodump", "C:\\dcs2\\bin\\demodump", "bin/demodump"])
+def test_find_exporter_refuses_a_wsl_path_that_is_not_absolute_linux(value, lookup, windows, monkeypatch) -> None:
+    monkeypatch.delenv(demodump.ENV_WSL, raising=False)
+    with pytest.raises(ValueError, match="absolute Linux path"):
+        demodump.find_exporter(None, value)
 
 
 def test_preflight_runs_the_version_check(lookup, windows, monkeypatch) -> None:

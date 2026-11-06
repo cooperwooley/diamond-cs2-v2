@@ -159,10 +159,13 @@ def find_exporter(
 
     Raises:
         DemodumpNotFound: If the WSL path is not in use and ``find_binary`` finds nothing.
+        ValueError: If the WSL path is used but is not an absolute Linux path.
     """
     wsl_value = os.environ.get(ENV_WSL) or (str(configured_wsl) if configured_wsl else None)
     if wsl_value:
         if _is_windows():
+            if not wsl_value.startswith("/"):  # `wsl.exe -e` runs it as is: no `~` expansion, no Windows paths
+                raise ValueError(f"{ENV_WSL} / demo.demodump_wsl must be an absolute Linux path, got {wsl_value!r}")
             return Exporter((WSL_EXE, "-e", wsl_value), wsl=True)
         log.debug("%s / demo.demodump_wsl only applies on Windows; ignoring %s", ENV_WSL, wsl_value)
     return Exporter((str(find_binary(configured)),))
@@ -219,7 +222,8 @@ def dump_demo(
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
     try:
-        code, _, err = _run(exe.command(demo_path.resolve(), tmp.resolve()), _TIMEOUT_S)
+        # abspath, not resolve(): on Windows resolve() turns a mapped or subst drive into a UNC path WSL cannot take
+        code, _, err = _run(exe.command(os.path.abspath(demo_path), os.path.abspath(tmp)), _TIMEOUT_S)
         if code != 0:
             raise RuntimeError(f"demodump failed on {demo_path} (exit {code}): {err.strip()[-500:]}")
         try:
