@@ -50,6 +50,7 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from cs2wm import demo as demo_utils
+from cs2wm import demodump
 from cs2wm.config import SAFE_NAME_RE
 from cs2wm.pipeline import generate, ntfy, proc
 
@@ -461,6 +462,7 @@ class Hooks:
         notify: ``ntfy.notify``-like; default posts to ``supervisor.ntfy_server``/``ntfy_topic``.
         disk: ``(cfg, failed demo ids) -> (working set GB, free GB)``; default ``measure_disk``.
         build_id: ``cs2_dir -> CS2 buildid``.
+        preflight: ``cfg -> None``, raises if the night cannot work; default ``Supervisor.check_exporter``.
         generate: ``(cfg, profile, hours) -> demos``; default ``generate.run``.
         sync: ``() -> summary with .ok``; default ``Supervisor.run_sync``.
         smoke: ``() -> failure reason, or None if the render smoke test passed``; default
@@ -475,6 +477,7 @@ class Hooks:
     notify: Callable[..., None] | None = None
     disk: Callable[[DictConfig, Iterable[str]], tuple[float, float]] = measure_disk
     build_id: Callable[[Path], int] = demo_utils.cs2_build_id
+    preflight: Callable[[DictConfig], None] | None = None
     generate: Callable[[DictConfig, str, float], Any] | None = None
     sync: Callable[[], Any] | None = None
     smoke: Callable[[], str | None] | None = None
@@ -705,6 +708,17 @@ class Supervisor:
         self.state.save()
         return summary
 
+    @staticmethod
+    def check_exporter(cfg: DictConfig) -> None:
+        """Fail at startup, not hours in, when the demo exporter cannot run (a blocked ``.exe``, a missing binary).
+
+        Raises:
+            DemodumpNotFound: If there is no exporter.
+            RuntimeError: If it cannot run or has other versions than ``cs2wm.demodump`` needs.
+        """
+        if cfg.demo.backend == "demoinfocs":
+            demodump.preflight(cfg.demo.demodump, cfg.demo.demodump_wsl)
+
     # -- the night ----------------------------------------------------------------------------------------------------
 
     def run_until(self, until: str, target_hours: float, profile: str = "dm") -> Night:
@@ -736,6 +750,7 @@ class Supervisor:
         log.info("supervise: target %.2f h, until %s, profile %s", target_hours, night.deadline, profile)
         try:
             self._recover()
+            (self.hooks.preflight or self.check_exporter)(self.cfg)
             working, free = self._disk()
             self._send(ntfy.format_start(target_hours, night.deadline, now, self._read_build(), working, free, profile))
             night.reason = self._loop()

@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -94,6 +95,190 @@ def test_find_binary_error_names_the_build_script(lookup) -> None:
     with pytest.raises(demodump.DemodumpNotFound, match=r"scripts/build_demodump\.sh") as err:
         demodump.find_binary(None)
     assert demodump.ENV_BINARY in str(err.value)
+
+
+# --- running the exporter through WSL (#78) ---
+
+
+@pytest.mark.parametrize(
+    ("win", "linux"),
+    [
+        (r"C:\dcs2\data\x.dem", "/mnt/c/dcs2/data/x.dem"),
+        (r"d:\Demos\Dm\A B.dem", "/mnt/d/Demos/Dm/A B.dem"),  # drive letter lowercased, the rest keeps its case
+        ("C:/dcs2/data/x.dem", "/mnt/c/dcs2/data/x.dem"),  # forward slashes
+        (r"C:\dcs2\\data\x.dem", "/mnt/c/dcs2/data/x.dem"),  # doubled separator
+        ("C:\\dcs2\\data\\", "/mnt/c/dcs2/data"),  # trailing separator
+        ("C:\\", "/mnt/c"),
+    ],
+)
+def test_wsl_path_translates_absolute_windows_paths(win, linux) -> None:
+    assert demodump.wsl_path(win) == linux
+
+
+@pytest.mark.parametrize(
+    "bad", [r"\\server\share\x.dem", r"dcs2\x.dem", "x.dem", r"C:x.dem", r"\dcs2\x.dem", "/mnt/c/x.dem", ""]
+)
+def test_wsl_path_rejects_paths_it_cannot_translate(bad) -> None:
+    with pytest.raises(ValueError, match="cannot translate"):
+        demodump.wsl_path(bad)
+
+
+LINUX_EXE = "/home/u/.local/bin/demodump"
+
+
+@pytest.fixture
+def windows(monkeypatch):
+    monkeypatch.setattr(demodump, "_is_windows", lambda: True)
+    monkeypatch.delenv(demodump.ENV_WSL, raising=False)
+
+
+def test_wsl_path_set_on_windows_beats_every_other_source(lookup, windows, monkeypatch) -> None:
+    env = _touch(lookup / "env" / "d")
+    _touch(lookup / "repo" / "bin" / demodump.binary_name())
+    monkeypatch.setenv(demodump.ENV_BINARY, str(env))
+    exe = demodump.find_exporter(env, LINUX_EXE)
+    assert exe == demodump.Exporter(("wsl.exe", "-e", LINUX_EXE), wsl=True)
+
+
+def test_wsl_env_wins_over_the_config_key(lookup, windows, monkeypatch) -> None:
+    monkeypatch.setenv(demodump.ENV_WSL, "/env/demodump")
+    assert demodump.find_exporter(None, LINUX_EXE).argv == ("wsl.exe", "-e", "/env/demodump")
+    monkeypatch.delenv(demodump.ENV_WSL)
+    assert demodump.find_exporter(None, LINUX_EXE).argv == ("wsl.exe", "-e", LINUX_EXE)
+
+
+def test_wsl_path_is_ignored_off_windows(lookup, monkeypatch, caplog) -> None:
+    monkeypatch.setattr(demodump, "_is_windows", lambda: False)
+    monkeypatch.setenv(demodump.ENV_WSL, LINUX_EXE)
+    repo = _touch(lookup / "repo" / "bin" / demodump.binary_name())
+    with caplog.at_level("DEBUG", logger=demodump.log.name):
+        exe = demodump.find_exporter(None, LINUX_EXE)
+    assert exe == demodump.Exporter((str(repo),)) and not exe.wsl
+    assert "only applies on Windows" in caplog.text
+
+
+def test_without_a_wsl_path_the_normal_lookup_applies_on_windows(lookup, windows) -> None:
+    repo = _touch(lookup / "repo" / "bin" / demodump.binary_name())
+    assert demodump.find_exporter(None, None).argv == (str(repo),)
+    with pytest.raises(demodump.DemodumpNotFound):
+        repo.unlink()
+        demodump.find_exporter(None, None)
+
+
+def test_exporter_command_translates_file_arguments_only_for_wsl() -> None:
+    wsl = demodump.Exporter(("wsl.exe", "-e", LINUX_EXE), wsl=True)
+    assert wsl.command(r"C:\d\x.dem", r"C:\c\out") == ["wsl.exe", "-e", LINUX_EXE, "/mnt/c/d/x.dem", "/mnt/c/c/out"]
+    assert demodump.Exporter(("/bin/d",)).command("/a/x.dem", "/o") == ["/bin/d", "/a/x.dem", "/o"]
+    with pytest.raises(ValueError, match="cannot translate"):
+        wsl.command("relative.dem", "C:/out")
+
+
+class FakeRun:
+    """Stands in for ``subprocess.run``: records the argv and answers the version query and the dump."""
+
+    def __init__(self, version=b"demodump %s demoinfocs %s behavior %s\n", code=0, stdout=None, stderr=b""):
+        ok = version % (
+            demodump.DEMODUMP_FORMAT.encode(),
+            demodump.DEMOINFOCS_VERSION.encode(),
+            demodump.DEMODUMP_BEHAVIOR.encode(),
+        )
+        self.stdout, self.stderr, self.code = ok if stdout is None else stdout, stderr, code
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, self.code, self.stdout, self.stderr)
+
+
+WSL_EXE = demodump.Exporter(("wsl.exe", "-e", LINUX_EXE), wsl=True)
+
+
+def test_check_version_runs_the_linux_exporter_through_wsl(monkeypatch) -> None:
+    fake = FakeRun()
+    monkeypatch.setattr(subprocess, "run", fake)
+    assert demodump.check_version(WSL_EXE) == (
+        demodump.DEMODUMP_FORMAT,
+        demodump.DEMOINFOCS_VERSION,
+        demodump.DEMODUMP_BEHAVIOR,
+    )
+    assert fake.calls == [["wsl.exe", "-e", LINUX_EXE, "--version"]]
+
+
+def test_check_version_names_a_missing_linux_exporter_and_survives_utf16_output(monkeypatch) -> None:
+    msg = "execvpe(/home/u/.local/bin/demodump) failed: No such file or directory\n".encode("utf-16-le")
+    monkeypatch.setattr(subprocess, "run", FakeRun(code=1, stdout=b"", stderr=msg))
+    with pytest.raises(
+        RuntimeError, match=r"wsl\.exe -e /home/u/.local/bin/demodump --version failed.*No such file.*DCS2_DEMODUMP_WSL"
+    ):
+        demodump.check_version(WSL_EXE)
+
+
+def test_check_version_reports_wsl_exe_that_cannot_be_started(monkeypatch) -> None:
+    def boom(argv, **kwargs):
+        raise FileNotFoundError("wsl.exe")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(RuntimeError, match=r"cannot run wsl\.exe -e /home/u/.local/bin/demodump: "):
+        demodump.check_version(WSL_EXE)
+
+
+def test_dump_demo_through_wsl_translates_the_paths_and_keeps_the_cache_key(tmp_path, windows, monkeypatch) -> None:
+    demo_file = tmp_path / "a.dem"
+    demo_file.write_bytes(b"x")
+    key_before = demodump.cache_key(demo_file)
+    fake = FakeRun()
+
+    def run(argv, **kwargs):
+        fake(argv, **kwargs)
+        if "--version" not in argv:
+            out = Path(tmp_path / "cache" / next(p for p in os.listdir(tmp_path / "cache") if p.startswith(".")))
+            shutil.copytree(FIXTURE, out, dirs_exist_ok=True)  # what the exporter writes into the output directory
+        return subprocess.CompletedProcess(argv, 0, fake.stdout, b"")
+
+    monkeypatch.setattr(demodump, "wsl_path", lambda p: "/mnt/c/" + Path(p).name)  # tmp_path is a Linux path here
+    monkeypatch.setattr(subprocess, "run", run)
+    target = demodump.dump_demo(demo_file, tmp_path / "cache", None, LINUX_EXE)
+    version_call, dump_call = fake.calls
+    assert version_call == ["wsl.exe", "-e", LINUX_EXE, "--version"]
+    assert dump_call[:3] == ["wsl.exe", "-e", LINUX_EXE] and dump_call[3] == "/mnt/c/a.dem"
+    assert dump_call[4].startswith("/mnt/c/.a-")
+    assert target.name == key_before and (target / "header.json").is_file()
+
+
+def test_dump_demo_through_wsl_refuses_a_path_without_a_drive_after_the_version_check(
+    tmp_path, windows, monkeypatch
+) -> None:
+    # tmp_path is a Linux path (no drive letter), so the translation refuses it; only --version has run by then
+    demo_file = tmp_path / "a.dem"
+    demo_file.write_bytes(b"x")
+    fake = FakeRun()
+    monkeypatch.setattr(subprocess, "run", fake)
+    with pytest.raises(ValueError, match="cannot translate"):
+        demodump.dump_demo(demo_file, tmp_path / "cache", None, LINUX_EXE)
+    assert fake.calls == [["wsl.exe", "-e", LINUX_EXE, "--version"]]
+
+
+@pytest.mark.parametrize("value", ["~/.local/bin/demodump", "C:\\dcs2\\bin\\demodump", "bin/demodump"])
+def test_find_exporter_refuses_a_wsl_path_that_is_not_absolute_linux(value, lookup, windows, monkeypatch) -> None:
+    monkeypatch.delenv(demodump.ENV_WSL, raising=False)
+    with pytest.raises(ValueError, match="absolute Linux path"):
+        demodump.find_exporter(None, value)
+
+
+def test_preflight_runs_the_version_check(lookup, windows, monkeypatch) -> None:
+    fake = FakeRun()
+    monkeypatch.setattr(subprocess, "run", fake)
+    demodump.preflight(None, LINUX_EXE)
+    assert fake.calls == [["wsl.exe", "-e", LINUX_EXE, "--version"]]
+
+
+def test_demo_settings_carry_demodump_wsl(tmp_path) -> None:
+    saved = demo._settings
+    try:
+        load_config(overrides=[f"paths.root={tmp_path}", f"demo.demodump_wsl={LINUX_EXE}"])
+        assert demo._settings.demodump_wsl == LINUX_EXE
+    finally:
+        demo._settings = saved
 
 
 # --- running and caching ---
