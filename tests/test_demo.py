@@ -7,7 +7,7 @@ import json
 import pandas as pd
 import pytest
 
-from cs2wm import demo
+from cs2wm import demo, demodump
 
 
 class FakeParser:
@@ -68,7 +68,7 @@ def test_parser_version_is_installed_version_for_demoparser2(monkeypatch) -> Non
 
 
 def test_parser_version_names_the_exporter_and_demoinfocs() -> None:
-    assert demo.parser_version() == "demodump 1 (demoinfocs v6.0.0-rc.1)"
+    assert demo.parser_version() == f"demodump 1 (demoinfocs {demodump.DEMOINFOCS_VERSION})"
 
 
 def test_header_values_are_strings(use_parser) -> None:

@@ -55,10 +55,15 @@ var grenadeColumns = []string{
 	"grenade_entity_id", "tick", "grenade_type", "thrower_user_id", "thrower_steamid", "X", "Y", "Z",
 }
 
+// demoinfocsVersion is the demoinfocs-golang version, plus "+<version>" of a fork that replaces it in go.mod, so a
+// patched build never passes for the release (the Python cache key includes it).
 func demoinfocsVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range info.Deps {
 			if dep.Path == demoinfocsModule {
+				if dep.Replace != nil {
+					return dep.Version + "+" + dep.Replace.Version
+				}
 				return dep.Version
 			}
 		}

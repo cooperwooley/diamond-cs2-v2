@@ -71,7 +71,7 @@ Then tell Windows where it is (PowerShell; use your WSL user name) and drop the 
 ```powershell
 [Environment]::SetEnvironmentVariable('DCS2_DEMODUMP_WSL', '/home/<user>/.local/bin/demodump', 'User')
 [Environment]::SetEnvironmentVariable('DCS2_DEMODUMP', $null, 'User')
-wsl.exe -e /home/<user>/.local/bin/demodump --version    # demodump 1 demoinfocs v6.0.0-rc.1 behavior 1
+wsl.exe -e /home/<user>/.local/bin/demodump --version    # demodump 1 demoinfocs v6.0.0-rc.1+v6.0.0-20261112032156-6d7a0a27e601 behavior 1
 ```
 Open a new shell afterwards so the variables take effect. With `DCS2_DEMODUMP_WSL` (or `demo.demodump_wsl` in
 `cs2wm.yaml`) set on Windows, every demo is dumped by `wsl.exe -e <that path> <demo> <output dir>`, with the Windows

@@ -50,7 +50,10 @@ def test_behavior_version_matches_the_go_exporter() -> None:
 
 def test_demoinfocs_version_matches_go_mod() -> None:
     mod = (REPO / "tools" / "demodump" / "go.mod").read_text(encoding="utf-8")
-    assert f"demoinfocs-golang/v6 {demodump.DEMOINFOCS_VERSION}\n" in mod
+    release = re.search(r"^require github\.com/markus-wa/demoinfocs-golang/v6 (\S+)$", mod, re.MULTILINE)
+    fork = re.search(r"^replace github\.com/markus-wa/demoinfocs-golang/v6 => \S+ (\S+)$", mod, re.MULTILINE)
+    assert release is not None
+    assert demodump.DEMOINFOCS_VERSION == (f"{release[1]}+{fork[1]}" if fork else release[1])
 
 
 # --- binary lookup ---
