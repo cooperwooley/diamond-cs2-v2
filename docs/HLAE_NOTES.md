@@ -229,6 +229,8 @@ black, and CS2 exited cleanly. Rendering works on a locked screen; the user has 
 
 - `cs2_video.txt` is rewritten by CS2 (fullscreen, other resolution): keep a backup and restore it after test runs.
 - CS2 auto-updates (Steam showed build 26445667 on Nov 4): `generate.expected_build` stops generation on a mismatch.
+  Under `cs2wm supervise` a build that passed the render smoke test is accepted too, and the pin only seeds the first
+  run (a different installed build then gets the smoke test); standalone `cs2wm generate` keeps using the pin alone.
 - demoparser2 0.41.3 and 0.42.1 fail on DM demos from this build (`IllegalPathOp`, LaihoE/demoparser#359); casual
   demos parse only partly. Hence demoinfocs (#72).
 - Casual mode (`game_type 0; game_mode 0`) also worked as DM-like (no round end in 3+ min, bots respawn, `mp_roundtime

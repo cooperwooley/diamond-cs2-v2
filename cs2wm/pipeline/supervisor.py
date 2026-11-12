@@ -21,8 +21,11 @@ at a time, so generation and rendering are interleaved, never parallel. Demos go
 * Disk guard: generation pauses while the working set exceeds ``max_working_gb`` and stops (with an alert) when the
   drive has less than ``min_free_gb`` free. The demo archive is not counted, nor (``sync.auto: false``) the packed hdf5.
 * Patch guard: when the CS2 ``buildid`` differs from the one in ``state.meta``, a ~10 s render smoke test runs before
-  anything else (see ``Supervisor.render_smoke_test``). If it fails, generation and rendering stop. Generate's own
-  ``PatchGuardError`` stops generation too; what is already generated is still drained.
+  anything else (see ``Supervisor.render_smoke_test``). If it fails, generation and rendering stop. A build that
+  passed the smoke test is also the one generation accepts under the supervisor (its ``generate.expected_build`` is
+  overridden with it); on a first run the static pin seeds the comparison, so a machine on another build is tested.
+  Generate's own ``PatchGuardError`` stops generation for a build the supervisor has not approved (a patch landing
+  mid-night); what is already generated is still drained.
 * ntfy: start, hourly heartbeat, immediate alerts and the morning summary (``ntfy.format_*``).
 
 State is persisted atomically in ``state/pipeline.json`` so a reboot resumes where it stopped. ``Supervisor.run_stage``,
@@ -889,7 +892,7 @@ class Supervisor:
         start = self.hooks.now()
         error: str | None = None
         try:
-            self._generate(self.cfg, night.profile, block_min / 60)
+            self._generate(self._generate_cfg(), night.profile, block_min / 60)
         except generate.PatchGuardError as exc:
             self._kill_cs2()
             night.stopped_generation = "CS2 patched (generate's patch guard)"
@@ -933,6 +936,17 @@ class Supervisor:
             log.warning("cannot read the CS2 build id: %s", exc)
             return None
 
+    def _generate_cfg(self) -> DictConfig:
+        """The config for generate: its patch guard accepts the build that passed the smoke test.
+
+        Without an approved build matching the installed one, ``self.cfg`` is returned as is, so generate's own guard
+        (the static ``generate.expected_build``) still stops on a build the supervisor has not approved.
+        """
+        approved = self.state.meta.get(BUILD_KEY)
+        if approved is not None and approved == self._read_build():
+            return OmegaConf.merge(self.cfg, {"generate": {"expected_build": approved}})
+        return self.cfg
+
     def _check_patch(self) -> None:
         """Run the render smoke test when the CS2 build changed since the last one that rendered fine."""
         night = self.night
@@ -940,10 +954,13 @@ class Supervisor:
         last = self.state.meta.get(BUILD_KEY)
         if build is None or build == last or build in night.bad_builds:
             return
-        if last is None:  # first run on this machine: nothing to compare with
-            self.state.meta[BUILD_KEY] = build
-            self.state.save()
-            return
+        if last is None:  # first run on this machine: the static pin, if any, is the build known to work
+            pin = self.cfg.generate.expected_build
+            if pin is None or int(pin) == build:
+                self.state.meta[BUILD_KEY] = build
+                self.state.save()
+                return
+            last = int(pin)
         log.warning("CS2 build changed from %s to %s; running the render smoke test", last, build)
         self._current = "smoke test"
         start = self.hooks.now()
