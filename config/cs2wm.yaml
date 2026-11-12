@@ -104,7 +104,7 @@ generate:
   bots: 10
   chunk_min: 10
   hang_timeout_min: 5
-  expected_build: 26445667          # CS2 buildid from appmanifest_730.acf (the #14 session ran on this build)
+  expected_build: 26598758          # CS2 buildid from appmanifest_730.acf (Nov 11 patch; was 26445667, the #14 build)
   # Launch: plain cs2.exe (NOT HLAE; HLAE is for render only) started directly rather than via `steam -applaunch 730`,
   # because steam.exe returns at once, which would leave nothing to watch, kill or restart.
   # -steam makes a directly started cs2.exe attach to the running Steam client (no prompts when Steam is running).
