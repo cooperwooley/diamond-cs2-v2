@@ -34,10 +34,11 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # Output format of the exporter (``version`` in tools/demodump/main.go) and the pinned demoinfocs-golang release
-# (tools/demodump/go.mod). tests/test_demodump.py checks both against the Go sources. The format version is part of
-# the cache key, so a bump re-parses every cached demo.
+# (tools/demodump/go.mod), plus "+<fork version>" while go.mod replaces it with a patched fork (the Nov 11 CS2 fix,
+# upstream PR #764). tests/test_demodump.py checks both against the Go sources. Both are part of the cache key, so a
+# bump re-parses every cached demo.
 DEMODUMP_FORMAT = "1"
-DEMOINFOCS_VERSION = "v6.0.0-rc.1"
+DEMOINFOCS_VERSION = "v6.0.0-rc.1+v6.0.0-20261112032156-6d7a0a27e601"
 # ``behaviorVersion`` in tools/demodump/main.go: bumped whenever the derived-event rules or the table logic
 # change, so cached dumps made by older logic are not reused. Tested against the Go source.
 DEMODUMP_BEHAVIOR = "1"

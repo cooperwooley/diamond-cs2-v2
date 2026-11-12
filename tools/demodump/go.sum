@@ -1,3 +1,5 @@
+github.com/GamersClub/demoinfocs-golang/v6 v6.0.0-20261112032156-6d7a0a27e601 h1:bynRAaFlhR/2Kd57RJqb4U/yctgSWe1W6Eq7TyZb9fA=
+github.com/GamersClub/demoinfocs-golang/v6 v6.0.0-20261112032156-6d7a0a27e601/go.mod h1:gPCrwLddSsCqjMAc5QL235UmXom/Qmr82b+EyXQW04A=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/golang/geo v0.0.0-20180826223333-635502111454/go.mod h1:vgWZ7cu0fq0KY3PpEHsocXOWJpRtkcbKemU4IUw0M60=
 github.com/golang/geo v0.0.0-20230421003525-6adc56603217 h1:HKlyj6in2JV6wVkmQ4XmG/EIm+SCYlPZ+V4GWit7Z+I=
@@ -6,8 +8,6 @@ github.com/golang/snappy v1.0.0 h1:Oy607GVXHs7RtbggtPBnr2RmDArIsAefDwvrdWvRhGs=
 github.com/golang/snappy v1.0.0/go.mod h1:/XxbfmMg8lxefKM7IXC3fBNl/7bRcc72aCRzEWrmP2Q=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
-github.com/markus-wa/demoinfocs-golang/v6 v6.0.0-rc.1 h1:wlkY+El7dzWPJ9hQyRWXr4l3oHOKel0eXeRgMdV1qf4=
-github.com/markus-wa/demoinfocs-golang/v6 v6.0.0-rc.1/go.mod h1:gPCrwLddSsCqjMAc5QL235UmXom/Qmr82b+EyXQW04A=
 github.com/markus-wa/go-unassert v0.1.3 h1:4N2fPLUS3929Rmkv94jbWskjsLiyNT2yQpCulTFFWfM=
 github.com/markus-wa/go-unassert v0.1.3/go.mod h1:/pqt7a0LRmdsRNYQ2nU3SGrXfw3bLXrvIkakY/6jpPY=
 github.com/markus-wa/gobitread v0.2.5 h1:F5GxezkgQhnWsXWOf4mY1mLcSeDRI3onkIouG26nCEY=

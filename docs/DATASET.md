@@ -184,7 +184,7 @@ The weapon strings demoinfocs returns, and the slot every one of them gets, are 
 
 ### 4.5 Demo parser conventions (demoinfocs, #72)
 
-Demos are parsed by `tools/demodump` (demoinfocs-golang v6.0.0-rc.1) and served through `cs2wm/demodump.py` under the demoparser2 column names, because demoparser2 0.42.1 cannot read current CS2 demos (patch_version 14196). `demo.backend: demoparser2` still selects the old parser. What was checked, on `dcs2_test-cas-client.dem` (the one demo where demoparser2 returns ticks; 8058 rows of 4 players matched on tick and name):
+Demos are parsed by `tools/demodump` (demoinfocs-golang v6.0.0-rc.1, plus upstream PR #764 through a `go.mod` replace since the Nov 11, 2026 CS2 update, which v6.0.0-rc.1 cannot decode; output on older demos is unchanged) and served through `cs2wm/demodump.py` under the demoparser2 column names, because demoparser2 0.42.1 cannot read current CS2 demos (patch_version 14196). `demo.backend: demoparser2` still selects the old parser. What was checked, on `dcs2_test-cas-client.dem` (the one demo where demoparser2 returns ticks; 8058 rows of 4 players matched on tick and name):
 
 | Convention | Result |
 |---|---|
