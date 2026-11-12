@@ -61,6 +61,7 @@ class World:
         self.sleeps: list[float] = []
         self.events: list[str] = []
         self.generate_hours: list[float] = []
+        self.generate_cfgs: list[DictConfig] = []
         self.kills = 0
         self.working, self.free = 0.0, 500.0
         self.build = 100
@@ -97,6 +98,7 @@ class World:
     def generate(self, cfg: DictConfig, profile: str, hours: float) -> list[Path]:
         assert len(self.generate_hours) < 40, "runaway loop"
         self.generate_hours.append(hours)
+        self.generate_cfgs.append(cfg)
         self.events.append("generate")
         self.advance(hours * 3600)
         if self.generate_script:
@@ -201,6 +203,7 @@ def cfg(tmp_path: Path) -> DictConfig:
         overrides=[
             f"paths.root={tmp_path / 'data'}",
             f"paths.cs2_dir={tmp_path / 'cs2'}",
+            "generate.expected_build=100",  # the build World reports, so a first run needs no smoke test
             "supervisor.drain_min=30",
             "supervisor.generate_block_min=60",
             "supervisor.max_working_gb=8",
@@ -209,6 +212,11 @@ def cfg(tmp_path: Path) -> DictConfig:
             "sync.batch_mode=true",
         ]
     )
+
+
+def pinned(cfg: DictConfig, build: int | None) -> DictConfig:
+    """A copy of ``cfg`` with ``generate.expected_build`` set (the loaded config is read-only)."""
+    return OmegaConf.merge(cfg, {"generate": {"expected_build": build}})
 
 
 def make(cfg: DictConfig, world: World | None = None, state: PipelineState | None = None) -> tuple[Supervisor, World]:
@@ -594,6 +602,29 @@ def test_first_run_records_the_build_without_a_smoke_test(cfg: DictConfig) -> No
     assert world.smoke_calls == 0 and sup.state.meta[BUILD_KEY] == 100
 
 
+def test_first_run_with_a_pin_on_another_build_runs_the_smoke_test(cfg: DictConfig) -> None:
+    cfg = pinned(cfg, 99)
+    sup, world = make(cfg)
+    sup.run_until("07:30", target_hours=0.3)
+    assert world.smoke_calls == 1 and world.events[0] == "smoke"
+    assert sup.state.meta[BUILD_KEY] == 100 and world.generate_cfgs[0].generate.expected_build == 100
+
+
+def test_first_run_with_a_failing_smoke_test_does_not_generate(cfg: DictConfig) -> None:
+    cfg = pinned(cfg, 99)
+    sup, world = make(cfg)
+    world.smoke_result = "no frames captured"
+    sup.run_until("07:30", target_hours=99)
+    assert world.generate_hours == [] and BUILD_KEY not in sup.state.meta
+
+
+def test_first_run_without_a_pin_records_the_build_without_a_smoke_test(cfg: DictConfig) -> None:
+    cfg = pinned(cfg, None)
+    sup, world = make(cfg)
+    sup.run_until("23:40", target_hours=99)
+    assert world.smoke_calls == 0 and sup.state.meta[BUILD_KEY] == 100
+
+
 def test_unchanged_build_skips_the_smoke_test(cfg: DictConfig) -> None:
     sup, world = make(cfg)
     sup.state.meta[BUILD_KEY] = 100
@@ -608,6 +639,49 @@ def test_changed_build_runs_the_smoke_test_before_generating_and_resumes_when_it
     assert world.events[0] == "smoke" and world.events[1] == "generate"
     assert sup.state.meta[BUILD_KEY] == 100 and PipelineState.load(sup.state.path).meta[BUILD_KEY] == 100
     assert world.by_title("CS2 updated") and night.exit_code == 0
+
+
+def test_generation_accepts_the_build_that_passed_the_smoke_test(cfg: DictConfig) -> None:
+    cfg = pinned(cfg, 99)
+    sup, world = make(cfg)
+    sup.state.meta[BUILD_KEY] = 99
+    sup.run_until("07:30", target_hours=0.3)
+    assert world.smoke_calls == 1 and world.generate_cfgs
+    assert all(c.generate.expected_build == 100 for c in world.generate_cfgs)
+    assert sup.cfg.generate.expected_build == 99  # the supervisor's own config is not mutated
+
+
+def test_generation_gets_the_unmodified_config_when_the_build_changed_since_the_approval(cfg: DictConfig) -> None:
+    cfg = pinned(cfg, 99)
+    sup, world = make(cfg)
+    sup.state.meta[BUILD_KEY] = 100
+    world.smoke_result = "no frames captured"  # the patch lands mid-night and is not approved
+
+    def patch() -> None:
+        world.build = 101
+        world.publish(1)
+
+    world.generate_script = [patch]
+    sup.run_until("07:30", target_hours=99)
+    assert len(world.generate_cfgs) == 1 and world.generate_cfgs[0].generate.expected_build == 100
+    assert sup._generate_cfg() is sup.cfg  # 101 is installed but only 100 is approved: generate's own guard decides
+
+
+def test_generation_uses_the_real_patch_guard_with_the_approved_build(cfg: DictConfig) -> None:
+    from types import SimpleNamespace
+
+    from cs2wm.pipeline.generate import Generator
+
+    cfg = pinned(cfg, 99)
+    sup, world = make(cfg)
+    sup.state.meta[BUILD_KEY] = 100
+    guard = lambda c: Generator._guard(
+        SimpleNamespace(g=c.generate, h=SimpleNamespace(notify=world.notify), _build=lambda: world.build)
+    )
+    assert guard(sup._generate_cfg()) == 100  # approved: passes
+    world.build = 101
+    with pytest.raises(PatchGuardError):
+        guard(sup._generate_cfg())  # not approved: generate's own guard stops
 
 
 def test_failed_smoke_test_stops_generation_and_rendering_and_alerts(cfg: DictConfig) -> None:
