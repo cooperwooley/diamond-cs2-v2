@@ -170,7 +170,9 @@ def extract_transitions(actions: np.ndarray, start: int, n_frames: int, spec: Ac
     return sorted(rows, key=lambda r: (r.frame, _SLOT_ORDER.index(r.slot), r.label))
 
 
-def random_mouse_rows(actions: np.ndarray, start: int, n_frames: int, spec: ActionSpec, seed: int) -> list[Row]:
+def random_mouse_rows(
+    actions: np.ndarray, start: int, n_frames: int, spec: ActionSpec, seed: int, n_random: int = N_RANDOM_FRAMES
+) -> list[Row]:
     """Mouse-x and mouse-y rows for seeded random frames of the clip.
 
     Args:
@@ -179,12 +181,13 @@ def random_mouse_rows(actions: np.ndarray, start: int, n_frames: int, spec: Acti
         n_frames: Number of frames in the clip.
         spec: Action layout.
         seed: RNG seed.
+        n_random: Frames to sample (``N_RANDOM_FRAMES`` by default).
 
     Returns:
-        Two rows per sampled frame (``N_RANDOM_FRAMES`` frames, or every frame of a shorter clip).
+        Two rows per sampled frame (``n_random`` frames, or every frame of a shorter clip).
     """
     rng = np.random.default_rng(seed)
-    frames = np.sort(rng.choice(np.arange(start, start + n_frames), size=min(N_RANDOM_FRAMES, n_frames), replace=False))
+    frames = np.sort(rng.choice(np.arange(start, start + n_frames), size=min(n_random, n_frames), replace=False))
     rows: list[Row] = []
     for t in frames:
         t = int(t)
@@ -198,10 +201,16 @@ def random_mouse_rows(actions: np.ndarray, start: int, n_frames: int, spec: Acti
 
 
 def make_review_sheet(
-    episode: Path, start: int, n_frames: int | None, out_csv: Path, seed: int = 0, cfg: DictConfig | None = None
+    episode: Path,
+    start: int,
+    n_frames: int | None,
+    out_csv: Path,
+    seed: int = 0,
+    cfg: DictConfig | None = None,
+    mouse_frames: int = N_RANDOM_FRAMES,
 ) -> Path:
-    """Write the review sheet: one row per label transition (key down/up, fire, reload, switch, jump) plus 200
-    random frames for mouse direction and magnitude.
+    """Write the review sheet: one row per label transition (key down/up, fire, reload, switch, jump) plus
+    ``mouse_frames`` (default 200) random frames for mouse direction and magnitude.
 
     Judge each row by the change from this frame to the next (the action on frame ``i`` is what the player does
     between frame ``i`` and ``i + 1``). Rows are sorted by frame (then slot, label), so the same episode, window and seed give the same file.
@@ -214,6 +223,8 @@ def make_review_sheet(
             empty.
         seed: Seed for the random frames.
         cfg: A validated cs2wm config; defaults to ``load_config()``.
+        mouse_frames: Random frames sampled for the mouse rows (two rows each). Fewer keeps a sheet short
+            enough for one sitting; the scoring is the same.
 
     Returns:
         ``out_csv``.
@@ -221,7 +232,7 @@ def make_review_sheet(
     spec = ActionSpec.from_config(cfg if cfg is not None else load_config())
     _, actions, _ = read_episode(Path(episode))
     n = _window(len(actions), start, n_frames)
-    rows = extract_transitions(actions, start, n, spec) + random_mouse_rows(actions, start, n, spec, seed)
+    rows = extract_transitions(actions, start, n, spec) + random_mouse_rows(actions, start, n, spec, seed, mouse_frames)
     rows.sort(key=lambda r: (r.frame, _SLOT_ORDER.index(r.slot), r.label))
     out_csv = Path(out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)

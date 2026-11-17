@@ -104,6 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument(
         "--out", required=True, type=Path, help="output clip.mp4 (the sheet is written as <stem>_labels.csv)"
     )
+    q.add_argument(
+        "--mouse-frames", type=int, default=200, help="random frames for the mouse rows of the sheet (two rows each)"
+    )
     q.epilog = "Judge each row by the change from this frame to the next (frame i shows the action taken after it)."
     q = lc.add_parser("score", help="score filled-in review sheets (several are pooled)")
     q.add_argument("sheet", nargs="+", type=Path, help="clip_labels.csv, one per reviewed episode")
@@ -401,7 +404,12 @@ def _dispatch(args: argparse.Namespace) -> int:
                 args.episode, args.full_res_frames, args.start, args.frames, args.out, _cfg(args)
             )
             label_accuracy.make_review_sheet(
-                args.episode, args.start, args.frames, args.out.with_name(args.out.stem + "_labels.csv"), cfg=_cfg(args)
+                args.episode,
+                args.start,
+                args.frames,
+                args.out.with_name(args.out.stem + "_labels.csv"),
+                cfg=_cfg(args),
+                mouse_frames=args.mouse_frames,
             )
         else:
             label_accuracy.score_review_sheet(args.sheet, args.out)
