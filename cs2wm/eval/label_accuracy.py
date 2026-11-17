@@ -8,7 +8,9 @@ A clip covers one episode (at most ``episodes.max_frames`` = 1000 frames, about 
 renders two consecutive episodes, reviews both sheets and scores them together.
 
 Timing: the action shown on frame ``i`` is what the player does between frame ``i`` and frame ``i + 1``, so judge
-each row by the change from this frame to the next.
+each row by the change from this frame to the next. The clip therefore ends with one extra "next frame" (tagged on
+screen, no rows on the sheet) whenever the episode has a frame after the window. When the window ends at the
+episode's last frame there is nothing to compare it with, so the sheet leaves out rows at that frame.
 
 Filling in the sheet: ``ok`` is empty on every row. Look at the frame and its neighbours and enter
 
@@ -117,6 +119,14 @@ def _window(n_total: int, start: int, n_frames: int | None) -> int:
     return n
 
 
+def _judgeable(n_total: int, start: int, n: int) -> int:
+    """Length of the window's judgeable part: the frames that have a next frame in the episode.
+
+    Only the episode's last frame (``n_total - 1``) has none, so the window loses one frame when it reaches it.
+    """
+    return min(n, n_total - 1 - start)
+
+
 def _mouse_bins(vec: np.ndarray, spec: ActionSpec) -> tuple[int, int]:
     """Active (mouse-x, mouse-y) bin indices of one action vector."""
     return int(np.argmax(vec[spec.mouse_x_slice])), int(np.argmax(vec[spec.mouse_y_slice]))
@@ -134,7 +144,7 @@ def extract_transitions(actions: np.ndarray, start: int, n_frames: int, spec: Ac
     """List the label transitions inside ``[start, start + n_frames)``.
 
     A transition at frame ``t`` compares frame ``t`` with ``t - 1``. At episode frame 0 there is no previous
-    frame, so nothing is emitted for it.
+    frame, so nothing is emitted for it. The caller leaves out the episode's last frame (see ``make_review_sheet``).
 
     Args:
         actions: ``float[n, 51]`` labels of the whole episode.
@@ -173,7 +183,7 @@ def extract_transitions(actions: np.ndarray, start: int, n_frames: int, spec: Ac
 def random_mouse_rows(
     actions: np.ndarray, start: int, n_frames: int, spec: ActionSpec, seed: int, n_random: int = N_RANDOM_FRAMES
 ) -> list[Row]:
-    """Mouse-x and mouse-y rows for seeded random frames of the clip.
+    """Mouse-x and mouse-y rows for seeded random frames of ``[start, start + n_frames)``.
 
     Args:
         actions: ``float[n, 51]`` labels of the whole episode.
@@ -213,7 +223,9 @@ def make_review_sheet(
     ``mouse_frames`` (default 200) random frames for mouse direction and magnitude.
 
     Judge each row by the change from this frame to the next (the action on frame ``i`` is what the player does
-    between frame ``i`` and ``i + 1``). Rows are sorted by frame (then slot, label), so the same episode, window and seed give the same file.
+    between frame ``i`` and ``i + 1``). A window that ends at the episode's last frame has no frame after it, so
+    that frame gets no rows (neither transitions nor mouse rows); any other window gets rows for all of its frames.
+    Rows are sorted by frame (then slot, label), so the same episode, window and seed give the same file.
 
     Args:
         episode: Packed episode HDF5 (labels).
@@ -231,7 +243,7 @@ def make_review_sheet(
     """
     spec = ActionSpec.from_config(cfg if cfg is not None else load_config())
     _, actions, _ = read_episode(Path(episode))
-    n = _window(len(actions), start, n_frames)
+    n = _judgeable(len(actions), start, _window(len(actions), start, n_frames))
     rows = extract_transitions(actions, start, n, spec) + random_mouse_rows(actions, start, n, spec, seed, mouse_frames)
     rows.sort(key=lambda r: (r.frame, _SLOT_ORDER.index(r.slot), r.label))
     out_csv = Path(out_csv)
@@ -259,7 +271,7 @@ def load_fullres_frames(source: Path, start: int, n_frames: int, expected: int) 
         source: A directory of png/tga/jpg/bmp files (sorted by the integer in the name, file ``i`` is episode
             frame ``i``), or a full-res episode HDF5 written by ``pack``.
         start: First frame.
-        n_frames: Number of frames.
+        n_frames: Number of frames (to include a clip's next frame, pass the window length plus one).
         expected: The episode's frame count. The source must hold this many frames, or one more: the renderer
             adds a trailing frame ``T_n`` beyond the last labelled frame, which is dropped.
 
@@ -324,7 +336,9 @@ def _arrow(
     _text(img, label, at, 0.5)
 
 
-def draw_overlay(frame_bgr: np.ndarray, vec: np.ndarray, index: int, spec: ActionSpec) -> np.ndarray:
+def draw_overlay(
+    frame_bgr: np.ndarray, vec: np.ndarray, index: int, spec: ActionSpec, title: str | None = None
+) -> np.ndarray:
     """Upscale a frame and draw its label overlay.
 
     Args:
@@ -332,6 +346,7 @@ def draw_overlay(frame_bgr: np.ndarray, vec: np.ndarray, index: int, spec: Actio
         vec: ``float[51]`` action of this frame.
         index: Episode frame index to print.
         spec: Action layout.
+        title: Text for the top-left corner; defaults to ``frame {index}``.
 
     Returns:
         The annotated ``uint8[H * UPSCALE, W * UPSCALE, 3]`` image.
@@ -343,7 +358,7 @@ def draw_overlay(frame_bgr: np.ndarray, vec: np.ndarray, index: int, spec: Actio
     zx = int(np.argmin(np.abs(spec.mouse_x_centers_deg)))
     zy = int(np.argmin(np.abs(spec.mouse_y_centers_deg)))
 
-    _text(img, f"frame {index}", (10, 24), 0.7)
+    _text(img, title or f"frame {index}", (10, 24), 0.7)
 
     # Key and click boxes along the bottom edge.
     labels = [(k.upper() if len(k) == 1 and k.isalpha() else k, k in dec.keys) for k in spec.keys]
@@ -372,7 +387,10 @@ def render_overlay_clip(
     """Render the half-speed label-overlay video.
 
     The action shown on frame ``i`` is what the player does between frame ``i`` and ``i + 1``: judge each row by the
-    change from this frame to the next.
+    change from this frame to the next. If the episode has a frame after the window it is appended as a final
+    "next frame" (own overlay, titled ``frame K (next frame, not on the sheet)``) so the window's last row can be
+    judged. When the window ends at the episode's last frame there is no such frame, the clip ends there and the
+    review sheet has no rows for that frame.
 
     Args:
         episode: Packed episode HDF5 (labels).
@@ -393,7 +411,8 @@ def render_overlay_clip(
     spec = ActionSpec.from_config(cfg)
     _, actions, _ = read_episode(Path(episode))
     n = _window(len(actions), start, n_frames)
-    frames = load_fullres_frames(Path(frames_dir), start, n, expected=len(actions))
+    has_next = start + n < len(actions)
+    frames = load_fullres_frames(Path(frames_dir), start, n + has_next, expected=len(actions))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     h, w = frames.shape[1:3]
@@ -404,7 +423,8 @@ def render_overlay_clip(
         raise ValueError(f"cannot open a VideoWriter for {out}")
     try:
         for i, frame in enumerate(frames):
-            writer.write(draw_overlay(frame, actions[start + i], start + i, spec))
+            title = f"frame {start + i} (next frame, not on the sheet)" if i == n else None
+            writer.write(draw_overlay(frame, actions[start + i], start + i, spec, title))
     finally:
         writer.release()
     return out

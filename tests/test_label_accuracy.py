@@ -104,8 +104,10 @@ def test_sheet_deterministic_and_columns(tmp_path, episode):
     assert all(r["ok"] == "" for r in rows)
     frames = [int(r["frame"]) for r in rows]
     assert frames == sorted(frames)
-    # 7 transitions + 2 mouse rows for each of the 12 frames (clip shorter than 200).
-    assert len(rows) == 7 + 2 * N
+    # 7 transitions + 2 mouse rows for each judgeable frame (clip shorter than 200); the episode's last frame
+    # has no next frame, so it has no rows.
+    assert len(rows) == 7 + 2 * (N - 1)
+    assert max(frames) == N - 2
     assert {r["slot"] for r in rows} >= {"wasd", "jump", "fire", "switch", "reload", "mouse_x", "mouse_y"}
 
 
@@ -133,6 +135,49 @@ def test_sheet_mouse_frames_sets_the_number_of_mouse_rows(tmp_path, cfg, spec):
     assert sum(r["slot"] == "mouse_x" for r in rows) == 30
     assert sum(r["slot"] == "mouse_y" for r in rows) == 30
     assert len({r["frame"] for r in rows if r["slot"] == "mouse_x"}) == 30
+
+
+def sheet_frames(sheet: Path) -> set[int]:
+    return {int(r["frame"]) for r in csv.DictReader(sheet.open())}
+
+
+def test_sheet_drops_last_frame_rows_only_at_the_episode_end(tmp_path, episode):
+    low = episode[0]
+    # Window ending inside the episode: the clip has a next frame, so the window's last frame keeps its rows.
+    inside = la.make_review_sheet(low, 0, 10, tmp_path / "in.csv", seed=1)
+    assert 9 in sheet_frames(inside)
+    assert 10 not in sheet_frames(inside)
+    # Window ending at the episode's last frame: that frame has nothing to compare with.
+    end = la.make_review_sheet(low, 4, None, tmp_path / "end.csv", seed=1)
+    assert N - 1 not in sheet_frames(end)
+    assert N - 2 in sheet_frames(end)
+
+
+def test_sheet_last_frame_transition_is_dropped_only_at_the_episode_end(tmp_path, cfg, spec):
+    actions = np.stack([encode(["w"] if t == 5 else [], False, False, 0.0, 0.0, spec) for t in range(8)])
+    res = write_episode(np.zeros((8, H, W, 3), np.uint8), actions, meta("tr"), tmp_path / "low", cfg)
+    inside = la.make_review_sheet(res.low_res_path, 0, 6, tmp_path / "a.csv")  # frame 6 exists as the next frame
+    assert any(r["slot"] == "wasd" and r["frame"] == "5" for r in csv.DictReader(inside.open()))
+    # "w down" on the episode's last frame (7): left out of the sheet.
+    last = np.stack([encode(["w"] if t == 7 else [], False, False, 0.0, 0.0, spec) for t in range(8)])
+    res2 = write_episode(np.zeros((8, H, W, 3), np.uint8), last, meta("tr2"), tmp_path / "low", cfg)
+    end = la.make_review_sheet(res2.low_res_path, 0, None, tmp_path / "b.csv")
+    assert not any(r["slot"] == "wasd" for r in csv.DictReader(end.open()))
+
+
+def test_random_mouse_rows_never_land_on_an_unjudgeable_frame(tmp_path, cfg, spec):
+    n = 300
+    rng = np.random.default_rng(2)
+    actions = np.stack([encode([], False, False, rng.normal() * 3, rng.normal(), spec) for _ in range(n)])
+    res = write_episode(np.zeros((n, H, W, 3), np.uint8), actions, meta("big2"), tmp_path / "low", cfg)
+    for seed in range(5):
+        sheet = la.make_review_sheet(res.low_res_path, 0, None, tmp_path / f"s{seed}.csv", seed=seed, mouse_frames=n)
+        assert sheet_frames(sheet) == set(range(n - 1))
+
+
+def test_single_frame_window_at_the_episode_end_has_no_rows(tmp_path, episode):
+    sheet = la.make_review_sheet(episode[0], N - 1, 1, tmp_path / "s.csv")
+    assert sheet_frames(sheet) == set()
 
 
 def write_sheet(path: Path, rows: list[tuple[str, str]]) -> Path:
@@ -207,7 +252,7 @@ def test_render_from_hdf5(tmp_path, cfg, episode):
     out = la.render_overlay_clip(low, full, 2, 8, tmp_path / "clip.mp4", cfg)
     assert out.exists()
     count, size, fps = read_back(out)
-    assert (count, size) == (8, (W * la.UPSCALE, H * la.UPSCALE))
+    assert (count, size) == (8 + 1, (W * la.UPSCALE, H * la.UPSCALE))  # 8 frames plus the next frame
     assert fps == pytest.approx(cfg.timing.fps / 2)
 
 
@@ -220,6 +265,29 @@ def test_render_from_image_dir(tmp_path, cfg, episode):
         cv2.imwrite(str(d / f"seg_{i}.png"), f)
     out = la.render_overlay_clip(low, d, 0, N, tmp_path / "clip.mp4", cfg)
     assert read_back(out)[:2] == (N, (W * la.UPSCALE, H * la.UPSCALE))
+
+
+def test_clip_ends_with_next_frame_only_inside_the_episode(tmp_path, cfg, episode):
+    low, full, _ = episode
+    assert read_back(la.render_overlay_clip(low, full, 0, 5, tmp_path / "a.mp4", cfg))[0] == 6
+    assert read_back(la.render_overlay_clip(low, full, 0, N - 1, tmp_path / "b.mp4", cfg))[0] == N
+    assert read_back(la.render_overlay_clip(low, full, 0, N, tmp_path / "c.mp4", cfg))[0] == N
+    assert read_back(la.render_overlay_clip(low, full, N - 1, 1, tmp_path / "d.mp4", cfg))[0] == 1
+
+
+def test_next_frame_title_changes_the_overlay(spec):
+    frame = np.zeros((H, W, 3), np.uint8)
+    vec = synthetic_actions(spec)[0]
+    plain = la.draw_overlay(frame, vec, 5, spec)
+    tagged = la.draw_overlay(frame, vec, 5, spec, "frame 5 (next frame, not on the sheet)")
+    assert not np.array_equal(plain, tagged)
+
+
+def test_image_dir_loads_one_more_frame_for_the_next_frame(tmp_path):
+    for i in range(4):
+        cv2.imwrite(str(tmp_path / f"f{i}.png"), np.full((4, 6, 3), i * 10, np.uint8))
+    got = la.load_fullres_frames(tmp_path, 1, 3, expected=4)
+    assert [int(f[0, 0, 0]) for f in got] == [10, 20, 30]
 
 
 def test_image_dir_sorted_by_integer(tmp_path):
