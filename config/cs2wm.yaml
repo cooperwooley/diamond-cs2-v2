@@ -76,6 +76,13 @@ qa:
   max_fill_ticks: 2                 # missing demo tick => use the nearest present tick within this distance
   max_speed_ups: 320.0
   teleport_factor: 1.5              # displacement > factor * max_speed / fps => fail
+  # Render-to-demo lag guard (pack, #88): camera rotation of the rendered frames against the demo yaw. With render.tick_offset
+  # applied the lag should be ~0; a demo whose measured |lag| exceeds the max fails. No verdict (turning too little, r or
+  # pair count under the minimum) only logs a warning.
+  max_render_lag_ticks: 2
+  min_render_lag_r: 0.5
+  min_render_lag_pairs: 200
+  render_lag_max_pairs: 2000        # frame pairs measured per demo (evenly spaced episodes), to keep pack cheap
 
 segment:
   policy: longest_remaining         # bots; human sessions use fixed_player
@@ -134,11 +141,11 @@ generate:
   max_failures: 3                   # give up after this many sessions (or publishes) in a row without a usable chunk
 
 render:
-  # mirv_tick = demo_tick + tick_offset (applied by segment when it writes the plan). The #14 muzzle-flash estimate is +7 ticks
-  # (a frame shows the state ~7 ticks before its nominal tick). Camera rotation on render2 gave +4.6 ticks (r 0.94, see
-  # docs/HLAE_NOTES.md); its two spectated bots agree (+5 and +4). Set to +5; the pilot run (#19) re-checks it on a render
-  # with a known schedule.
-  tick_offset: 5
+  # mirv_tick = demo_tick + tick_offset (applied by segment when it writes the plan). +5 was right for CS2 build 26445667
+  # (camera rotation on render2 gave a lag of -4.6 ticks, #73). On build 26598758 (Nov 11 patch) the measured lag with +5
+  # is +4.5 ticks, so the raw lag is about -0.5 and the offset is 0 (#88). pack re-measures the lag on every demo and fails
+  # the demo when it is off by more than qa.max_render_lag_ticks, so the next patch that moves it is caught.
+  tick_offset: 0
   timeout_factor: 3.0               # x demo length (demo_end_tick / tickrate)
   startup_s: 60                     # CS2 launch + demo load, added to the timeout (the demo plays ~13 s after launch)
   # tga | ffmpeg. tga (afxClassic): ~94 fps (5.9x realtime), 2.76 MB/frame at 1280x720 (~159 GB per rendered hour at 16 fps),

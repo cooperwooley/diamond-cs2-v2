@@ -229,6 +229,7 @@ def validate_config(cfg: DictConfig) -> None:
 
     if cfg.qa.max_fill_ticks < 0:
         problems.append(f"qa.max_fill_ticks must be >= 0, got {cfg.qa.max_fill_ticks}")
+    _check_render_lag(cfg.qa, problems)
 
     if cfg.demo.backend not in ("demoinfocs", "demoparser2"):
         problems.append(f"demo.backend must be demoinfocs or demoparser2, got {cfg.demo.backend!r}")
@@ -241,6 +242,24 @@ def validate_config(cfg: DictConfig) -> None:
 
     if problems:
         raise ConfigError("invalid cs2wm config:\n  - " + "\n  - ".join(problems))
+
+
+def _check_render_lag(qa: DictConfig, problems: list[str]) -> None:
+    """Append problems with the ``qa.*render_lag*`` keys (the pack guard of #88)."""
+    for key, low, high in (
+        ("max_render_lag_ticks", 0, None),
+        ("min_render_lag_r", 0, 1),
+        ("min_render_lag_pairs", 3, None),
+        ("render_lag_max_pairs", 3, None),
+    ):
+        value = qa.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            problems.append(f"qa.{key} must be a number, got {value!r}")
+        elif value < low or (high is not None and value > high):
+            problems.append(f"qa.{key} must be in [{low}, {high if high is not None else 'inf'}], got {value}")
+    pairs, cap = qa.get("min_render_lag_pairs"), qa.get("render_lag_max_pairs")
+    if isinstance(pairs, (int, float)) and isinstance(cap, (int, float)) and pairs > cap:
+        problems.append(f"qa.min_render_lag_pairs ({pairs}) must be <= qa.render_lag_max_pairs ({cap})")
 
 
 def _validate_supervisor(sup: DictConfig, problems: list[str]) -> None:

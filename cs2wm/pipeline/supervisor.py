@@ -622,7 +622,10 @@ class Supervisor:
         def pack(demo_id: str) -> dict[str, Any]:
             from cs2wm.pipeline import pack as pk
 
-            results = pk.run(demo_id, cfg)
+            try:
+                results = pk.run(demo_id, cfg)
+            except pk.RenderLagError as exc:
+                raise StageFailure(str(exc)) from exc  # an expected failure: the reason, not a traceback
             return {"packed_episodes": len(results), "frames": sum(r.n_frames for r in results)}
 
         return {"segment": segment, "render": render, "extract": extract, "pack": pack}[stage]

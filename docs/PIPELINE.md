@@ -41,7 +41,12 @@ generate -> segment -> render -> extract_actions -> pack -> sync        (run by:
 5. **pack** (#12, `cs2wm.pipeline.pack`). Writes one HDF5 file per episode in v1's `frame_i_x`/`frame_i_y` schema at
    30x56 (resized exactly as v1 did), a deterministic ~10% full-res JPEG subset, and a `manifest.jsonl` of sha256s
    (rewritten per run, so re-runs never duplicate lines). Each episode is read back and its actions must equal the
-   labels. `frames/<demo_id>/` and `labels/<demo_id>/` are deleted once every episode is packed.
+   labels. `frames/<demo_id>/` and `labels/<demo_id>/` are deleted once every episode is packed. Before writing, pack
+   measures the render-to-demo lag of the demo from the camera rotation of its frames against the spectated player's
+   yaw (`cs2wm.eval.render_offset`, #88) and stores it as the optional attrs `render_lag_ticks` and `render_lag_r`. A
+   verdict (`qa.min_render_lag_r`, `qa.min_render_lag_pairs`) with a lag beyond `qa.max_render_lag_ticks` (2) fails the
+   demo with a reason that names the lag and says `render.tick_offset` needs re-measuring for this CS2 build; no
+   verdict only logs a warning.
 6. **sync** (#16, `cs2wm.pipeline.sync`). rsyncs HDF5, demos and QA to the Mill, verifies every checksum there, and
    only then deletes the local HDF5. With `sync.batch_mode: false` (password mode) it opens one shared ssh connection
    first (`ControlMaster`, closed with `ssh -O exit` at the end), so the SSO password and Duo are asked once on the
@@ -99,8 +104,10 @@ Defined once, in `cs2wm.timeline`; no other module may re-derive it.
 - Labeling the last frame `n - 1` needs the state at `T_n`, so every episode renders one extra frame (`end_tick` is
   the tick of frame `n`).
 - `render.tick_offset` corrects the render-to-demo offset: the plan schedules `mirv_cmd` at
-  `mirv_tick = demo_tick + tick_offset`. The #14 muzzle-flash estimate is +7 ticks (provisional; the config value
-  stays 0 until it is measured, #73).
+  `mirv_tick = demo_tick + tick_offset`. It is 0 for CS2 build 26598758 (Nov 11 patch): +5 was measured on build
+  26445667 (#73), but on 26598758 the lag with +5 is +4.5 ticks, so the raw lag is about -0.5 (#88; see
+  `docs/HLAE_NOTES.md`). The #14 muzzle-flash estimate (+7 ticks) is not used. `pack` re-measures the lag on every
+  demo, so the next patch that moves it is caught on the first demo.
 - HLAE writes `n + 1` frames for a record span of `4n` ticks (start `T0`, end `T0 + 4n`), which is the extra frame above.
 
 Examples with `T0 = 0`: an event at tick 4 is in frame 0 (window `(0, 4]`); an event at tick 5 is in frame 1
