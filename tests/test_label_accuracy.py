@@ -123,6 +123,18 @@ def test_sheet_random_frames_seeded(tmp_path, cfg, spec):
     assert sheet.read_bytes() != other.read_bytes()
 
 
+def test_sheet_mouse_frames_sets_the_number_of_mouse_rows(tmp_path, cfg, spec):
+    n = 400
+    rng = np.random.default_rng(1)
+    actions = np.stack([encode([], False, False, rng.normal() * 3, rng.normal(), spec) for _ in range(n)])
+    res = write_episode(np.zeros((n, H, W, 3), np.uint8), actions, meta("big"), tmp_path / "low", cfg)
+    sheet = la.make_review_sheet(res.low_res_path, 0, n, tmp_path / "s.csv", seed=1, mouse_frames=30)
+    rows = list(csv.DictReader(sheet.open()))
+    assert sum(r["slot"] == "mouse_x" for r in rows) == 30
+    assert sum(r["slot"] == "mouse_y" for r in rows) == 30
+    assert len({r["frame"] for r in rows if r["slot"] == "mouse_x"}) == 30
+
+
 def write_sheet(path: Path, rows: list[tuple[str, str]]) -> Path:
     with path.open("w", newline="") as f:
         w = csv.writer(f)
