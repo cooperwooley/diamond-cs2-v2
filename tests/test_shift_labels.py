@@ -116,7 +116,8 @@ def root(tmp_path: Path) -> Path:
 
 
 def _run(shift: ModuleType, root: Path, demos: Path, *flags: str) -> int:
-    return shift.main(["--root", str(root), "--demos", str(demos), *flags])
+    build = ["--build", "26598758"] if "--apply" in flags and "--build" not in flags else []
+    return shift.main(["--root", str(root), "--demos", str(demos), *build, *flags])
 
 
 def test_shift_drops_the_last_frame_and_the_first_action(shift, root, tmp_path) -> None:
@@ -231,6 +232,51 @@ def test_demos_file_needs_at_least_one_id(shift, root, tmp_path) -> None:
     empty.write_text("# nothing\n")
     assert _run(shift, root, empty, "--apply") == 2
     assert shift.read_demo_ids(_demos_file(tmp_path, "a", "b")) == ["a", "b"]
+
+
+# --- safety rails ----------------------------------------------------------------------------------------------
+
+
+def _set_attr(path: Path, key: str, value) -> None:
+    with h5py.File(path, "r+") as f:
+        f.attrs[key] = value
+
+
+def test_apply_needs_a_build(shift, root, tmp_path, capsys) -> None:
+    before = _digests(root, DEMO)
+    assert shift.main(["--root", str(root), "--demos", str(_demos_file(tmp_path, DEMO)), "--apply"]) == 2
+    assert "--build" in capsys.readouterr().err and _digests(root, DEMO) == before
+
+
+def test_files_of_another_build_are_refused(shift, root, tmp_path, capsys) -> None:
+    before = _digests(root, DEMO)
+    assert _run(shift, root, _demos_file(tmp_path, DEMO), "--apply", "--build", "26445667") == 1
+    out = capsys.readouterr().out
+    assert "cs2_build is" in out and "not 26445667" in out and "refusing" in out
+    assert _digests(root, DEMO) == before
+
+
+def test_files_packed_after_the_fix_are_refused(shift, verify, root, tmp_path, capsys) -> None:
+    path = min((root / "hdf5" / KIND / DEMO).glob("*.hdf5"))
+    _set_attr(path, "render_lag_ticks", 0.2)
+    before = sha256_file(path)
+    assert _run(shift, root, _demos_file(tmp_path, DEMO), "--apply") == 1
+    assert "render_lag_ticks" in capsys.readouterr().out
+    assert sha256_file(path) == before and "label_shift_frames" not in read_episode(path)[2]
+    with pytest.raises(shift.ShiftError, match="render_lag_ticks"):
+        shift.shift_file(path, apply=True, build="26598758")
+
+
+def test_a_failing_file_still_gets_the_manifest_synced_for_the_files_shifted_before_it(
+    shift, verify, root, tmp_path, capsys
+) -> None:
+    low = sorted((root / "hdf5" / KIND / DEMO).glob("*.hdf5"))
+    _set_attr(low[1], "render_lag_ticks", 0.0)  # the second low-res file is refused, the first is shifted before it
+    assert _run(shift, root, _demos_file(tmp_path, DEMO), "--apply") == 1
+    out = capsys.readouterr().out
+    assert "FAIL" in out and "rewrote 2 record(s)" in out  # the shifted file and the one the test edited
+    assert read_episode(low[0])[2]["n_frames"] == N - 1 and read_episode(low[1])[2]["n_frames"] == N
+    _verify(verify, root, DEMO)  # the manifest matches every file as it is now
 
 
 # --- the pooled lag report --------------------------------------------------------------------------------------

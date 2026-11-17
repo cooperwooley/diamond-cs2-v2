@@ -107,7 +107,12 @@ Defined once, in `cs2wm.timeline`; no other module may re-derive it.
   `mirv_tick = demo_tick + tick_offset`. It is 0 for CS2 build 26598758 (Nov 11 patch): +5 was measured on build
   26445667 (#73), but on 26598758 the lag with +5 is +4.5 ticks, so the raw lag is about -0.5 (#88; see
   `docs/HLAE_NOTES.md`). The #14 muzzle-flash estimate (+7 ticks) is not used. `pack` re-measures the lag on every
-  demo, so the next patch that moves it is caught on the first demo.
+  demo, so the next patch that moves it is caught on the first demo. The 29 demos already synced from 26598758 are fixed
+  on the Mill by `scripts/shift_labels.py --build 26598758` (list: `scripts/mill/shift88_demos.txt`; hardlink backup with
+  `cp -al` first). Afterwards the PC's manifests of those demos are stale: every sync rsyncs the whole `hdf5/` tree,
+  manifests included, and verifies every demo with a local manifest, so they would overwrite the rewritten ones. Move
+  them out of the tree first, to `<data>/backup/manifests_pre88/<kind>/<demo_id>/manifest.jsonl`; the demos stay
+  `synced` in the pipeline state.
 - HLAE writes `n + 1` frames for a record span of `4n` ticks (start `T0`, end `T0 + 4n`), which is the extra frame above.
 
 Examples with `T0 = 0`: an event at tick 4 is in frame 0 (window `(0, 4]`); an event at tick 5 is in frame 1

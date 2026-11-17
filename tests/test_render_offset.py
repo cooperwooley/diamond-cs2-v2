@@ -54,8 +54,8 @@ def _segment(lag: int, start_tick: int = T0, wrap: bool = False, with_pitch: boo
 
 
 def _with(seg: Segment, **changes) -> Segment:
-    fields = {"dx": seg.dx, "dy": seg.dy, "start_tick": seg.start_tick, "ticks_per_frame": seg.ticks_per_frame}
-    return Segment(**{**fields, "yaw": seg.yaw, "pitch": seg.pitch, **changes})
+    fields = {f: getattr(seg, f) for f in Segment.__dataclass_fields__}
+    return Segment(**{**fields, **changes})
 
 
 @pytest.mark.parametrize("lag", [-5, 0, 3, 7])
@@ -99,6 +99,17 @@ def test_large_jumps_are_left_out() -> None:
     yaw.loc[yaw.index >= T0 + 200] += 40.0  # a respawn-like jump: the pairs across it are dropped
     res = measure_lag([_with(seg, yaw=yaw)])
     assert res is not None and res.lag == 3 and res.r > 0.9
+
+
+def test_spectator_cuts_in_the_image_cannot_mask_the_lag() -> None:
+    seg = _segment(3)
+    assert seg.max_shift_px == 0.25 * W
+    dx = seg.dx.copy()
+    dx[[20, 21, 60, 61, 90]] = [900.0, -700.0, 1100.0, -1000.0, 800.0]  # phase-correlation wraps at cuts
+    unfiltered = measure_lag([_with(seg, dx=dx, max_shift_px=float("inf"))])
+    res = measure_lag([_with(seg, dx=dx)])
+    assert unfiltered is not None and unfiltered.r < 0.5  # the cuts swamp the correlation without the limit
+    assert res is not None and res.lag == 3 and res.r > 0.9 and res.n_pairs < measure_lag([seg]).n_pairs
 
 
 def test_no_turning_has_no_verdict() -> None:

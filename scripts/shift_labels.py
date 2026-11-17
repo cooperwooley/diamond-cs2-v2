@@ -21,6 +21,18 @@ The default is a dry run that prints what would change; ``--apply`` writes. ``--
 lag (``corr(-dx[t], mouse_x_deg[t + lag])`` of the low-res frames) per CS2 build and for listed vs other demos, to
 show before and after: the listed demos should peak at +1 before and 0 after, the others at 0.
 
+Safety: ``--apply`` needs ``--build`` (``26598758``). A file whose ``cs2_build`` attr differs, or that already has
+``render_lag_ticks`` (packed after the ``tick_offset`` fix, so it is aligned), is refused and reported as a problem, never
+shifted. If a file of a demo fails, the files before it stay shifted and the demo's manifest is still brought in line.
+
+On the Mill, take a hardlink backup first (``cp -al``); that is safe because every write here is a temp file renamed over
+the original, so the backup keeps the old inode and content.
+
+After the shift, the PC's manifests for these demos are stale. Every supervisor sync rsyncs the PC's whole ``hdf5/``
+tree, manifests included, and verifies every demo that has a local manifest, so a stale one would overwrite the rewritten
+Mill manifest. Before the next sync move the PC copies out of the tree, to
+``<data>/backup/manifests_pre88/<kind>/<demo_id>/manifest.jsonl``; the demos stay ``synced`` in the pipeline state.
+
 Not touched: ``qa/<demo>.jsonl`` (it records the planned episode frame counts, not the packed ones).
 """
 
@@ -41,15 +53,14 @@ import numpy as np
 
 from cs2wm.actions import ActionSpec
 from cs2wm.config import load_config
+from cs2wm.eval.render_offset import MAX_SHIFT_FRAC
 from cs2wm.eval.rotation import estimate_shift_phasecorr
 from cs2wm.pipeline.pack import _fsync_path, sha256_file, write_manifest
 
 SHIFT_ATTR = "label_shift_frames"
+LAG_ATTR = "render_lag_ticks"  # written by pack since #88, i.e. packed after the tick_offset fix
 REPORT_LAGS = (-2, -1, 0, 1, 2)
 MAX_MOUSE_DEG = 15.0  # report: pairs with a larger turn per frame are cuts or glitches (the #73 rule)
-MAX_SHIFT_FRAC = (
-    0.25  # report: pairs whose image shift exceeds this fraction of the frame width are phase-correlation wraps
-)
 _TRANSIENT_SUFFIXES = (".staging", ".old", ".deleting")
 
 
@@ -62,7 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", required=True, help="synced data root (holds hdf5/ and hdf5_fullres/)")
     p.add_argument("--demos", help="file with one demo id per line: the demos to shift")
-    p.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")
+    p.add_argument("--apply", action="store_true", help="write the changes (default: dry run); needs --build")
+    p.add_argument(
+        "--build", help="CS2 build the demos were rendered on (26598758); files of any other build are refused"
+    )
     p.add_argument("--report", action="store_true", help="print the pooled frame-level lag instead of shifting")
     return p
 
@@ -87,24 +101,30 @@ def _h5_attrs(f: h5py.File) -> dict[str, Any]:
     return {k: f.attrs[k] for k in f.attrs}
 
 
-def shift_file(path: Path, apply: bool) -> str:
+def shift_file(path: Path, apply: bool, build: str | None = None) -> str:
     """Shift one episode file by one frame (see the module docstring).
 
     Args:
         path: Low-res or full-res episode HDF5.
         apply: Write the file; False only reports what would happen.
+        build: Required ``cs2_build`` attr; a file of another build is refused. None skips the check (dry runs).
 
     Returns:
         ``"skipped"`` if the file already has ``label_shift_frames``, else ``"shifted"`` (or ``"would shift"``).
 
     Raises:
-        ShiftError: If the file has fewer than 2 frames or lacks a frame or an attr.
+        ShiftError: If the file has fewer than 2 frames or lacks a frame or an attr, is of another CS2 build than
+            ``build``, or already has ``render_lag_ticks`` (it was packed after the fix and must never be shifted).
     """
     path = Path(path)
     with h5py.File(path, "r") as src:
         attrs = _h5_attrs(src)
         if SHIFT_ATTR in attrs:
             return "skipped"
+        if LAG_ATTR in attrs:
+            raise ShiftError(f"{path}: has {LAG_ATTR} (packed after the tick_offset fix), refusing to shift it")
+        if build is not None and str(attrs.get("cs2_build")) != str(build):
+            raise ShiftError(f"{path}: cs2_build is {attrs.get('cs2_build')!r}, not {build}, refusing to shift it")
         try:
             n, start = int(attrs["n_frames"]), int(attrs["start_tick"])
             ticks = int(attrs["tickrate"]) // int(attrs["fps"])
@@ -176,7 +196,7 @@ def sync_manifest(low_dir: Path, full_dir: Path, apply: bool, pending: frozenset
     return changed
 
 
-def shift_demos(root: Path, demo_ids: Sequence[str], apply: bool) -> int:
+def shift_demos(root: Path, demo_ids: Sequence[str], apply: bool, build: str | None = None) -> int:
     """Shift every episode of the listed demos; prints one line per file and a summary.
 
     Returns:
@@ -195,17 +215,23 @@ def shift_demos(root: Path, demo_ids: Sequence[str], apply: bool) -> int:
         for low_dir, full_dir in dirs:
             files = sorted(low_dir.glob("*.hdf5")) + (sorted(full_dir.glob("*.hdf5")) if full_dir.is_dir() else [])
             pending: set[Path] = set()
+            problem = False
             try:
                 for path in files:
-                    status = shift_file(path, apply)
+                    status = shift_file(path, apply, build)
                     counts[status] += 1
                     print(f"{status:<11} {path.relative_to(hdf5.parent)}")
                     if status == "would shift":
                         pending.add(path)
-                stale = sync_manifest(low_dir, full_dir, apply, frozenset(pending))
             except (ShiftError, OSError, ValueError, KeyError) as e:
                 print(f"FAIL {demo_id}: {e}")
-                failed += 1
+                failed, problem = failed + 1, True
+            try:  # also after a failure: the manifest must match the files that were shifted before it
+                stale = sync_manifest(low_dir, full_dir, apply, frozenset(pending))
+            except (ShiftError, OSError, ValueError, KeyError) as e:
+                if not problem:
+                    print(f"FAIL {demo_id}: {e}")
+                    failed += 1
                 continue
             verb = "rewrote" if apply else "would rewrite"
             print(f"manifest    {demo_id}: {verb} {stale} record(s)")
@@ -291,7 +317,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not demo_ids:
         print("error: --demos FILE with at least one demo id is required to shift", file=sys.stderr)
         return 2
-    return shift_demos(root, demo_ids, args.apply)
+    if args.apply and not args.build:
+        print("error: --apply needs --build (the CS2 build of the demos, e.g. 26598758)", file=sys.stderr)
+        return 2
+    return shift_demos(root, demo_ids, args.apply, args.build)
 
 
 if __name__ == "__main__":

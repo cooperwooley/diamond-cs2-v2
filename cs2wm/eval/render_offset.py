@@ -7,7 +7,8 @@ measures what is left, with the method of #73:
 * the camera shift between consecutive frames comes from phase correlation on the upper 60% of the frame (the lower part
   holds the viewmodel and HUD, which do not move with the camera);
 * it is correlated with the spectated player's d-yaw over the ticks ``(T_k + L, T_k + ticks_per_frame + L]`` for every
-  lag ``L`` in ``-16..+16``; pairs with ``|d-yaw| >= 15`` degrees (respawns, spectator cuts) are left out;
+  lag ``L`` in ``-16..+16``; pairs with ``|d-yaw| >= 15`` degrees (respawns, spectator cuts) and pairs whose image shift is over ``MAX_SHIFT_FRAC`` of the frame
+  width (the same cuts seen from the image side) are left out;
 * the lag with the highest correlation is the answer, refined to sub-tick precision by a parabola through the peak.
 
 Sign conventions: ``L > 0`` means the frame shows the state ``L`` ticks **after** its nominal tick (the render is
@@ -30,6 +31,9 @@ from cs2wm.eval.rotation import estimate_shift_phasecorr
 
 LAGS = tuple(range(-16, 17))
 MAX_ABS_DELTA_DEG = 15.0  # pairs with a larger demo d-angle are spectator glitches, not camera motion
+# Pairs whose image shift is over this fraction of the frame width are phase-correlation wraps (a spectator cut returns
+# a shift in the hundreds of pixels), not camera motion; they would mask the real lag.
+MAX_SHIFT_FRAC = 0.25
 UPPER_FRACTION = 0.6  # the part of the frame (from the top) that the shift is measured on
 _MIN_PAIRS = 3
 
@@ -45,6 +49,8 @@ class Segment:
         ticks_per_frame: Demo ticks between two frames (``timing.tickrate // timing.fps``).
         yaw: Demo yaw in degrees of the spectated player, indexed by tick.
         pitch: Demo pitch in degrees indexed by tick, or None to skip the pitch estimate.
+        max_shift_px: Pairs whose |dx| or |dy| exceeds this are left out (``MAX_SHIFT_FRAC`` of the frame width when
+            made by ``from_frames``; no limit by default).
     """
 
     dx: np.ndarray
@@ -53,6 +59,7 @@ class Segment:
     ticks_per_frame: int
     yaw: pd.Series
     pitch: pd.Series | None = None
+    max_shift_px: float = math.inf
 
     @classmethod
     def from_frames(
@@ -65,7 +72,7 @@ class Segment:
     ) -> Segment:
         """Measure the shifts of ``frames_bgr`` (``uint8[m, H, W, 3]``) and keep only those, not the frames."""
         dx, dy = frame_shifts(frames_bgr)
-        return cls(dx, dy, int(start_tick), int(ticks_per_frame), yaw, pitch)
+        return cls(dx, dy, int(start_tick), int(ticks_per_frame), yaw, pitch, MAX_SHIFT_FRAC * frames_bgr.shape[2])
 
 
 @dataclass(frozen=True)
@@ -136,7 +143,12 @@ def _pairs(seg: Segment, lag: int, axis: str) -> tuple[np.ndarray, np.ndarray]:
     if axis == "yaw":
         delta = _wrap(delta)
     shift = seg.dx if axis == "yaw" else -seg.dy
-    ok = np.isfinite(delta) & np.isfinite(shift) & (np.abs(delta) < MAX_ABS_DELTA_DEG)
+    ok = (
+        np.isfinite(delta)
+        & np.isfinite(shift)
+        & (np.abs(delta) < MAX_ABS_DELTA_DEG)
+        & (np.abs(shift) <= seg.max_shift_px)
+    )
     return shift[ok], delta[ok]
 
 
