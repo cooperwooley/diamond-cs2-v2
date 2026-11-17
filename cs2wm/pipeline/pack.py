@@ -3,7 +3,8 @@
 Each file holds ``frame_{i}_x`` (``uint8 (30, 56, 3)`` BGR) and ``frame_{i}_y`` (``float32 (51,)``) plus attrs
 (``n_frames``, ``schema_version``, ``fps``, ``tickrate``, ``start_tick``, ``demo_id``, ``kind``, ``player``,
 ``cs2_build``, ``demoparser2_version``, ``cs2wm_git_sha``, ``config_sha256``); the provenance ones are required meta
-keys. Writes are atomic (temp file, fsync, rename).
+keys. Writes are atomic (temp file, fsync, rename). ``run`` also measures the render-to-demo lag of each demo and stores
+it as the optional attrs ``render_lag_ticks`` and ``render_lag_r`` (#88).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -28,10 +30,12 @@ from omegaconf import DictConfig
 
 from cs2wm import demo
 from cs2wm.actions import ACTION_DIM
-from cs2wm.config import config_sha256
+from cs2wm.config import config_sha256, ticks_per_frame
+from cs2wm.eval.render_offset import LagResult, Segment, measure_lag, player_angles
 from cs2wm.pipeline.extract_actions import labels_dir, read_qa, sweep_deleting
 from cs2wm.pipeline.generate import _git_sha
 from cs2wm.pipeline.segment import episodes_from_plan, read_render_plan
+from cs2wm.timeline import EpisodeSpec
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +70,10 @@ _RESERVED_ATTRS = frozenset(
 
 class PackError(RuntimeError):
     """A packed episode does not hold what was meant to be written."""
+
+
+class RenderLagError(PackError):
+    """The rendered frames are off from the demo ticks by more than ``qa.max_render_lag_ticks``."""
 
 
 @dataclass(frozen=True)
@@ -419,6 +427,65 @@ def _read_frames(seg_dir: Path, first: int, n: int, size: tuple[int, int]) -> np
     return frames
 
 
+def _measure_render_lag(
+    cfg: DictConfig, demo_id: str, jobs: Sequence[tuple[EpisodeSpec, Path, int]], size: tuple[int, int]
+) -> LagResult | None:
+    """Render-to-demo lag of a demo from its passing episodes, or None if it could not be measured.
+
+    Episodes are taken evenly spaced until about ``qa.render_lag_max_pairs`` frame pairs are covered, so the cost per
+    demo is bounded. Reading the demo ticks may fail; that is a missing measurement, not a failed demo.
+
+    Args:
+        cfg: A validated cs2wm config.
+        demo_id: Demo id.
+        jobs: ``(episode, segment frame dir, first frame index)`` of every passing episode.
+        size: Rendered frame ``(H, W)``.
+    """
+    if not jobs:
+        return None
+    total = sum(ep.n_frames - 1 for ep, _, _ in jobs)
+    chosen = jobs[:: max(1, math.ceil(total / int(cfg.qa.render_lag_max_pairs)))]
+    demo_path = Path(cfg.paths.demos) / chosen[0][0].kind / f"{demo_id}.dem"
+    try:
+        ticks = demo.load_ticks(demo_path, ["yaw", "pitch"], players=sorted({ep.user_id for ep, _, _ in chosen}))
+        segments = []
+        for ep, seg_dir, first in chosen:
+            yaw, pitch = player_angles(ticks, ep.user_id)
+            frames = _read_frames(seg_dir, first, ep.n_frames, size)
+            segments.append(Segment.from_frames(frames, ep.start_tick, ticks_per_frame(cfg), yaw, pitch))
+        return measure_lag(segments)
+    except Exception:
+        log.warning("%s: could not measure the render-to-demo lag", demo_id, exc_info=True)
+        return None
+
+
+def _check_render_lag(cfg: DictConfig, demo_id: str, result: LagResult | None) -> dict[str, float]:
+    """Judge a measured lag; returns the episode attrs to store (empty when there is no verdict).
+
+    Raises:
+        RenderLagError: If there is a verdict and ``|lag|`` exceeds ``qa.max_render_lag_ticks``.
+    """
+    qa = cfg.qa
+    if result is None or result.r < float(qa.min_render_lag_r) or result.n_pairs < int(qa.min_render_lag_pairs):
+        found = "nothing to correlate" if result is None else result.summary()
+        log.warning(
+            "%s: no verdict on the render-to-demo lag (%s; needs r >= %s and >= %s pairs)",
+            demo_id,
+            found,
+            qa.min_render_lag_r,
+            qa.min_render_lag_pairs,
+        )
+        return {}
+    if abs(result.lag_subtick) > float(qa.max_render_lag_ticks):
+        raise RenderLagError(
+            f"rendered frames are {result.lag_subtick:+.1f} ticks off from the demo "
+            f"(r {result.r:.2f}, {result.n_pairs} pairs; limit +-{qa.max_render_lag_ticks}): render.tick_offset "
+            f"({cfg.render.tick_offset}) needs re-measuring for this CS2 build"
+        )
+    log.info("%s: render-to-demo %s", demo_id, result.summary())
+    return {"render_lag_ticks": round(result.lag_subtick, 3), "render_lag_r": round(result.r, 4)}
+
+
 def _sidecar(cfg: DictConfig, kind: str, demo_id: str) -> dict[str, Any]:
     try:
         with open(Path(cfg.paths.demos) / kind / f"{demo_id}.json", encoding="utf-8") as f:
@@ -533,6 +600,12 @@ def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
     differ or when neither is known (an empty string is stored then). ``demoparser2_version`` comes from the plan,
     ``cs2wm_git_sha`` from the sidecar (else the current commit).
 
+    Render lag guard (#88): before anything is written, the lag between the rendered frames and the demo ticks is
+    measured over the passing episodes (camera rotation against the spectated player's yaw, ``cs2wm.eval.render_offset``).
+    With ``render.tick_offset`` applied it should be about 0. A verdict (``r >= qa.min_render_lag_r`` over at least
+    ``qa.min_render_lag_pairs`` pairs) with ``|lag| > qa.max_render_lag_ticks`` fails the demo; no verdict logs a
+    warning. The lag and r are stored as the optional episode attrs ``render_lag_ticks`` and ``render_lag_r``.
+
     Args:
         demo_id: Demo id.
         cfg: A validated cs2wm config.
@@ -545,6 +618,7 @@ def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
         ValueError: If ``render.json`` was made from a different plan, or an episode is missing from the QA file or
             from ``render.json``.
         PackError: If a stored action or frame does not match what should have been written.
+        RenderLagError: If the measured render-to-demo lag exceeds ``qa.max_render_lag_ticks``.
     """
     plan_path = Path(cfg.paths.plans) / demo_id / "render_plan.json"
     plan_sha = sha256_file(plan_path)
@@ -595,6 +669,13 @@ def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
         "cs2wm_git_sha": sidecar.get("cs2wm_git_sha") or _git_sha(),
     }
 
+    jobs = [
+        (ep, frames_root / where[ep.episode_id][0], int(where[ep.episode_id][1]))
+        for ep in passing
+        if ep.episode_id in where
+    ]
+    lag_meta = _check_render_lag(cfg, demo_id, _measure_render_lag(cfg, demo_id, jobs, size))
+
     staging = {  # kind -> (low-res staging dir, full-res staging dir)
         k: (
             Path(cfg.paths.hdf5) / k / f"{demo_id}.staging",
@@ -624,6 +705,7 @@ def run(demo_id: str, cfg: DictConfig) -> list[PackResult]:
                 "user_id": ep.user_id,  # demo user_id of the spectated player (bots share steamid 0); H2 needs it
                 "start_tick": ep.start_tick,
                 **provenance,
+                **lag_meta,
             }
             out, full = staging[ep.kind]
             result = write_episode(frames, labels, meta, out, cfg, fullres_dir=full)

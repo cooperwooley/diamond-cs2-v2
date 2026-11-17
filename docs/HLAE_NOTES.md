@@ -174,8 +174,8 @@ Spectating:
 Ticks: the UI tick and demoinfocs `IngameTick()` equal the `mirv_cmd addAtTick` tick (CGameRules reports +224, the
 `server_start_tick` offset, which is not used). Muzzle flashes appeared ~2 frames later than
 `ceil((fire_tick - T0) / 4)`; the best fit over three bursts is **+7 ticks** (16/21 shots matched at +7, 11/21 at 0).
-`render.tick_offset` applies it as `mirv_tick = demo_tick + tick_offset` but stays 0 until it is measured from camera
-rotation (#73): see the measurement below.
+`render.tick_offset` applies it as `mirv_tick = demo_tick + tick_offset`; the value comes from camera rotation (#73,
+#88): see the measurements below.
 
 ### Measured tick offset (#73)
 
@@ -197,8 +197,29 @@ apart.
 
 The second kept render, `lock30` (T0 4000), could not be used: its cfg and spectated entity are not in the #14 log and
 no single bot (nor a split at the camera jumps) correlates with it (best r 0.12-0.3 at inconsistent lags), so it did
-not confirm the number. The two spectated bots inside `render2` agree (+5 and +4), so `render.tick_offset` is set to
-+5; the pilot run (#19) re-checks it on a render with a known schedule.
+not confirm the number. The two spectated bots inside `render2` agree (+5 and +4), so `render.tick_offset` was set to
++5 for build 26445667; the pilot run (#19) re-checks it on a render with a known schedule.
+
+### Re-measured on the Nov 11 build (#88)
+
+The label hand-check (#18) found the video one frame ahead of the labels. Same method (phase correlation on the upper
+60% of the 280x150 frames, d-yaw of the spectated player over `(T0 + 4k + L, T0 + 4k + 4 + L]`, pairs with
+`|d-yaw| >= 15` deg left out), now `cs2wm.eval.render_offset`. A lag `L > 0` means a frame shows the state `L` ticks
+**after** its nominal tick.
+
+| render | CS2 build at render | `tick_offset` | best lag L (yaw) | r | best lag (pitch) |
+|---|---|---|---|---|---|
+| `render2` (the #73 capture), re-measured | 26445667 | 0 | -5 / -4 (two bots) | 0.96 / 0.95 | |
+| `dm_20261112-060957_002` s008-c00 (label-check episode) | 26598758 | 5 | **+4 / +5** (tie) | 0.94 | +5 (r 0.92) |
+
+Re-measuring `render2` reproduces #73 (a frame shows the state ~4.6 ticks before its nominal tick), so the method is
+sound. On build 26598758 with `tick_offset: 5` a frame shows the state ~4.5 ticks **after** its nominal tick: the
+render-to-demo lag of the new client is about -0.5, and the +5 correction overshoots by about one frame (4 ticks).
+`render.tick_offset` is therefore 0 for build 26598758. Effect of the overshoot: action `k` describes the motion into
+frame `k` instead of out of it. The 29 demos rendered that way are fixed in place by `scripts/shift_labels.py`
+(frames `[:-1]`, actions `[1:]`, `start_tick += 4`, attr `label_shift_frames`); the 38 demos rendered on 26445667 were
+rendered on the client #73 measured. `pack` now measures the lag on every demo and fails a demo whose lag is off by more
+than `qa.max_render_lag_ticks`.
 
 ### Output and frame counts
 

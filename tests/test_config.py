@@ -80,10 +80,19 @@ def _bad(tmp_path: Path, overrides: list[str]) -> str:
         (["qa.min_fire_recall=1.5"], "qa.min_fire_recall"),
         (["qa.max_missing_tick_frac=-0.1"], "qa.max_missing_tick_frac"),
         (["qa.max_fill_ticks=-1"], "qa.max_fill_ticks"),
+        (["qa.max_render_lag_ticks=-1"], "qa.max_render_lag_ticks"),
+        (["qa.min_render_lag_r=1.5"], "qa.min_render_lag_r"),
+        (["qa.min_render_lag_pairs=0"], "qa.min_render_lag_pairs"),
+        (["qa.render_lag_max_pairs=abc"], "qa.render_lag_max_pairs"),
+        (["qa.min_render_lag_pairs=500", "qa.render_lag_max_pairs=100"], "must be <= qa.render_lag_max_pairs"),
     ],
 )
 def test_validation_rules(tmp_path: Path, overrides: list[str], needle: str) -> None:
     assert needle in _bad(tmp_path, overrides)
+
+
+def test_render_tick_offset_is_zero_for_the_current_build(cfg) -> None:
+    assert cfg.render.tick_offset == 0  # #88: +5 was right for build 26445667 only
 
 
 def test_missing_default_slot_fails(tmp_path: Path) -> None:

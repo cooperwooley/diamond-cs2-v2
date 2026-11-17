@@ -27,7 +27,7 @@ Contents: [1 Provenance](#1-provenance) - [2 Pipeline summary](#2-pipeline-summa
 | FOV | CS2's fixed 90 degrees (4:3-based), which is about 106.26 degrees horizontal at 16:9 (`eval.h1.hfov_deg`, to be refit on ground truth in #32) | candidate until #14 |
 | Demo type | `TBD(#14): GOTV (tv_record) or client (record) demos, whichever contains full tick and event data for every bot` | #14 decides; gates #13 |
 | Episode kinds | `dm` (bots only), `human` (a human plays against bots, #22), `smoke` (grenade-heavy, #23) (`episodes.kinds`) | |
-| Render | HLAE `mirv_streams`, captured before the UI, 16 fps (`timing.fps`). `TBD(#14): output format (tga or ffmpeg, render.output_format), render.tick_offset (config says 0, to be measured), segment.settle_ticks (config says 32, to be tuned)` | `config/cs2/render_base.cfg`; candidate until #14 |
+| Render | HLAE `mirv_streams`, captured before the UI, 16 fps (`timing.fps`). `TBD(#14): output format (tga or ffmpeg, render.output_format), render.tick_offset (0 for build 26598758, #88), segment.settle_ticks (config says 32, to be tuned)` | `config/cs2/render_base.cfg`; candidate until #14 |
 
 ## 2. Pipeline summary
 
@@ -41,7 +41,7 @@ Defined once, in `cs2wm/timeline.py`.
 - Frame `k` of an episode is the image rendered at tick `T_k = T0 + 4k`, where `T0` is the episode's `start_tick` (HDF5 attr).
 - Action `k` covers the tick window `(T_k, T_{k+1}]`, open at the start and closed at the end: it is what the player did while frame `k` was on screen and before frame `k+1`. An event at tick `t` belongs to frame `ceil((t - T0) / 4) - 1`.
 - Labeling frame `n-1` needs the state at `T_n`, so an episode of `n` labeled frames needs `n + 1` rendered frames. Only the `n` frames that have an action are stored: `write_episode` requires frames and actions to have the same length, so the extra frame is rendered and then not packed.
-- `render.tick_offset` (config value 0) corrects any measured render-to-demo offset. `TBD(#14): measured tick-to-frame offset`.
+- `render.tick_offset` corrects the render-to-demo offset. It is 0 for CS2 build 26598758 and was +5 for build 26445667 (#73, #88; `docs/HLAE_NOTES.md`). Demos of 26598758 rendered with +5 are one frame ahead of their labels; `scripts/shift_labels.py` fixes the packed files (attr `label_shift_frames`, section 8.1).
 
 Worked example with `T0 = 1000` and `n = 3`. The rendered frames are at ticks 1000, 1004, 1008 and 1012; the first three are stored and 1012 is used only for labeling.
 
@@ -381,6 +381,9 @@ File attrs (Python scalars; `read_episode` returns them as plain Python values):
 | `cs2_build` | str or int | CS2 build ID |
 | `demoparser2_version` | str | parser version used for the labels: `demodump <n> (demoinfocs <version>)`, or the demoparser2 version with `demo.backend: demoparser2` (the attr keeps its old name) |
 | `cs2wm_git_sha` | str | cs2wm commit used for the labels |
+| `render_lag_ticks` | float, optional | Render-to-demo lag in ticks measured by `pack` for the whole demo (camera rotation against the spectated player's yaw, #88); about 0 when `render.tick_offset` is right. Absent when there was no verdict and in older files |
+| `render_lag_r` | float, optional | Peak correlation of that measurement |
+| `label_shift_frames` | int, optional | `1` once `scripts/shift_labels.py` has dropped the last frame and the first action (and added one frame of ticks to `start_tick`) of an episode rendered one frame ahead of its labels (#88). Absent otherwise |
 
 The caller may pass further scalar (str, int, float, bool or None) meta keys, which are written as attrs too (None becomes the empty string); keys that collide with the writer's own attrs are rejected. `jpeg_quality` appears in the full-res file only.
 

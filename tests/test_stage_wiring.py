@@ -18,11 +18,14 @@ import pytest
 from cs2wm import cli, demo
 from cs2wm.actions import ActionSpec
 from cs2wm.config import load_config
+from cs2wm.eval.render_offset import LagResult
 from cs2wm.pipeline import extract_actions, pack, render, segment
-from cs2wm.pipeline.pack import PackError, read_episode, to_low_res
+from cs2wm.pipeline.pack import PackError, RenderLagError, read_episode, to_low_res
 from cs2wm.pipeline.supervisor import PipelineState, Supervisor
+from cs2wm.timeline import EpisodeSpec
 from tests.test_demo import FakeParser
 from tests.test_render import FakeLauncher, _hooks_clock
+from tests.test_render_offset import N_FRAMES, TPF, synthetic_render
 from tests.test_sync import LocalTransport
 
 DEMO = "dm-0001"
@@ -579,6 +582,7 @@ def test_a_failing_first_pack_leaves_no_output_at_all(cfg, use_parser, fake_hlae
 
 def test_frame_alignment_check_catches_wrongly_sliced_frames(cfg, use_parser, fake_hlae, monkeypatch) -> None:
     run_to_extracted(cfg, use_parser, fake_hlae)
+    monkeypatch.setattr(pack, "_measure_render_lag", lambda *a, **k: None)  # its reads are not the slicing under test
     real = pack._read_frames
     calls = {"n": 0}
 
@@ -650,3 +654,118 @@ def test_segment_prints_each_plan_path(cfg, use_parser, capsys) -> None:
     out = capsys.readouterr().out.splitlines()
     assert out[:2] == [f"segment {d}: {Path(cfg.paths.plans) / d / 'render_plan.json'}" for d in ("dm-0001", "dm-0002")]
     assert out[2] == "segment: 2 done, 0 failed, 2 considered"
+
+
+# --- render lag guard (#88) --------------------------------------------------------------------------------------
+
+
+def lag_result(lag: float, r: float = 0.9, pairs: int = 500) -> LagResult:
+    return LagResult(round(lag), lag, r, pairs, {})
+
+
+def test_pack_stores_the_measured_lag_on_every_episode_file(cfg, use_parser, fake_hlae, monkeypatch, caplog) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    monkeypatch.setattr(pack, "_measure_render_lag", lambda *a, **k: lag_result(0.4, r=0.93))
+    with caplog.at_level("INFO", logger="cs2wm.pipeline.pack"):
+        results = pack.run(DEMO, cfg)
+    assert "lag +0.40 ticks" in caplog.text
+    for result in results:
+        for path in (result.low_res_path, result.fullres_path):
+            attrs = read_episode(path)[2]
+            assert attrs["render_lag_ticks"] == 0.4 and attrs["render_lag_r"] == 0.93
+
+
+@pytest.mark.parametrize(
+    "weak",
+    [None, lag_result(4.0, r=0.3), lag_result(4.0, pairs=50)],  # an off lag, but too weak to trust
+    ids=["nothing", "low_r", "few_pairs"],
+)
+def test_pack_without_a_verdict_warns_and_packs_without_the_attrs(
+    cfg, use_parser, fake_hlae, monkeypatch, caplog, weak
+) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    monkeypatch.setattr(pack, "_measure_render_lag", lambda *a, **k: weak)
+    results = pack.run(DEMO, cfg)
+    assert "no verdict on the render-to-demo lag" in caplog.text
+    assert len(results) == 2
+    for result in results:
+        for path in (result.low_res_path, result.fullres_path):
+            attrs = read_episode(path)[2]
+            assert "render_lag_ticks" not in attrs and "render_lag_r" not in attrs
+
+
+def test_pack_fails_the_demo_when_the_lag_is_off(cfg, use_parser, fake_hlae, monkeypatch) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    monkeypatch.setattr(pack, "_measure_render_lag", lambda *a, **k: lag_result(4.5))
+    with pytest.raises(RenderLagError, match=r"\+4\.5 ticks.*render\.tick_offset.*re-measuring"):
+        pack.run(DEMO, cfg)
+    assert not list((Path(cfg.paths.hdf5) / "dm" / DEMO).glob("*"))  # nothing half-packed, inputs kept for a retry
+    assert (Path(cfg.paths.frames) / DEMO).is_dir() and (Path(cfg.paths.labels) / DEMO).is_dir()
+
+
+def test_the_supervisor_reports_a_lag_failure_as_the_reason(cfg, use_parser, fake_hlae, monkeypatch) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    monkeypatch.setattr(pack, "_measure_render_lag", lambda *a, **k: lag_result(-3.0))
+    assert cli.main(["pack", "--all-pending"]) != 0
+    rec = state_of(cfg)
+    assert rec["state"] == "failed" and rec["failed_stage"] == "pack"
+    assert "-3.0 ticks" in rec["reason"] and not rec["reason"].startswith("RenderLagError")
+
+
+def test_a_lag_at_the_limit_passes(cfg, use_parser, fake_hlae, monkeypatch) -> None:
+    run_to_extracted(cfg, use_parser, fake_hlae)
+    monkeypatch.setattr(pack, "_measure_render_lag", lambda *a, **k: lag_result(-2.0))
+    assert len(pack.run(DEMO, cfg)) == 2
+
+
+def _episode_on_disk(tmp_path: Path, n_episodes: int, lag: int) -> tuple[list, pd.DataFrame]:
+    """``n_episodes`` episodes with synthetic frames at ``lag`` as PNGs, and the demo tick table of their player."""
+    jobs, tables = [], []
+    for i in range(n_episodes):
+        start = 1000 + 1000 * i
+        frames, yaw, pitch = synthetic_render(lag, start_tick=start, with_pitch=True)
+        seg_dir = tmp_path / f"seg{i}"
+        seg_dir.mkdir()
+        for k, frame in enumerate(frames):
+            cv2.imwrite(str(seg_dir / f"{k:06d}.png"), frame)
+        ep = EpisodeSpec(f"ep{i}", DEMO, "dm", "Bot A", 1, 0, start, N_FRAMES - 1, TPF, i, 0)
+        jobs.append((ep, seg_dir, 0))
+        tables.append(pd.DataFrame({"tick": yaw.index, "user_id": 1, "yaw": yaw.to_numpy(), "pitch": pitch.to_numpy()}))
+    return jobs, pd.concat(tables, ignore_index=True)
+
+
+def test_measure_render_lag_reads_frames_and_ticks(cfg, tmp_path, monkeypatch) -> None:
+    jobs, ticks = _episode_on_disk(tmp_path, 2, lag=3)
+    asked = {}
+
+    def load_ticks(path, props, players=None, ticks_=None):
+        asked.update(path=path, props=list(props), players=list(players))
+        return ticks
+
+    monkeypatch.setattr(demo, "load_ticks", load_ticks)
+    res = pack._measure_render_lag(cfg, DEMO, jobs, (150, 280))
+    assert res is not None and res.lag == 3 and res.r > 0.9
+    assert asked["path"] == Path(cfg.paths.demos) / "dm" / f"{DEMO}.dem"
+    assert asked["props"] == ["yaw", "pitch"] and asked["players"] == [1]
+
+
+def test_measure_render_lag_caps_the_pairs_by_skipping_episodes(cfg, tmp_path, monkeypatch) -> None:
+    jobs, ticks = _episode_on_disk(tmp_path, 4, lag=0)
+    monkeypatch.setattr(demo, "load_ticks", lambda *a, **k: ticks)
+    capped = load_config(overrides=[f"paths.root={tmp_path}", f"qa.render_lag_max_pairs={2 * (N_FRAMES - 2)}"])
+    full = pack._measure_render_lag(cfg, DEMO, jobs, (150, 280))
+    half = pack._measure_render_lag(capped, DEMO, jobs, (150, 280))
+    assert full is not None and half is not None
+    assert half.n_pairs < 0.6 * full.n_pairs and half.lag == 0
+
+
+def test_measure_render_lag_survives_a_demo_that_cannot_be_read(cfg, tmp_path, monkeypatch, caplog) -> None:
+    jobs, _ = _episode_on_disk(tmp_path, 1, lag=0)
+
+    def broken(*args, **kwargs):
+        raise OSError("no dump")
+
+    monkeypatch.setattr(demo, "load_ticks", broken)
+    assert pack._measure_render_lag(cfg, DEMO, jobs, (150, 280)) is None
+    assert "could not measure" in caplog.text
+    assert pack._measure_render_lag(cfg, DEMO, [], (150, 280)) is None
