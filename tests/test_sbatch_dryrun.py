@@ -323,6 +323,7 @@ def test_python_command_and_staging(h: Harness) -> None:
     assert staged_ok == "staged_ok"  # the dataset was already staged (with its train/ dir) when python started
     assert h.logged("rsync.log") == [f"-a {h.s}/datasets/pilot/ {h.staged}/pilot/"]
     assert not h.staged.exists()  # removed on exit
+    assert f"Removed staged data {h.local}/" in res.stdout  # the log shows the cleanup (#21)
     assert not (h.local / os.environ.get("USER", "") / JOB_ID).exists()
 
 

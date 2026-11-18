@@ -160,7 +160,7 @@ python scripts/dataset_stats.py $S/datasets/pilot | tail -n 40
 
 # 2) 2-epoch sanity run, no resubmits
 sbatch -p $H100_PARTITION --gres=$H100_GRES --time=04:00:00 -J sanity \
-  --export=ALL,RUN_NAME=sanity-pilot,DATASET=pilot,HW=h100,RESUBMITS_LEFT=0,EXTRA="training.num_final_epochs=2 evaluation.every=1" \
+  --export=ALL,RUN_NAME=sanity-pilot,DATASET=pilot,HW=h100,RESUBMITS_LEFT=0,EXTRA="agent=cs2_denoiser_only training.num_final_epochs=2 evaluation.every=1" \
   scripts/mill/train.sbatch
 squeue -u $USER
 tail -f $S/logs/sanity-<jobid>.out          # Ctrl-C to stop following
@@ -169,7 +169,7 @@ ls -la $S/runs/sanity-pilot/checkpoints $S/runs/sanity-pilot/checkpoints/agent_v
 
 # 3) preemption test: 3 epochs, one allowed resubmit; send USR1 to the batch shell mid-epoch 2
 sbatch -p $H100_PARTITION --gres=$H100_GRES --time=04:00:00 -J preempt \
-  --export=ALL,RUN_NAME=sanity-preempt,DATASET=pilot,HW=h100,RESUBMITS_LEFT=1,EXTRA="training.num_final_epochs=3" \
+  --export=ALL,RUN_NAME=sanity-preempt,DATASET=pilot,HW=h100,RESUBMITS_LEFT=1,EXTRA="agent=cs2_denoiser_only training.num_final_epochs=3" \
   scripts/mill/train.sbatch
 # wait until metrics.jsonl has 1 line, then:
 scancel --signal=USR1 --batch <jobid>

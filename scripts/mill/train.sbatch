@@ -151,6 +151,7 @@ cleanup() {
     local rc=$?
     trap - EXIT
     rm -rf "$STAGE_DIR"
+    if [[ -e "$STAGE_DIR" ]]; then echo "WARNING: staged data $STAGE_DIR was not removed." >&2; else echo "Removed staged data $STAGE_DIR."; fi
     [[ "$OWNED" != 1 ]] || rm -f "$OWNER_FILE"
     case "$PHASE" in
         done | crash | failed)
@@ -280,7 +281,7 @@ fi
 cd "$REPO_DIR"
 MARKER=$STAGE_DIR/.launched
 touch "$MARKER"
-printf 'Launching: %q ' "${PY_CMD[@]}"
+printf 'Launching:'; printf ' %q' "${PY_CMD[@]}"
 echo
 "${PY_CMD[@]}" &
 PID=$!

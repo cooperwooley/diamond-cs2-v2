@@ -1,4 +1,4 @@
-# Denoiser-only agent: identical to cs2.yaml but with no upsampler (the v1 upsampler is reused as-is).
+# Denoiser-only agent: identical to cs2.yaml but with no upsampler. The main runs (sanity, #29, #30) use it; the upsampler is trained on its own (#70).
 # Train with `agent=cs2_denoiser_only`; env.path_data_full_res may then be null.
 _target_: agent.AgentConfig
 
