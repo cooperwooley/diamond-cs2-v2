@@ -18,14 +18,13 @@ import re
 import shutil
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import cv2
 import h5py
 import numpy as np
-import torch
-import torch.nn.functional as F
 from omegaconf import DictConfig
 
 from cs2wm import demo
@@ -100,17 +99,51 @@ def _check_frames(frames_bgr: np.ndarray) -> None:
         raise ValueError(f"frames must have shape [n, H, W, 3], got {frames_bgr.shape}")
 
 
+def _cubic(x: np.ndarray, a: float = -0.5) -> np.ndarray:
+    """Keys cubic convolution kernel, as in ``aten/src/ATen/native/UpSample.h`` (``a=-0.5``)."""
+    x = np.abs(x)
+    near = ((a + 2) * x - (a + 3)) * x * x + 1
+    far = (((x - 5) * x + 8) * x - 4) * a
+    return np.where(x < 1, near, np.where(x < 2, far, 0))
+
+
+@lru_cache(maxsize=16)
+def _resample_matrix(n_in: int, n_out: int) -> np.ndarray:
+    """Weight matrix ``float32[n_out, n_in]`` of torch's antialiased bicubic resize along one axis.
+
+    Follows ``_compute_indices_min_size_weights_aa`` in torch: the kernel support grows with the downscale factor,
+    centers are ``scale * (i + 0.5)`` (``align_corners=False``), taps outside the input are dropped and each row of
+    weights is normalized to sum to 1. The result is cached and must not be modified.
+    """
+    scale = n_in / n_out
+    support = 2.0 * scale if scale >= 1 else 2.0
+    inv_scale = 1.0 / scale if scale >= 1 else 1.0
+    m = np.zeros((n_out, n_in), dtype=np.float64)
+    for i in range(n_out):
+        center = scale * (i + 0.5)
+        lo = max(int(center - support + 0.5), 0)
+        hi = min(int(center + support + 0.5), n_in)
+        w = _cubic((np.arange(lo, hi) - center + 0.5) * inv_scale)
+        m[i, lo:hi] = w / w.sum()
+    out = m.astype(np.float32)
+    out.setflags(write=False)
+    return out
+
+
 def to_low_res(frames_bgr: np.ndarray, size: tuple[int, int] = (30, 56)) -> np.ndarray:
     """Downscale like v1 ``build_dataset.py::create_low_res_dataset``, with the uint8 cast clamped.
 
-    Steps: BGR to RGB, scale to [-1, 1], bicubic (antialiased) resize to ``size``,
-    ``add(1).div(2).mul(255)``, clamp to [0, 255], uint8, back to BGR. The clamp is the only intentional difference
-    from v1, whose ``.byte()`` wraps bicubic overshoot at hard edges (257.5 becomes 1).
+    Steps: scale to [-1, 1], bicubic (antialiased) resize to ``size``, ``add(1).div(2).mul(255)``, clamp to
+    [0, 255], truncating uint8 cast. The clamp is the only intentional difference from v1, whose ``.byte()`` wraps
+    bicubic overshoot at hard edges (257.5 becomes 1). Channels are resampled independently, so the BGR to RGB flip
+    and back that v1 does cancel out and is not done.
 
-    The resize calls ``torch.nn.functional.interpolate`` directly. That is exactly what v1's
-    ``torchvision.transforms.functional.resize`` does for a float tensor (bicubic, ``align_corners=False``, antialias,
-    no clamp or cast), and it avoids importing torchvision, whose compiled extension Windows Smart App Control blocks
-    on the render PC ("An Application Control policy has blocked this file").
+    The resize is a separable matrix product in float32 that reproduces torch's ``F.interpolate(mode="bicubic",
+    align_corners=False, antialias=True)``, which is what v1's ``torchvision.transforms.functional.resize`` does for a
+    float tensor. It does not import torch: Windows Smart App Control blocks torch's DLLs on the render PC, so pack
+    (and ``label-check``, which reads episodes through this module) has to run without it. Float rounding differs from
+    torch's kernel, so a few values (well under 0.1%) land one level off after the truncating cast. The play loop
+    (#31) still needs torch on the PC and is out of scope here.
 
     Args:
         frames_bgr: ``uint8[n, H, W, 3]`` frames.
@@ -123,13 +156,18 @@ def to_low_res(frames_bgr: np.ndarray, size: tuple[int, int] = (30, 56)) -> np.n
         ValueError: If the input is not a uint8 ``[n, H, W, 3]`` array.
     """
     _check_frames(frames_bgr)
-    out = np.empty((len(frames_bgr), *size, 3), dtype=np.uint8)
-    for start in range(0, len(frames_bgr), _CHUNK):
-        chunk = torch.from_numpy(np.ascontiguousarray(frames_bgr[start : start + _CHUNK]))
-        x = chunk.flip(3).permute(0, 3, 1, 2).float().div(255).mul(2).sub(1)
-        y = F.interpolate(x, size=list(size), mode="bicubic", align_corners=False, antialias=True)
-        y = y.add(1).div(2).mul(255).clamp(0, 255).byte()
-        out[start : start + _CHUNK] = y.flip(1).permute(0, 2, 3, 1).numpy()
+    n, h, w, c = frames_bgr.shape
+    wh = _resample_matrix(h, size[0])
+    ww_t = _resample_matrix(w, size[1]).T
+    out = np.empty((n, *size, c), dtype=np.uint8)
+    for start in range(0, n, _CHUNK):
+        x = frames_bgr[start : start + _CHUNK].astype(np.float32)
+        x = x / np.float32(255) * np.float32(2) - np.float32(1)
+        k = len(x)
+        x = (x.transpose(0, 1, 3, 2) @ ww_t).reshape(k, h, c * size[1])  # [k, H, C * W'], width first like torch
+        y = (wh @ x).reshape(k, size[0], c, size[1])
+        y = (y + np.float32(1)) / np.float32(2) * np.float32(255)
+        out[start : start + _CHUNK] = np.clip(y, 0, 255).astype(np.uint8).transpose(0, 1, 3, 2)
     return out
 
 
