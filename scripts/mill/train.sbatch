@@ -280,7 +280,7 @@ fi
 cd "$REPO_DIR"
 MARKER=$STAGE_DIR/.launched
 touch "$MARKER"
-printf 'Launching: %q ' "${PY_CMD[@]}"
+printf 'Launching:'; printf ' %q' "${PY_CMD[@]}"
 echo
 "${PY_CMD[@]}" &
 PID=$!
