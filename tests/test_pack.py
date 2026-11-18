@@ -10,6 +10,7 @@ import h5py
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
@@ -111,6 +112,51 @@ def test_to_low_res_rejects_bad_input(bad) -> None:
 
 # 2. v1 equivalence
 
+AGREE_MIN = 0.999
+
+
+def torch_low_res(frames_bgr: np.ndarray, size: tuple[int, int] = (30, 56)) -> np.ndarray:
+    """The torch implementation to_low_res replaced (clamped cast), as the parity reference."""
+    x = torch.from_numpy(frames_bgr).flip(3).permute(0, 3, 1, 2).float().div(255).mul(2).sub(1)
+    y = F.interpolate(x, size=list(size), mode="bicubic", align_corners=False, antialias=True)
+    return y.add(1).div(2).mul(255).clamp(0, 255).byte().flip(1).permute(0, 2, 3, 1).numpy()
+
+
+def assert_parity(frames: np.ndarray, size: tuple[int, int] = (30, 56)) -> float:
+    diff = np.abs(to_low_res(frames, size).astype(np.int16) - torch_low_res(frames, size))
+    agree = float((diff == 0).mean())
+    print(f"{frames.shape[1:3]} -> {size}: agreement {agree:.6f}, max abs diff {diff.max()}")
+    assert agree >= AGREE_MIN and diff.max() <= 1
+    return agree
+
+
+def structured_frames(n: int, h: int, w: int, seed: int = 0) -> np.ndarray:
+    """Noisy gradients with hard-edged rectangles, like a rendered scene (overshoot and clamp at the edges)."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = np.empty((n, h, w, 3), dtype=np.float32)
+    for i in range(n):
+        out[i] = 40 + 120 * (yy / h)[..., None] * rng.uniform(0.3, 1, 3) + 60 * (xx / w)[..., None]
+        for _ in range(6):
+            y0, x0 = rng.integers(0, h - 4), rng.integers(0, w - 4)
+            out[i, y0 : y0 + rng.integers(2, h // 2), x0 : x0 + rng.integers(2, w // 2)] = rng.choice([0, 255], 3)
+    return (out + rng.normal(0, 4, out.shape)).clip(0, 255).astype(np.uint8)
+
+
+@pytest.mark.parametrize("shape", [(150, 280), (64, 96), (33, 47), (200, 200), (30, 56)])
+def test_parity_with_torch_random(shape) -> None:
+    frames = np.random.default_rng(1).integers(0, 256, (12, *shape, 3), dtype=np.uint8)
+    assert_parity(frames)
+
+
+@pytest.mark.parametrize("shape", [(150, 280), (64, 96), (33, 47), (200, 200)])
+def test_parity_with_torch_structured(shape) -> None:
+    assert_parity(structured_frames(12, *shape))
+
+
+def test_parity_with_torch_other_target_size() -> None:
+    assert_parity(structured_frames(4, 90, 160), size=(45, 80))
+
 
 def test_matches_v1_on_smooth_images() -> None:
     frames = gradient_frames(4)
@@ -118,7 +164,9 @@ def test_matches_v1_on_smooth_images() -> None:
     ours = to_low_res(frames)
     in_range = (p >= 0) & (p <= 255)
     assert in_range.all()
-    assert np.array_equal(ours[in_range], v1[in_range])
+    # Linear ramps land on exact integers, where float rounding decides the truncating cast, so agreement is lower here.
+    assert (ours[in_range] == v1[in_range]).mean() >= 0.98
+    assert np.abs(ours.astype(np.int16) - v1).max() <= 1
 
 
 def test_clamps_where_v1_wraps() -> None:
@@ -128,11 +176,11 @@ def test_clamps_where_v1_wraps() -> None:
     out_of_range = (p < 0) | (p > 255)
     assert out_of_range.any(), "bar pattern must make bicubic overshoot"
     print(f"hard-edge wrap fraction: {out_of_range.mean():.4f}")
-    assert np.array_equal(ours[out_of_range], np.clip(p, 0, 255)[out_of_range].astype(np.uint8))
+    assert (ours[out_of_range] == np.clip(p, 0, 255)[out_of_range].astype(np.uint8)).mean() >= AGREE_MIN
     assert not np.array_equal(ours[out_of_range], v1[out_of_range])
     # v1's resize call omits antialias, but torchvision's default is antialias=True, so every in-range pixel must
-    # still be bit-identical: the clamp is the only intended difference.
-    assert np.array_equal(ours[~out_of_range], v1[~out_of_range])
+    # still match: the clamp is the only intended difference (up to float rounding at the truncating cast).
+    assert (ours[~out_of_range] == v1[~out_of_range]).mean() >= AGREE_MIN
 
 
 def test_v1_reader_path_works_on_v2_file(tmp_path, cfg) -> None:

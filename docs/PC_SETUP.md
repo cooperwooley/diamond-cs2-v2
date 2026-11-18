@@ -82,16 +82,20 @@ sources; on Linux it is ignored. Without it the lookup order is env `DCS2_DEMODU
 finding out hours later. Each demo is parsed once and the tables are cached in `<DCS2_ROOT>\demo_cache` (keyed by path,
 size and mtime; safe to delete). `demo.backend: demoparser2` switches back to the old parser.
 
-## Windows Smart App Control blocks torchvision
+## Windows Smart App Control blocks torch and torchvision
 
 On this PC, Windows Smart App Control (WinError 4551, "An Application Control policy has blocked this file") blocks
-torchvision's compiled extension `torchvision\_C_stable.pyd`, so `import torchvision` fails in `C:\dcs2\venv` with
-`operator torchvision::nms does not exist`. torch itself, h5py, OpenCV and demoparser2 load fine. A self-built, unsigned `demodump.exe` is blocked the same
+unsigned native libraries. It blocked torchvision's compiled extension `torchvision\_C_stable.pyd`, so `import
+torchvision` fails in `C:\dcs2\venv` with `operator torchvision::nms does not exist`. Since the Nov 12 Windows update
+(KB5132061, KB5132688) it also blocks torch's DLLs (`torch\lib\shm.dll`), so `import torch` can fail there too (#87).
+h5py, OpenCV and demoparser2 load fine. A self-built, unsigned `demodump.exe` is blocked the same
 way (`OSError: [WinError 4551]`), which is why the exporter runs through WSL.
 
-- The Windows pipeline stages don't import torchvision: `pack` resizes with `torch.nn.functional.interpolate`, which is
-  what v1's torchvision resize does for float tensors (bit-identical; `tests/test_pack.py` checks it against
-  torchvision on Linux).
+- The Windows pipeline stages import neither torch nor torchvision: `pack` (and `label-check`, which reads episodes
+  through it) resizes with a numpy reimplementation of torch's antialiased bicubic resize. It agrees with torch on
+  more than 99.9% of values and never differs by more than 1 (`tests/test_pack.py` checks it against torch on Linux,
+  `tests/test_no_torch_import.py` that the night pipeline imports without torch).
+- The play loop and FPS benchmark (#28, #31) still need torch with CUDA on the PC.
 - Anything that needs torchvision, such as the LPIPS evals (#27, #33, via the `lpips` package), runs in WSL or on the
   Mill instead.
 - Don't turn Smart App Control off to work around this: it can't be turned back on without reinstalling Windows.

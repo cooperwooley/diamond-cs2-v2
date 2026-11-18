@@ -406,6 +406,7 @@ def test_low_res_clamps_bicubic_overshoot_instead_of_wrapping() -> None:
     expected = y.clamp(0, 255).byte().permute(0, 2, 3, 1).numpy()
     assert (wrapped != expected).any()
     low = uc.frames_to_tensor(to_low_res(uc._to_bgr_uint8(uc.frames_to_tensor(gt))))
-    np.testing.assert_array_equal(((low + 1) / 2 * 255).round().permute(0, 2, 3, 1).numpy().astype(np.uint8), expected)
+    got = ((low + 1) / 2 * 255).round().permute(0, 2, 3, 1).numpy().astype(np.int16)
+    assert np.abs(got - expected).max() <= 1  # numpy resize vs torch: float rounding at the truncating cast
     # Saturated, not wrapped: the overshooting white-edge pixels are 255 and the dark ones 0.
     assert low.max() == 1.0 and low.min() == -1.0
