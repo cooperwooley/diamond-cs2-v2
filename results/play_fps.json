@@ -1,0 +1,52 @@
+{
+  "device": "cuda",
+  "gpu": "NVIDIA GeForce RTX 3060",
+  "torch": "2.14.1+cu130",
+  "note": "per-frame time = model step + GPU-to-CPU frame conversion; excludes display, overlay and recording",
+  "n_frames": 64,
+  "warmup_steps": 3,
+  "ckpt": "/mnt/c/dcs2/data/checkpoints/v2/v2-main-e150.pt",
+  "upsampler_ckpt": "/mnt/c/dcs2/data/checkpoints/v2/v2-upsampler-e150.pt",
+  "results": {
+    "denoiser_1step_fp32": {
+      "status": "ok",
+      "fps": 28.313937716028303,
+      "ms_per_frame": 35.31829482813009
+    },
+    "denoiser_1step_bf16": {
+      "status": "ok",
+      "fps": 16.48420881887408,
+      "ms_per_frame": 60.66411867186616
+    },
+    "denoiser_3step_fp32": {
+      "status": "ok",
+      "fps": 10.034935030125219,
+      "ms_per_frame": 99.65186590625308
+    },
+    "denoiser_3step_bf16": {
+      "status": "ok",
+      "fps": 9.16513229248826,
+      "ms_per_frame": 109.10917246874874
+    },
+    "upsampler_1step_fp32": {
+      "status": "ok",
+      "fps": 12.309599736984998,
+      "ms_per_frame": 81.23740993750062
+    },
+    "upsampler_1step_bf16": {
+      "status": "ok",
+      "fps": 11.010299963578335,
+      "ms_per_frame": 90.82404687501366
+    },
+    "upsampler_3step_fp32": {
+      "status": "ok",
+      "fps": 4.348387301578781,
+      "ms_per_frame": 229.97031557812875
+    },
+    "upsampler_3step_bf16": {
+      "status": "ok",
+      "fps": 3.7363190347478854,
+      "ms_per_frame": 267.6430975781159
+    }
+  }
+}

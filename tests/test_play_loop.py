@@ -140,6 +140,18 @@ def test_restart_restores_the_initial_context(agent, cfg) -> None:
     assert torch.equal(world._ctx_obs, frames) and torch.equal(world.full_res, start_full)
 
 
+def test_reset_accepts_tensor_actions_that_numpy_cannot_read(agent, cfg) -> None:
+    # On CUDA, restart() hands reset() device tensors, which np.asarray cannot convert. A tensor that requires grad
+    # fails np.asarray the same way on CPU, so this covers the play crash on the RTX 3060 (#31) in CI.
+    world = WorldModel(agent, 1, use_upsampler=False)
+    actions = torch.zeros(4, ACTION_DIM, requires_grad=True)
+    world.reset(torch.zeros(4, 3, 30, 56), actions)
+    assert world._ctx_act.dtype == torch.float32 and torch.equal(world._ctx_act, torch.zeros(4, ACTION_DIM))
+    world.step(idle(cfg))
+    world.restart()
+    assert torch.equal(world._ctx_act, torch.zeros(4, ACTION_DIM))
+
+
 def test_world_model_errors(agent) -> None:
     with pytest.raises(RuntimeError, match="before reset"):
         WorldModel(agent, 1, use_upsampler=False).step(np.zeros(ACTION_DIM, np.float32))
