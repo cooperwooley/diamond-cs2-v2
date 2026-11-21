@@ -62,3 +62,6 @@ Thumbs.db
 
 # Built by scripts/build_demodump.sh (#72)
 /bin/
+
+# per-frame H1 CSVs (~9 MB each) stay on the PC: $DCS2_ROOT/eval/h1_frames
+results/h1/*_frames.csv

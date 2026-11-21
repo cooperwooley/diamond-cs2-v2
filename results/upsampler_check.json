@@ -1,0 +1,68 @@
+{
+  "v2": {
+    "upsampler": {
+      "psnr": {
+        "mean": 27.4278621673584,
+        "std": 1.2872345447540283
+      },
+      "ssim": {
+        "mean": 0.8839852213859558,
+        "std": 0.0570932999253273
+      },
+      "lpips": {
+        "mean": 0.0994546115398407,
+        "std": 0.07668780535459518
+      }
+    },
+    "n": 256,
+    "bicubic": {
+      "psnr": {
+        "mean": 25.85123634338379,
+        "std": 1.701027750968933
+      },
+      "ssim": {
+        "mean": 0.6737778782844543,
+        "std": 0.06571611016988754
+      },
+      "lpips": {
+        "mean": 0.5633434057235718,
+        "std": 0.04602319374680519
+      }
+    }
+  },
+  "verdict": {
+    "criteria": {
+      "v2_vs_v1_lpips": {
+        "threshold_ratio": 1.15,
+        "passed": null
+      },
+      "v2_beats_bicubic": {
+        "v2_upsampler_lpips": 0.0994546115398407,
+        "v2_bicubic_lpips": 0.5633434057235718,
+        "passed": true
+      }
+    },
+    "passed": null,
+    "summary": "INCOMPLETE: no --v1-fullres, so v2 vs v1 LPIPS was not evaluated (v2 upsampler beats bicubic)"
+  },
+  "n_requested": 256,
+  "denoising_steps": 1,
+  "checkpoint": {
+    "path": "/mnt/c/dcs2/data/checkpoints/v2/v2-upsampler-e150.pt",
+    "sha256_16": "6da69e0aca0daabc"
+  },
+  "seed": 0,
+  "device": "cuda",
+  "torch_version": "2.14.1+cu130",
+  "git_sha": "e45d84f",
+  "notes": [
+    "v2 ground truth and the previous-frame conditioning are JPEG-decoded (10% JPEG subset) while v1 is raw: this biases the comparison against v2 (conservative).",
+    "Scores are teacher-forced (previous frame = GT t-1, s_cond=0); in play the previous frame is generated, so they are optimistic relative to play."
+  ],
+  "grid": {
+    "written": true,
+    "rows": {
+      "v2": 4
+    }
+  }
+}
