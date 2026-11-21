@@ -304,7 +304,9 @@ class WorldModel:
         Raises:
             ValueError: If fewer than ``n_cond`` frames or actions are given.
         """
-        act = torch.as_tensor(np.asarray(actions), dtype=torch.float32)
+        # restart() passes back the stored device tensors; np.asarray cannot read a CUDA tensor, so keep tensors as is.
+        act = actions if isinstance(actions, torch.Tensor) else torch.as_tensor(np.asarray(actions))
+        act = act.detach().to(torch.float32)
         if len(frames) < self.n_cond or len(act) < self.n_cond:
             raise ValueError(f"need {self.n_cond} context frames and actions, got {len(frames)} and {len(act)}")
         obs = frames[-self.n_cond :].to(self.device, torch.float32)
