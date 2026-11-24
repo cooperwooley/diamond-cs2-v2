@@ -125,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--invert-mouse", action="store_true", help="flip both mouse axes (WSLg reports the captured mouse reversed)"
     )
+    p.add_argument("--fullscreen", action="store_true", help="play full screen (Esc quits)")
 
     p = sub.add_parser("eval", help="evaluations (#27, #32, #33, #34)")
     ev = p.add_subparsers(dest="eval_cmd", required=True, metavar="<experiment>")
@@ -432,6 +433,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.benchmark,
             args.bf16,
             args.compile,
+            args.fullscreen,
         )
     elif cmd == "eval":
         _dispatch_eval(args)

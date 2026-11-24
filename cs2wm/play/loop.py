@@ -129,6 +129,8 @@ class PlaySession:
         no_upsampler: Display bicubic even if ``upsampler_ckpt`` is given.
         bf16: Sample under bf16 autocast (CUDA only).
         compile: ``torch.compile`` the models.
+        fullscreen: Fill the screen (scaled, aspect kept), so a cursor the window cannot confine (WSLg) has
+            nowhere to drift.
         agent: A ready agent, used instead of loading the checkpoints (tests).
         event_source: Returns the frame's pygame events; defaults to ``pygame.event.get`` (tests).
         max_frames: Stop after this many frames (tests); None plays until Esc or the window is closed.
@@ -146,6 +148,7 @@ class PlaySession:
         no_upsampler: bool = False,
         bf16: bool = False,
         compile: bool = False,
+        fullscreen: bool = False,
         agent: Agent | None = None,
         event_source: Callable[[], Iterable[Any]] | None = None,
         max_frames: int | None = None,
@@ -160,6 +163,7 @@ class PlaySession:
         self.no_upsampler = no_upsampler
         self.bf16 = bf16
         self.compile = compile
+        self.fullscreen = fullscreen
         self.agent = agent
         self.event_source = event_source
         self.max_frames = max_frames
@@ -195,7 +199,8 @@ class PlaySession:
         writer = None
         pg.init()
         try:
-            screen = pg.display.set_mode(size)
+            # SCALED keeps the logical size, so drawing is unchanged; the window is stretched to the screen, aspect kept.
+            screen = pg.display.set_mode(size, pg.FULLSCREEN | pg.SCALED if self.fullscreen else 0)
             pg.display.set_caption("cs2wm play  |  Esc quit  Backspace reset  F1 overlay")
             pg.mouse.set_visible(False)
             pg.event.set_grab(True)
@@ -369,6 +374,7 @@ def run(
     benchmark_frames: int | None = None,
     bf16: bool = False,
     compile: bool = False,
+    fullscreen: bool = False,
 ) -> None:
     """CLI entry: play interactively, or benchmark when ``benchmark_frames`` is set.
 
@@ -383,6 +389,7 @@ def run(
         benchmark_frames: If set, run ``benchmark`` with this many frames instead of playing.
         bf16: Sample under bf16 autocast (CUDA only).
         compile: ``torch.compile`` the models.
+        fullscreen: Play full screen.
 
     Raises:
         SystemExit: If neither ``upsampler_ckpt`` nor ``no_upsampler`` is given for interactive play.
@@ -393,5 +400,14 @@ def run(
     if upsampler_ckpt is None and not no_upsampler:
         raise SystemExit("pass --upsampler-ckpt <v1 checkpoint>, or --no-upsampler to display a bicubic upscale")
     PlaySession(
-        cfg, ckpt, upsampler_ckpt, denoising_steps, context, record, no_upsampler, bf16=bf16, compile=compile
+        cfg,
+        ckpt,
+        upsampler_ckpt,
+        denoising_steps,
+        context,
+        record,
+        no_upsampler,
+        bf16=bf16,
+        compile=compile,
+        fullscreen=fullscreen,
     ).run()

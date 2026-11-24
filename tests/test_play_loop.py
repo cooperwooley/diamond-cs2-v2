@@ -434,3 +434,52 @@ def test_step_passes_context_in_the_right_order_to_the_samplers(agent, cfg) -> N
 def test_benchmark_notes_what_is_excluded(agent, cfg, tmp_path) -> None:
     report = loop.benchmark(cfg, tmp_path / "c.pt", tmp_path / "v.pt", 1, tmp_path / "o.json", agent=agent)
     assert "excludes display" in report["note"]
+
+
+@pytest.mark.parametrize("fullscreen", [False, True])
+def test_play_session_fullscreen_flags(dummy_pygame, agent, cfg, episode, tmp_path, monkeypatch, fullscreen) -> None:
+    # Full screen keeps the cursor in the window where it cannot be confined (WSLg); SCALED keeps the drawing size.
+    pg = dummy_pygame
+    flags_seen = []
+    real_set_mode = pg.display.set_mode
+
+    def spy(size, flags=0, *a, **k):
+        flags_seen.append(flags)
+        return real_set_mode(size, flags, *a, **k)
+
+    monkeypatch.setattr(pg.display, "set_mode", spy)
+    session = loop.PlaySession(
+        cfg,
+        tmp_path / "c.pt",
+        None,
+        1,
+        episode[0],
+        no_upsampler=True,
+        fullscreen=fullscreen,
+        agent=agent,
+        event_source=scripted_events(pg, [[pg.event.Event(pg.KEYDOWN, key=pg.K_ESCAPE)]]),
+        max_frames=3,
+        clock=FakeClock(step=1 / 32),
+    )
+    session.run()
+    want = pg.FULLSCREEN | pg.SCALED if fullscreen else 0
+    assert flags_seen == [want]
+
+
+def test_run_and_cli_pass_fullscreen(cfg, tmp_path, monkeypatch) -> None:
+    from cs2wm.cli import build_parser
+
+    seen = {}
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            seen.update(k)
+
+        def run(self):
+            seen["ran"] = True
+
+    monkeypatch.setattr(loop, "PlaySession", FakeSession)
+    loop.run(cfg, tmp_path / "c.pt", tmp_path / "u.pt", fullscreen=True)
+    assert seen["fullscreen"] is True and seen["ran"]
+    args = build_parser().parse_args(["play", "--ckpt", "x.pt", "--no-upsampler", "--fullscreen"])
+    assert args.fullscreen is True
