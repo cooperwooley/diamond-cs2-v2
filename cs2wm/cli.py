@@ -122,6 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bf16", action="store_true", help="sample under bf16 autocast (CUDA); FPS fallback #2")
     p.add_argument("--compile", action="store_true", help="torch.compile the models; FPS fallback #3")
     p.add_argument("--benchmark", type=int, default=None, metavar="N", help="benchmark FPS over N frames and exit")
+    p.add_argument(
+        "--invert-mouse", action="store_true", help="flip both mouse axes (WSLg reports the captured mouse reversed)"
+    )
 
     p = sub.add_parser("eval", help="evaluations (#27, #32, #33, #34)")
     ev = p.add_subparsers(dest="eval_cmd", required=True, metavar="<experiment>")
@@ -414,10 +417,12 @@ def _dispatch(args: argparse.Namespace) -> int:
         else:
             label_accuracy.score_review_sheet(args.sheet, args.out)
     elif cmd == "play":
+        from cs2wm.config import load_config
         from cs2wm.play import loop
 
+        flips = ["play.invert_mouse_x=true", "play.invert_mouse_y=true"] if args.invert_mouse else []
         loop.run(
-            _cfg(args),
+            load_config(args.config, overrides=flips),
             args.ckpt,
             args.upsampler_ckpt,
             args.no_upsampler,
