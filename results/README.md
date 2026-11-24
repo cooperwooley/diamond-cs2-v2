@@ -11,4 +11,6 @@ under `$DCS2_ROOT` on the PC or `$S` on the Mill.
   (about 9 MB each, gitignored); they are on the PC under `$DCS2_ROOT/eval/h1_frames`. `summary.json` already holds the
   per-(script, context) scatter points the report needs.
 - `carried/` (#34): loss curves (v1 vs v2), rollouts and FID at 30x56.
-- Later: `label_accuracy.json` (#18), `play_fps.json` (#28), `h2/` (#33).
+- `play_fps.json` (#28): play FPS by sampler setting on the RTX 3060.
+- `play_ratings.json` (#31): by-hand 0/1/2 ratings of 14 controls in play, with the train label rate of each action.
+- Later: `label_accuracy.json` (#18), `h2/` (#33).
