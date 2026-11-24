@@ -288,8 +288,10 @@ H1 on contexts without `--split-json` may include training demos; the run warns 
 
 ## Play
 
-Play runs on Windows Python (reliable relative-mouse capture; WSLg is fine for quick tests). Keys: W/A/S/D, space,
-ctrl, shift, 1/2/3/4, R, LMB/RMB, mouse to turn. `Backspace` resets the context, `F1` toggles the overlay.
+Play runs on Windows Python (reliable relative-mouse capture) or from WSL through WSLg, which also works when Smart
+App Control blocks torch on Windows (#87). WSLg reports the captured mouse reversed on both axes, so add
+`--invert-mouse` there. Keys: W/A/S/D, space, ctrl, shift, 1/2/3/4, R, LMB/RMB, mouse to turn. `Backspace` resets the
+context, `F1` toggles the overlay.
 
 ```powershell
 # Windows PowerShell

@@ -294,3 +294,21 @@ def test_drop_mouse_keeps_keys(spec) -> None:
     m.drop_mouse()
     d = decode(m.frame_action(), spec)
     assert d.keys == ("w",) and d.mouse_x_deg == 0.0
+
+
+@pytest.mark.parametrize("invert", [False, True])
+def test_invert_mouse_flips_both_axes(spec, invert) -> None:
+    # WSLg's captured mouse reports motion reversed on both axes; play --invert-mouse flips it back (#31).
+    flips = ["play.invert_mouse_x=true", "play.invert_mouse_y=true"] if invert else []
+    mapper = InputMapper(load_config(overrides=["play.sensitivity=2.5", *flips]), BINDINGS)
+    feed(mapper, motion(40, 20))
+    d = decode(mapper.frame_action(), spec)
+    sign = -1 if invert else 1
+    assert np.sign(d.mouse_x_deg) == sign and np.sign(d.mouse_y_deg) == sign
+
+
+def test_cli_play_has_invert_mouse_flag() -> None:
+    from cs2wm.cli import build_parser
+
+    args = build_parser().parse_args(["play", "--ckpt", "x.pt", "--no-upsampler", "--invert-mouse"])
+    assert args.invert_mouse is True

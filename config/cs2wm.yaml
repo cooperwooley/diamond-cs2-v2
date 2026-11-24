@@ -200,6 +200,8 @@ play:
   sensitivity: 1.15   # the owner's CS2 sensitivity (#2); 2.5 would reproduce P&Z units exactly
   m_yaw: 0.022        # deg per mouse count at sensitivity 1
   m_pitch: 0.022
+  invert_mouse_x: false  # flip mouse x before encoding; WSLg's captured mouse reports both axes reversed (#31)
+  invert_mouse_y: false  # `cs2wm play --invert-mouse` sets both
   window_scale: 4     # window = render resolution x this (280x150 -> 1120x600)
 
 eval:

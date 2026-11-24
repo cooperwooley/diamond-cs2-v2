@@ -139,6 +139,11 @@ class InputMapper:
         self.spec = ActionSpec.from_config(cfg)
         self.bindings = bindings if bindings is not None else pygame_bindings()
         self.state = InputState()
+        # +1 or -1 per axis: WSLg's captured (relative) mouse reports motion reversed on both axes (#31).
+        self._mouse_sign = (
+            -1.0 if cfg.play.get("invert_mouse_x", False) else 1.0,
+            -1.0 if cfg.play.get("invert_mouse_y", False) else 1.0,
+        )
 
     def handle_event(self, event: object) -> str | None:
         """Update the state from one pygame event (key down/up, mouse button, mouse motion).
@@ -156,8 +161,8 @@ class InputMapper:
             return CMD_QUIT
         if etype == b.mousemotion:
             dx, dy = event.rel  # type: ignore[attr-defined]
-            s.mouse_dx_counts += dx
-            s.mouse_dy_counts += dy
+            s.mouse_dx_counts += self._mouse_sign[0] * dx
+            s.mouse_dy_counts += self._mouse_sign[1] * dy
         elif etype in (b.mousebuttondown, b.mousebuttonup):
             button = event.button  # type: ignore[attr-defined]
             name = "lmb" if button == b.button_lmb else "rmb" if button == b.button_rmb else None
