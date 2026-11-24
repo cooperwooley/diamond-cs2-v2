@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "issue": 31,
+  "date": "2026-11-23",
+  "rater": "project author, by hand",
+  "scale": {
+    "0": "no visible effect",
+    "1": "weak or inconsistent",
+    "2": "clear"
+  },
+  "setup": {
+    "denoiser": "v2-main-e150.pt (#29)",
+    "upsampler": "v2-upsampler-e150.pt (#70)",
+    "denoising_steps": 1,
+    "precision": "fp32",
+    "gpu": "NVIDIA GeForce RTX 3060",
+    "fps_benchmark": 12.3,
+    "frontend": "WSLg window, cs2wm play --invert-mouse --fullscreen",
+    "context": "held-out test episode dm-dm_20261106-003858_004-s000-c00",
+    "procedure": "each control held about 2 s; Backspace between tries if the scene drifted"
+  },
+  "ratings": {
+    "turn_left": 2,
+    "turn_right": 2,
+    "look_up": 2,
+    "look_down": 2,
+    "w": 2,
+    "s": 2,
+    "a": 2,
+    "d": 2,
+    "jump": 1,
+    "crouch": 0,
+    "fire": 2,
+    "reload": 1,
+    "switch_pistol": 1,
+    "switch_knife": 1
+  },
+  "summary": {
+    "n_controls": 14,
+    "n_2": 9,
+    "n_1": 4,
+    "n_0": 1
+  },
+  "milestone_m3_turning_at_least_1": true,
+  "train_label_rate": {
+    "w": 0.531,
+    "a": 0.224,
+    "s": 0.087,
+    "d": 0.175,
+    "jump": 0.005,
+    "crouch": 0.0,
+    "fire": 0.128,
+    "reload": 0.002,
+    "switch_pistol": 0.0,
+    "switch_knife": 0.0
+  },
+  "notes": [
+    "Mouse turning and look, W/A/S/D and fire are clear; jump, reload and the weapon switches are weak; crouch has no effect.",
+    "The weak and absent controls are the ones the bot data almost never contains: crouch and the slot keys have a train label rate of 0.000, jump 0.005, reload 0.002."
+  ]
+}
